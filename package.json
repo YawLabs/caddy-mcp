@@ -1,0 +1,68 @@
+{
+  "name": "@yawlabs/caddy-mcp",
+  "version": "0.1.0",
+  "description": "MCP server for managing Caddy web servers via the admin API",
+  "license": "MIT",
+  "author": "Yaw Labs <contact@yaw.sh> (https://yaw.sh)",
+  "type": "module",
+  "exports": {
+    ".": {
+      "import": "./dist/server.js",
+      "types": "./dist/server.d.ts"
+    }
+  },
+  "main": "./dist/server.js",
+  "types": "./dist/server.d.ts",
+  "bin": {
+    "caddy-mcp": "./dist/index.js"
+  },
+  "files": [
+    "dist",
+    "!dist/**/*.test.*",
+    "README.md",
+    "LICENSE"
+  ],
+  "scripts": {
+    "build": "tsup",
+    "dev": "tsup --watch",
+    "test": "vitest run",
+    "lint": "biome check src/",
+    "lint:fix": "biome check --write src/",
+    "typecheck": "tsc --noEmit",
+    "test:ci": "npm run build && npm test",
+    "prepublishOnly": "npm run build",
+    "start": "node dist/index.js"
+  },
+  "dependencies": {
+    "@modelcontextprotocol/sdk": "^1.29.0",
+    "zod": "^3.24.4"
+  },
+  "devDependencies": {
+    "@biomejs/biome": "^1.9.4",
+    "@types/node": "^25.5.2",
+    "tsup": "^8.4.0",
+    "typescript": "^5.8.3",
+    "vitest": "^3.1.1"
+  },
+  "engines": {
+    "node": ">=18"
+  },
+  "keywords": [
+    "mcp",
+    "model-context-protocol",
+    "caddy",
+    "reverse-proxy",
+    "web-server",
+    "mcp-server",
+    "devtools",
+    "ai"
+  ],
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/YawLabs/caddy-mcp.git"
+  },
+  "bugs": {
+    "url": "https://github.com/YawLabs/caddy-mcp/issues"
+  },
+  "homepage": "https://github.com/YawLabs/caddy-mcp"
+}
