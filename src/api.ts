@@ -43,8 +43,9 @@ async function caddyRequest<T = any>(
     const headers = getHeaders(hasBody ? contentType || "application/json" : undefined);
 
     // Send If-Match on config writes when we have a cached ETag for this path
+    const isConfigPath = path.startsWith("/config/") || path.startsWith("/id/");
     const isWrite = method !== "GET";
-    if (isWrite && path.startsWith("/config/")) {
+    if (isWrite && isConfigPath) {
       const cachedEtag = etagCache.get(path);
       if (cachedEtag) headers["If-Match"] = cachedEtag;
     }
@@ -59,12 +60,12 @@ async function caddyRequest<T = any>(
 
     // Capture ETag from config GET responses
     const etag = res.headers.get("ETag") || undefined;
-    if (method === "GET" && etag && path.startsWith("/config/")) {
+    if (method === "GET" && etag && isConfigPath) {
       etagCache.set(path, etag);
     }
 
     // Invalidate cached ETags after successful config writes
-    if (isWrite && res.ok && path.startsWith("/config/")) {
+    if (isWrite && res.ok && isConfigPath) {
       etagCache.delete(path);
     }
 
