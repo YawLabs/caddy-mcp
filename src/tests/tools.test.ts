@@ -1,8 +1,7 @@
-import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { describe, expect, it, vi } from "vitest";
 
 describe("caddy-mcp tools", () => {
-  it("registers exactly 13 tools", async () => {
+  it("registers exactly 16 tools", async () => {
     const registeredTools: string[] = [];
     const mockServer = {
       tool: vi.fn((...args: any[]) => {
@@ -26,7 +25,7 @@ describe("caddy-mcp tools", () => {
     registerOperationalTools(mockServer as any);
     registerResources(mockServer as any);
 
-    expect(registeredTools.length).toBe(13);
+    expect(registeredTools.length).toBe(16);
   });
 
   it("all tool names start with caddy_", async () => {
@@ -84,14 +83,17 @@ describe("caddy-mcp tools", () => {
     "caddy_config_set",
     "caddy_config_delete",
     "caddy_load",
+    "caddy_config_by_id",
     "caddy_reverse_proxy",
     "caddy_add_route",
     "caddy_list_routes",
     "caddy_adapt",
     "caddy_tls",
     "caddy_status",
+    "caddy_list_servers",
     "caddy_upstreams",
     "caddy_pki",
+    "caddy_metrics",
     "caddy_stop",
   ];
 
@@ -146,6 +148,33 @@ describe("caddy-mcp tools", () => {
       expect(desc).toBeTruthy();
       expect(typeof desc).toBe("string");
     }
+  });
+
+  describe("parseFrom", () => {
+    it("parses bare hostname", async () => {
+      const { parseFrom } = await import("../tools/routes.js");
+      expect(parseFrom("api.local")).toEqual({ host: ["api.local"] });
+    });
+
+    it("parses bare path", async () => {
+      const { parseFrom } = await import("../tools/routes.js");
+      expect(parseFrom("/api/*")).toEqual({ path: ["/api/*"] });
+    });
+
+    it("parses hostname + path", async () => {
+      const { parseFrom } = await import("../tools/routes.js");
+      expect(parseFrom("app.local/ws")).toEqual({ host: ["app.local"], path: ["/ws"] });
+    });
+
+    it("strips http:// scheme", async () => {
+      const { parseFrom } = await import("../tools/routes.js");
+      expect(parseFrom("http://api.local/test")).toEqual({ host: ["api.local"], path: ["/test"] });
+    });
+
+    it("strips https:// scheme", async () => {
+      const { parseFrom } = await import("../tools/routes.js");
+      expect(parseFrom("https://example.com")).toEqual({ host: ["example.com"] });
+    });
   });
 
   it("registers 2 resources", async () => {

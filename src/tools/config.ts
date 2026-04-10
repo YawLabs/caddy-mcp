@@ -14,19 +14,26 @@ export function registerConfigTools(server: McpServer) {
 
   server.tool(
     "caddy_config_set",
-    "Create or replace config at a JSON path. Mode 'create' (default) appends to arrays or creates objects (POST). Mode 'replace' overwrites existing values (PATCH).",
+    "Write config at a JSON path. Mode 'append' (default) adds to arrays or creates keys (POST). Mode 'overwrite' replaces existing values (PATCH). Mode 'insert' places at a specific array index (PUT) — useful for route ordering.",
     {
       path: z.string().describe("Config path to write to (e.g., 'apps/http/servers/srv0/routes')"),
       value: z.any().describe("The JSON value to set at the path"),
       mode: z
-        .enum(["create", "replace"])
+        .enum(["append", "overwrite", "insert"])
         .optional()
-        .default("create")
-        .describe("'create' = POST (append), 'replace' = PATCH (overwrite)"),
+        .default("append")
+        .describe(
+          "'append' = POST (add to arrays, create on objects), 'overwrite' = PATCH (replace existing), 'insert' = PUT (insert at array index)",
+        ),
     },
     { readOnlyHint: false, destructiveHint: false, idempotentHint: false, openWorldHint: false },
     async ({ path, value, mode }) => {
-      const res = mode === "replace" ? await api.configPatch(path, value) : await api.configPost(path, value);
+      const res =
+        mode === "overwrite"
+          ? await api.configPatch(path, value)
+          : mode === "insert"
+            ? await api.configPut(path, value)
+            : await api.configPost(path, value);
       return formatResult(res);
     },
   );
@@ -41,9 +48,52 @@ export function registerConfigTools(server: McpServer) {
 
   server.tool(
     "caddy_load",
-    "Replace the entire Caddy configuration atomically. Accepts a full Caddy JSON config object. This is the safest way to make large config changes.",
-    { config: z.record(z.any()).describe("Full Caddy JSON configuration object") },
+    "Replace the entire Caddy configuration atomically. Accepts a JSON config object, or a Caddyfile string with format='caddyfile'. This is the safest way to make large config changes. Has a 60-second timeout to allow for TLS provisioning.",
+    {
+      config: z.union([z.record(z.any()), z.string()]).describe("Full config — JSON object or Caddyfile text string"),
+      format: z
+        .enum(["json", "caddyfile"])
+        .optional()
+        .default("json")
+        .describe("Config format: 'json' (default) or 'caddyfile'"),
+    },
     { readOnlyHint: false, destructiveHint: true, idempotentHint: true, openWorldHint: false },
-    async ({ config }) => formatResult(await api.loadConfig(config)),
+    async ({ config, format }) => {
+      const contentType = format === "caddyfile" ? "text/caddyfile" : "application/json";
+      return formatResult(await api.loadConfig(config, contentType));
+    },
+  );
+
+  server.tool(
+    "caddy_config_by_id",
+    "Access config by @id tag. Any config object with an '@id' field can be read, updated, or deleted by its ID instead of needing its full path. This is the recommended way to manage individual routes and config objects.",
+    {
+      id: z
+        .string()
+        .regex(/^[\w-]+$/)
+        .describe("The @id value of the config object"),
+      action: z.enum(["get", "set", "delete"]).optional().default("get").describe("Action to perform"),
+      value: z.any().optional().describe("New value (required for 'set' action)"),
+      subpath: z.string().optional().default("").describe("Optional sub-path within the identified object"),
+    },
+    { readOnlyHint: false, destructiveHint: false, idempotentHint: false, openWorldHint: false },
+    async ({ id, action, value, subpath }) => {
+      if (action === "get") {
+        return formatResult(await api.configByIdGet(id, subpath));
+      }
+      if (action === "set") {
+        if (value === undefined) {
+          return {
+            isError: true,
+            content: [{ type: "text" as const, text: "Error: value is required for 'set' action" }],
+          };
+        }
+        return formatResult(await api.configByIdSet(id, value, "PATCH", subpath));
+      }
+      if (action === "delete") {
+        return formatResult(await api.configByIdDelete(id, subpath));
+      }
+      return { isError: true, content: [{ type: "text" as const, text: `Unknown action: ${action}` }] };
+    },
   );
 }

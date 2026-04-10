@@ -27,11 +27,3 @@ export async function startServer(): Promise<void> {
   const transport = new StdioServerTransport();
   await server.connect(transport);
 }
-
-const isDirectRun = process.argv[1]?.endsWith("server.js");
-if (isDirectRun) {
-  startServer().catch((err) => {
-    console.error("MCP server error:", err);
-    process.exit(1);
-  });
-}

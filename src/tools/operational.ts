@@ -27,7 +27,9 @@ export function registerOperationalTools(server: McpServer) {
           const srv = servers[name];
           const listen = srv.listen || [];
           const routes = srv.routes || [];
-          const tls = srv.tls_connection_policies ? "enabled" : "auto";
+          const hasExplicitTls = !!srv.tls_connection_policies;
+          const listensHttps = listen.some((l: string) => l.includes(":443"));
+          const tls = hasExplicitTls ? "enabled" : listensHttps ? "auto (HTTPS)" : "off (HTTP only)";
           lines.push(
             `Server "${name}": ${routes.length} route(s), listen: ${listen.join(", ") || "default"}, TLS: ${tls}`,
           );
@@ -45,6 +47,37 @@ export function registerOperationalTools(server: McpServer) {
   );
 
   server.tool(
+    "caddy_list_servers",
+    "List all configured HTTP servers with their names, listen addresses, route counts, and TLS status. Use this to discover server names before calling route tools.",
+    {},
+    { readOnlyHint: true, destructiveHint: false, idempotentHint: true, openWorldHint: false },
+    async () => {
+      const res = await api.configGet("apps/http/servers");
+      if (!res.ok) return formatResult(res);
+
+      const servers = res.data || {};
+      const names = Object.keys(servers);
+      if (names.length === 0) {
+        return { content: [{ type: "text" as const, text: "No HTTP servers configured" }] };
+      }
+
+      const lines: string[] = [];
+      for (const name of names) {
+        const srv = servers[name];
+        const listen = srv.listen || [];
+        const routes = srv.routes || [];
+        const hasExplicitTls = !!srv.tls_connection_policies;
+        const listensHttps = listen.some((l: string) => l.includes(":443"));
+        const tls = hasExplicitTls ? "enabled" : listensHttps ? "auto (HTTPS)" : "off (HTTP only)";
+        lines.push(`  ${name}: ${routes.length} route(s), listen: ${listen.join(", ") || "default"}, TLS: ${tls}`);
+      }
+      return {
+        content: [{ type: "text" as const, text: `HTTP Servers:\n${lines.join("\n")}` }],
+      };
+    },
+  );
+
+  server.tool(
     "caddy_upstreams",
     "Get the current health status of all reverse proxy upstreams. Shows address, active requests, and failure counts.",
     {},
@@ -56,7 +89,12 @@ export function registerOperationalTools(server: McpServer) {
     "caddy_pki",
     "Get PKI certificate authority info or the CA certificate chain.",
     {
-      ca: z.string().optional().default("local").describe("CA ID (default: 'local')"),
+      ca: z
+        .string()
+        .regex(/^[\w-]+$/)
+        .optional()
+        .default("local")
+        .describe("CA ID (default: 'local')"),
       certificates: z.boolean().optional().default(false).describe("If true, return the full CA certificate chain"),
     },
     { readOnlyHint: true, destructiveHint: false, idempotentHint: true, openWorldHint: false },
@@ -64,6 +102,14 @@ export function registerOperationalTools(server: McpServer) {
       const res = certificates ? await api.getPkiCertificates(ca) : await api.getPki(ca);
       return formatResult(res);
     },
+  );
+
+  server.tool(
+    "caddy_metrics",
+    "Get Prometheus metrics from Caddy. Shows request counts, durations, TLS handshake stats, active connections, and more.",
+    {},
+    { readOnlyHint: true, destructiveHint: false, idempotentHint: true, openWorldHint: false },
+    async () => formatResult(await api.getMetrics()),
   );
 
   server.tool(

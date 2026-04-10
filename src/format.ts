@@ -8,7 +8,8 @@ export function formatResult(res: ApiResponse) {
       content: [{ type: "text" as const, text: `Error: ${res.error || `HTTP ${res.status}`}` }],
     };
   }
-  const text =
-    res.data !== undefined ? (typeof res.data === "string" ? res.data : JSON.stringify(res.data, null, 2)) : "OK";
+  const raw =
+    res.data !== undefined ? (typeof res.data === "string" ? res.data : JSON.stringify(res.data, null, 2)) : "";
+  const text = raw || "OK";
   return { content: [{ type: "text" as const, text }] };
 }
