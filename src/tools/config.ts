@@ -50,7 +50,9 @@ export function registerConfigTools(server: McpServer) {
     "caddy_load",
     "Replace the entire Caddy configuration atomically. Accepts a JSON config object, or a Caddyfile string with format='caddyfile'. This is the safest way to make large config changes. Has a 60-second timeout to allow for TLS provisioning.",
     {
-      config: z.union([z.record(z.any()), z.string()]).describe("Full config — JSON object or Caddyfile text string"),
+      config: z
+        .union([z.record(z.string(), z.any()), z.string()])
+        .describe("Full config — JSON object or Caddyfile text string"),
       format: z
         .enum(["json", "caddyfile"])
         .optional()

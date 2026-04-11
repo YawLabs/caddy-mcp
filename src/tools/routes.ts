@@ -81,10 +81,10 @@ export function registerRouteTools(server: McpServer) {
     "Add a route with full control over match conditions and handlers. Supports any Caddy handler (reverse_proxy, file_server, static_response, redirect, encode, headers, etc.).",
     {
       match: z
-        .array(z.record(z.any()))
+        .array(z.record(z.string(), z.any()))
         .describe("Array of match objects (e.g., [{ host: ['example.com'], path: ['/api/*'] }])"),
       handle: z
-        .array(z.record(z.any()))
+        .array(z.record(z.string(), z.any()))
         .describe("Array of handler objects (e.g., [{ handler: 'file_server', root: '/var/www' }])"),
       server: z
         .string()

@@ -3,7 +3,7 @@
 [![npm version](https://img.shields.io/npm/v/@yawlabs/caddy-mcp)](https://www.npmjs.com/package/@yawlabs/caddy-mcp)
 [![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](https://opensource.org/licenses/MIT)
 
-**MCP server for managing Caddy web servers.** 13 tools for config management, reverse proxy setup, route operations, TLS, and server monitoring — all via Caddy's admin API.
+**MCP server for managing Caddy web servers.** 16 tools for config management, reverse proxy setup, route operations, TLS, and server monitoring — all via Caddy's admin API.
 
 Built and maintained by [Yaw Labs](https://yaw.sh).
 
@@ -60,6 +60,7 @@ Add to your MCP config file:
 - **caddy_config_get** — Read config at any JSON path (or full config)
 - **caddy_config_set** — Create or replace config at a path
 - **caddy_config_delete** — Delete config at a path
+- **caddy_config_by_id** — Read, update, or delete config by `@id` tag
 - **caddy_load** — Replace entire config atomically
 
 ### Route operations
@@ -76,7 +77,9 @@ Add to your MCP config file:
 ### Server operations
 
 - **caddy_status** — Connectivity check + config summary
+- **caddy_list_servers** — List all HTTP servers with names, addresses, and TLS status
 - **caddy_upstreams** — Reverse proxy backend health
+- **caddy_metrics** — Prometheus metrics (request counts, durations, connections)
 - **caddy_pki** — CA info and certificate chains
 - **caddy_stop** — Graceful shutdown (requires confirmation)
 

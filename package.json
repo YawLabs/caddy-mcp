@@ -1,6 +1,6 @@
 {
   "name": "@yawlabs/caddy-mcp",
-  "version": "0.1.0",
+  "version": "0.1.1",
   "description": "MCP server for managing Caddy web servers via the admin API",
   "license": "MIT",
   "author": "Yaw Labs <contact@yaw.sh> (https://yaw.sh)",
@@ -35,14 +35,14 @@
   },
   "dependencies": {
     "@modelcontextprotocol/sdk": "^1.29.0",
-    "zod": "^3.24.4"
+    "zod": "^4.3.6"
   },
   "devDependencies": {
-    "@biomejs/biome": "^1.9.4",
-    "@types/node": "^25.5.2",
+    "@biomejs/biome": "^2.4.11",
+    "@types/node": "^25.6.0",
     "tsup": "^8.4.0",
-    "typescript": "^5.8.3",
-    "vitest": "^3.1.1"
+    "typescript": "^6.0.2",
+    "vitest": "^4.1.4"
   },
   "engines": {
     "node": ">=18"
