@@ -83,7 +83,7 @@ NPM_VERSION=$(npm view @yawlabs/caddy-mcp version 2>/dev/null || echo "")
 if [ "$NPM_VERSION" = "$VERSION" ]; then
   info "Already published to npm — skipping"
 else
-  npm publish --access public
+  npm publish --access public --provenance
   info "Published @yawlabs/caddy-mcp@${VERSION} to npm"
 fi
 
