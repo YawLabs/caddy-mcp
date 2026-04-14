@@ -77,9 +77,16 @@ export function registerConfigTools(server: McpServer) {
       action: z.enum(["get", "set", "delete"]).optional().default("get").describe("Action to perform"),
       value: z.any().optional().describe("New value (required for 'set' action)"),
       subpath: z.string().optional().default("").describe("Optional sub-path within the identified object"),
+      mode: z
+        .enum(["append", "overwrite", "insert"])
+        .optional()
+        .default("overwrite")
+        .describe(
+          "For 'set' action: 'overwrite' = PATCH (replace existing, default), 'append' = POST (add to arrays, create on objects), 'insert' = PUT (insert at array index)",
+        ),
     },
     { readOnlyHint: false, destructiveHint: false, idempotentHint: false, openWorldHint: false },
-    async ({ id, action, value, subpath }) => {
+    async ({ id, action, value, subpath, mode }) => {
       if (action === "get") {
         return formatResult(await api.configByIdGet(id, subpath));
       }
@@ -90,7 +97,8 @@ export function registerConfigTools(server: McpServer) {
             content: [{ type: "text" as const, text: "Error: value is required for 'set' action" }],
           };
         }
-        return formatResult(await api.configByIdSet(id, value, "PATCH", subpath));
+        const method = mode === "append" ? "POST" : mode === "insert" ? "PUT" : "PATCH";
+        return formatResult(await api.configByIdSet(id, value, method, subpath));
       }
       if (action === "delete") {
         return formatResult(await api.configByIdDelete(id, subpath));

@@ -272,6 +272,22 @@ describe("tool handler behavior", () => {
       expect(api.configByIdSet).toHaveBeenCalledWith("my-route", { listen: [":443"] }, "PATCH", "");
     });
 
+    it("uses POST for set action with mode=append", async () => {
+      api.configByIdSet.mockResolvedValue(ok());
+
+      await handler({ id: "routes", action: "set", value: { handle: [] }, subpath: "", mode: "append" });
+
+      expect(api.configByIdSet).toHaveBeenCalledWith("routes", { handle: [] }, "POST", "");
+    });
+
+    it("uses PUT for set action with mode=insert", async () => {
+      api.configByIdSet.mockResolvedValue(ok());
+
+      await handler({ id: "my-route", action: "set", value: { handle: [] }, subpath: "", mode: "insert" });
+
+      expect(api.configByIdSet).toHaveBeenCalledWith("my-route", { handle: [] }, "PUT", "");
+    });
+
     it("calls configByIdDelete for delete action", async () => {
       api.configByIdDelete.mockResolvedValue(ok());
 
