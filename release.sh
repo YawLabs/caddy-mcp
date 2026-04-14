@@ -30,10 +30,11 @@ command -v npm >/dev/null  || fail "npm not installed"
 
 CURRENT_VERSION=$(node -p "require('./package.json').version")
 
+[ -z "$(git status --porcelain)" ] || fail "Working directory not clean — commit or stash changes before releasing"
+
 if [ "$CURRENT_VERSION" = "$VERSION" ]; then
   info "Resuming release v${VERSION}"
 else
-  [ -z "$(git status --porcelain)" ] || fail "Working directory not clean"
   info "Current version: $CURRENT_VERSION → $VERSION"
 fi
 

@@ -26,3 +26,12 @@ jobs:
       - run: npm run typecheck
       - run: npm run build
       - run: npm test
+
+      - name: Check for repo drift after install and build
+        run: |
+          if [ -n "$(git status --porcelain)" ]; then
+            echo "Repo has uncommitted changes after install+build:"
+            git status --porcelain
+            git diff
+            exit 1
+          fi

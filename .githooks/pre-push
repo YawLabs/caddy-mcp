@@ -1,0 +1,22 @@
+#!/bin/bash
+# Refuse pushes when the working tree is dirty on a push that updates main.
+# Install: git config core.hooksPath .githooks
+
+set -e
+
+while read -r _local_ref local_sha remote_ref _remote_sha; do
+  case "$remote_ref" in
+    refs/heads/main)
+      if [ "$local_sha" != "0000000000000000000000000000000000000000" ]; then
+        if [ -n "$(git status --porcelain)" ]; then
+          echo "pre-push: refusing to push to main with a dirty working tree" >&2
+          echo "pre-push: commit, stash, or discard changes first:" >&2
+          git status --short >&2
+          exit 1
+        fi
+      fi
+      ;;
+  esac
+done
+
+exit 0
