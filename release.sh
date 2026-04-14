@@ -15,12 +15,19 @@ fail() { echo -e "${RED}  ✗ $1${NC}"; exit 1; }
 
 TOTAL_STEPS=7
 
-if [ $# -ne 1 ]; then
-  echo "Usage: ./release.sh <version>"
-  exit 1
+VERSION="${1:-}"
+IS_CI="${CI:-false}"
+
+if [ -z "$VERSION" ]; then
+  if [ "$IS_CI" = "true" ] && [ -n "${GITHUB_REF_NAME:-}" ]; then
+    VERSION="${GITHUB_REF_NAME#v}"
+    info "CI mode — version $VERSION from tag $GITHUB_REF_NAME"
+  else
+    echo "Usage: ./release.sh <version>"
+    exit 1
+  fi
 fi
 
-VERSION="$1"
 [[ "$VERSION" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]] || fail "Invalid version: $VERSION"
 
 echo -e "${CYAN}Pre-flight checks...${NC}"
@@ -30,7 +37,9 @@ command -v npm >/dev/null  || fail "npm not installed"
 
 CURRENT_VERSION=$(node -p "require('./package.json').version")
 
-[ -z "$(git status --porcelain)" ] || fail "Working directory not clean — commit or stash changes before releasing"
+if [ "$IS_CI" != "true" ]; then
+  [ -z "$(git status --porcelain)" ] || fail "Working directory not clean — commit or stash changes before releasing"
+fi
 
 if [ "$CURRENT_VERSION" = "$VERSION" ]; then
   info "Resuming release v${VERSION}"
@@ -61,23 +70,31 @@ else
 fi
 
 step 3 "Commit and tag"
-if [ -n "$(git status --porcelain package.json package-lock.json 2>/dev/null)" ]; then
-  git add package.json package-lock.json
-  git commit -m "v${VERSION}"
-  info "Committed version bump"
+if [ "$IS_CI" = "true" ]; then
+  info "CI mode — skipping commit/tag (tag triggered the workflow)"
 else
-  info "Already committed — skipping"
-fi
-if git tag -l "v${VERSION}" | grep -q "v${VERSION}"; then
-  info "Tag v${VERSION} already exists — skipping"
-else
-  git tag "v${VERSION}"
-  info "Tag v${VERSION} created"
+  if [ -n "$(git status --porcelain package.json package-lock.json 2>/dev/null)" ]; then
+    git add package.json package-lock.json
+    git commit -m "v${VERSION}"
+    info "Committed version bump"
+  else
+    info "Already committed — skipping"
+  fi
+  if git tag -l "v${VERSION}" | grep -q "v${VERSION}"; then
+    info "Tag v${VERSION} already exists — skipping"
+  else
+    git tag "v${VERSION}"
+    info "Tag v${VERSION} created"
+  fi
 fi
 
 step 4 "Push to origin"
-git push origin main --tags
-info "Pushed commit and tag"
+if [ "$IS_CI" = "true" ]; then
+  info "CI mode — skipping push (tag was already pushed to trigger this workflow)"
+else
+  git push origin main --tags
+  info "Pushed commit and tag"
+fi
 
 step 5 "Publish to npm"
 NPM_VERSION=$(npm view @yawlabs/caddy-mcp version 2>/dev/null || echo "")
