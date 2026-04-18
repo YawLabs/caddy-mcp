@@ -574,6 +574,61 @@ describe("tool handler behavior", () => {
     });
   });
 
+  // ─── caddy_remove_route ───────────────────────────────────────────────
+
+  describe("caddy_remove_route", () => {
+    let handler: (...args: any[]) => Promise<any>;
+
+    beforeEach(async () => {
+      const mockServer = { tool: vi.fn(), resource: vi.fn() };
+      const { registerRouteTools } = await import("../tools/routes.js");
+      registerRouteTools(mockServer as any);
+      handler = getToolHandler(mockServer, "caddy_remove_route");
+    });
+
+    it("refuses to remove without confirm=true", async () => {
+      const result = await handler({ id: "my-route", confirm: false });
+      expect(result.isError).toBe(true);
+      expect(result.content[0].text).toContain("confirm=true");
+      expect(api.configByIdDelete).not.toHaveBeenCalled();
+    });
+
+    it("errors if neither id nor index provided", async () => {
+      const result = await handler({ confirm: true });
+      expect(result.isError).toBe(true);
+      expect(result.content[0].text).toContain("id or index");
+    });
+
+    it("deletes by @id when id is given", async () => {
+      api.configByIdDelete.mockResolvedValue(ok({}));
+      const result = await handler({ id: "api-v2", confirm: true });
+      expect(result.isError).toBeFalsy();
+      expect(api.configByIdDelete).toHaveBeenCalledWith("api-v2");
+      expect(result.content[0].text).toContain('@id="api-v2"');
+    });
+
+    it("rejects out-of-range index", async () => {
+      api.configGet.mockResolvedValue(ok([{ match: [], handle: [] }]));
+      const result = await handler({ index: 5, server: "srv0", confirm: true });
+      expect(result.isError).toBe(true);
+      expect(result.content[0].text).toContain("out of range");
+      expect(api.configDelete).not.toHaveBeenCalled();
+    });
+
+    it("deletes by index on named server", async () => {
+      api.configGet.mockResolvedValue(
+        ok([
+          { match: [], handle: [] },
+          { match: [], handle: [] },
+        ]),
+      );
+      api.configDelete.mockResolvedValue(ok({}));
+      const result = await handler({ index: 1, server: "srv0", confirm: true });
+      expect(result.isError).toBeFalsy();
+      expect(api.configDelete).toHaveBeenCalledWith("apps/http/servers/srv0/routes/1");
+    });
+  });
+
   // ─── formatResult ─────────────────────────────────────────────────────
 
   describe("formatResult", () => {

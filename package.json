@@ -1,6 +1,6 @@
 {
   "name": "@yawlabs/caddy-mcp",
-  "version": "0.2.0",
+  "version": "0.3.0",
   "description": "MCP server for managing Caddy web servers via the admin API",
   "license": "MIT",
   "author": "Yaw Labs <contact@yaw.sh> (https://yaw.sh)",

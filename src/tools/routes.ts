@@ -309,4 +309,81 @@ export function registerRouteTools(server: McpServer) {
       };
     },
   );
+
+  server.tool(
+    "caddy_remove_route",
+    "Remove a route. Target by @id (preferred — stable across reorderings) or by array index on a specific server. Uses ETags to prevent concurrent overwrites.",
+    {
+      id: z
+        .string()
+        .regex(/^[\w-]{1,128}$/)
+        .optional()
+        .describe("The @id of the route to remove (preferred — stable even if routes get reordered)"),
+      index: z
+        .number()
+        .int()
+        .nonnegative()
+        .optional()
+        .describe("Zero-based index of the route in the server's routes array (only used if id is not provided)"),
+      server: z
+        .string()
+        .regex(/^[\w-]{1,128}$/)
+        .optional()
+        .default("srv0")
+        .describe("Caddy server name when using index (default: srv0). Ignored when id is provided."),
+      confirm: z.boolean().optional().default(false).describe("Must be true to actually remove the route (safety)"),
+    },
+    { readOnlyHint: false, destructiveHint: true, idempotentHint: true, openWorldHint: false },
+    async ({ id, index, server: srv, confirm }) => {
+      if (!id && index === undefined) {
+        return {
+          isError: true,
+          content: [{ type: "text" as const, text: "Error: must provide either id or index" }],
+        };
+      }
+      if (!confirm) {
+        const target = id ? `@id="${id}"` : `route ${index} on server "${srv}"`;
+        return {
+          isError: true,
+          content: [
+            {
+              type: "text" as const,
+              text: `Refusing to remove ${target} without confirm=true. Re-run with confirm:true to proceed.`,
+            },
+          ],
+        };
+      }
+      if (id) {
+        const res = await api.configByIdDelete(id);
+        if (res.ok) return { content: [{ type: "text" as const, text: `Route @id="${id}" removed.` }] };
+        return formatResult(res);
+      }
+      // Read first so we populate the ETag cache, then delete by index
+      const readRes = await api.configGet(`apps/http/servers/${srv}/routes`);
+      if (!readRes.ok) return formatResult(readRes);
+      const routes = readRes.data;
+      if (!Array.isArray(routes)) {
+        return {
+          isError: true,
+          content: [{ type: "text" as const, text: `Error: server "${srv}" has no routes array (or it is malformed)` }],
+        };
+      }
+      if ((index as number) >= routes.length) {
+        return {
+          isError: true,
+          content: [
+            {
+              type: "text" as const,
+              text: `Error: index ${index} out of range — server "${srv}" has ${routes.length} route(s)`,
+            },
+          ],
+        };
+      }
+      const res = await api.configDelete(`apps/http/servers/${srv}/routes/${index}`);
+      if (res.ok) {
+        return { content: [{ type: "text" as const, text: `Route ${index} removed from server "${srv}".` }] };
+      }
+      return formatResult(res);
+    },
+  );
 }

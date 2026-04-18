@@ -1,7 +1,7 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
 
 describe("caddy-mcp tools", () => {
-  it("registers exactly 16 tools", async () => {
+  it("registers exactly 17 tools", async () => {
     const registeredTools: string[] = [];
     const mockServer = {
       tool: vi.fn((...args: any[]) => {
@@ -25,7 +25,7 @@ describe("caddy-mcp tools", () => {
     registerOperationalTools(mockServer as any);
     registerResources(mockServer as any);
 
-    expect(registeredTools.length).toBe(16);
+    expect(registeredTools.length).toBe(17);
   });
 
   it("all tool names start with caddy_", async () => {
@@ -189,7 +189,7 @@ describe("caddy-mcp tools", () => {
     const { registerResources } = await import("../resources.js");
     registerResources(mockServer as any);
 
-    expect(resources.length).toBe(2);
+    expect(resources.length).toBe(4);
   });
 
   describe("adapter validation", () => {
