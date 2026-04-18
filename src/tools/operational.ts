@@ -91,7 +91,7 @@ export function registerOperationalTools(server: McpServer) {
     {
       ca: z
         .string()
-        .regex(/^[\w-]+$/)
+        .regex(/^[\w-]{1,128}$/)
         .optional()
         .default("local")
         .describe("CA ID (default: 'local')"),

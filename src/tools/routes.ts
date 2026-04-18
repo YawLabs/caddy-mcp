@@ -3,6 +3,55 @@ import { z } from "zod";
 import * as api from "../api.js";
 import { formatResult } from "../format.js";
 
+interface CaddyServerConfig {
+  listen?: unknown;
+  routes?: unknown;
+}
+
+interface CaddyRoute {
+  "@id"?: unknown;
+  group?: unknown;
+  match?: unknown;
+  handle?: unknown;
+  terminal?: unknown;
+}
+
+interface CaddyMatcher {
+  host?: unknown;
+  path?: unknown;
+  method?: unknown;
+  protocol?: unknown;
+  remote_ip?: unknown;
+  client_ip?: unknown;
+  query?: unknown;
+  header?: unknown;
+  expression?: unknown;
+  not?: unknown;
+}
+
+interface CaddyHandler {
+  handler?: unknown;
+  upstreams?: unknown;
+  root?: unknown;
+  status_code?: unknown;
+  uri?: unknown;
+  routes?: unknown;
+  providers?: unknown;
+}
+
+interface CaddyUpstream {
+  dial?: unknown;
+}
+
+/** Join an unknown value as comma-separated strings if it's an array; return "" otherwise */
+function safeJoin(value: unknown): string {
+  if (!Array.isArray(value)) return "";
+  return value
+    .filter((v) => v !== null && v !== undefined)
+    .map(String)
+    .join(",");
+}
+
 /** Parse a "from" string like "api.example.com" or "example.com/api/*" into match object */
 export function parseFrom(from: string): { host?: string[]; path?: string[] } {
   const cleaned = from.replace(/^https?:\/\//, "");
@@ -46,7 +95,7 @@ export function registerRouteTools(server: McpServer) {
       to: z.array(z.string()).describe("Upstream addresses (e.g., ['localhost:3000', 'localhost:3001'])"),
       server: z
         .string()
-        .regex(/^[\w-]+$/)
+        .regex(/^[\w-]{1,128}$/)
         .optional()
         .default("srv0")
         .describe("Caddy server name (default: srv0)"),
@@ -88,7 +137,7 @@ export function registerRouteTools(server: McpServer) {
         .describe("Array of handler objects (e.g., [{ handler: 'file_server', root: '/var/www' }])"),
       server: z
         .string()
-        .regex(/^[\w-]+$/)
+        .regex(/^[\w-]{1,128}$/)
         .optional()
         .default("srv0")
         .describe("Caddy server name (default: srv0)"),
@@ -111,47 +160,67 @@ export function registerRouteTools(server: McpServer) {
     {
       server: z
         .string()
-        .regex(/^[\w-]+$/)
+        .regex(/^[\w-]{1,128}$/)
         .optional()
         .default("srv0")
         .describe("Caddy server name (default: srv0)"),
     },
     { readOnlyHint: true, destructiveHint: false, idempotentHint: true, openWorldHint: false },
     async ({ server: srv }) => {
-      const serverRes = await api.configGet(`apps/http/servers/${srv}`);
+      const serverRes = await api.configGet<CaddyServerConfig>(`apps/http/servers/${srv}`);
       if (!serverRes.ok) return formatResult(serverRes);
 
-      const serverConfig = serverRes.data;
-      const routes = serverConfig?.routes || [];
-      const listen = serverConfig?.listen || [];
+      const serverConfig = serverRes.data || {};
+      const routes: unknown[] = Array.isArray(serverConfig.routes) ? serverConfig.routes : [];
+      const listen: unknown[] = Array.isArray(serverConfig.listen) ? serverConfig.listen : [];
+      const listenStr = listen.map(String).join(", ") || "default";
 
       if (routes.length === 0) {
         return {
           content: [
             {
               type: "text" as const,
-              text: `Server ${srv} (listen: ${listen.join(", ") || "default"}) — no routes configured`,
+              text: `Server ${srv} (listen: ${listenStr}) — no routes configured`,
             },
           ],
         };
       }
 
-      const lines: string[] = [`Server: ${srv} (listen: ${listen.join(", ") || "default"})`, ""];
+      const lines: string[] = [`Server: ${srv} (listen: ${listenStr})`, ""];
       for (let i = 0; i < routes.length; i++) {
-        const route = routes[i];
+        const rawRoute = routes[i];
+        if (!rawRoute || typeof rawRoute !== "object") {
+          lines.push(`  Route ${i}: <invalid>`);
+          continue;
+        }
+        const route = rawRoute as CaddyRoute;
 
-        const id = route["@id"] ? ` @id="${route["@id"]}"` : "";
-        const group = route.group ? ` group="${route.group}"` : "";
+        const idVal = typeof route["@id"] === "string" ? route["@id"] : undefined;
+        const groupVal = typeof route.group === "string" ? route.group : undefined;
+        const id = idVal ? ` @id="${idVal}"` : "";
+        const group = groupVal ? ` group="${groupVal}"` : "";
 
-        const matchers = (route.match || [])
-          .map((m: any) => {
+        const matchList: unknown[] = Array.isArray(route.match) ? route.match : [];
+        const matchers = matchList
+          .map((rawMatcher) => {
+            if (!rawMatcher || typeof rawMatcher !== "object") return "catch-all";
+            const m = rawMatcher as CaddyMatcher;
             const parts: string[] = [];
-            if (m.host) parts.push(`host=[${m.host.join(",")}]`);
-            if (m.path) parts.push(`path=[${m.path.join(",")}]`);
-            if (m.method) parts.push(`method=[${m.method.join(",")}]`);
-            if (m.protocol) parts.push(`protocol=${m.protocol}`);
-            if (m.remote_ip) parts.push(`remote_ip=[${m.remote_ip.ranges?.join(",") || "..."}]`);
-            if (m.client_ip) parts.push(`client_ip=[${m.client_ip.ranges?.join(",") || "..."}]`);
+            const host = safeJoin(m.host);
+            if (host) parts.push(`host=[${host}]`);
+            const path = safeJoin(m.path);
+            if (path) parts.push(`path=[${path}]`);
+            const method = safeJoin(m.method);
+            if (method) parts.push(`method=[${method}]`);
+            if (typeof m.protocol === "string") parts.push(`protocol=${m.protocol}`);
+            if (m.remote_ip && typeof m.remote_ip === "object") {
+              const ranges = safeJoin((m.remote_ip as { ranges?: unknown }).ranges);
+              parts.push(`remote_ip=[${ranges || "..."}]`);
+            }
+            if (m.client_ip && typeof m.client_ip === "object") {
+              const ranges = safeJoin((m.client_ip as { ranges?: unknown }).ranges);
+              parts.push(`client_ip=[${ranges || "..."}]`);
+            }
             if (m.query) parts.push("query=...");
             if (m.header) parts.push("header=...");
             if (m.expression) parts.push(`expr(${typeof m.expression === "string" ? m.expression : "..."})`);
@@ -177,26 +246,59 @@ export function registerRouteTools(server: McpServer) {
           })
           .join(" | ");
 
-        const handlers = (route.handle || [])
-          .map((h: any) => {
+        const handleList: unknown[] = Array.isArray(route.handle) ? route.handle : [];
+        const handlers = handleList
+          .map((rawHandler) => {
+            if (!rawHandler || typeof rawHandler !== "object") return "unknown";
+            const h = rawHandler as CaddyHandler;
             if (h.handler === "reverse_proxy") {
-              const upstreams = (h.upstreams || []).map((u: any) => u.dial).join(",");
+              const upstreamsArr: unknown[] = Array.isArray(h.upstreams) ? h.upstreams : [];
+              const upstreams = upstreamsArr
+                .map((u) => {
+                  if (u && typeof u === "object") {
+                    const dial = (u as CaddyUpstream).dial;
+                    if (typeof dial === "string") return dial;
+                  }
+                  return "?";
+                })
+                .join(",");
               return `reverse_proxy(${upstreams})`;
             }
-            if (h.handler === "file_server") return `file_server(${h.root || "."})`;
-            if (h.handler === "static_response") return `static_response(${h.status_code || 200})`;
-            if (h.handler === "rewrite") return `rewrite(${h.uri || "..."})`;
-            if (h.handler === "subroute") return `subroute(${h.routes?.length || 0} routes)`;
+            if (h.handler === "file_server") {
+              const root = typeof h.root === "string" ? h.root : ".";
+              return `file_server(${root})`;
+            }
+            if (h.handler === "static_response") {
+              const status = typeof h.status_code === "number" ? h.status_code : 200;
+              return `static_response(${status})`;
+            }
+            if (h.handler === "rewrite") {
+              const uri = typeof h.uri === "string" ? h.uri : "...";
+              return `rewrite(${uri})`;
+            }
+            if (h.handler === "subroute") {
+              const count = Array.isArray(h.routes) ? h.routes.length : 0;
+              return `subroute(${count} routes)`;
+            }
             if (h.handler === "encode") return "encode";
             if (h.handler === "headers") return "headers";
-            if (h.handler === "authentication")
-              return `auth(${h.providers ? Object.keys(h.providers).join(",") : "..."})`;
-            if (h.handler === "error") return `error(${h.status_code || "..."})`;
-            return h.handler || "unknown";
+            if (h.handler === "authentication") {
+              const providers =
+                h.providers && typeof h.providers === "object"
+                  ? Object.keys(h.providers as Record<string, unknown>).join(",")
+                  : "...";
+              return `auth(${providers})`;
+            }
+            if (h.handler === "error") {
+              const status = typeof h.status_code === "number" ? h.status_code : "...";
+              return `error(${status})`;
+            }
+            return typeof h.handler === "string" ? h.handler : "unknown";
           })
           .join(" → ");
 
-        lines.push(`  Route ${i}:${id}${group} ${matchers} → ${handlers}${route.terminal ? " [terminal]" : ""}`);
+        const terminal = route.terminal === true ? " [terminal]" : "";
+        lines.push(`  Route ${i}:${id}${group} ${matchers} → ${handlers}${terminal}`);
       }
 
       return {

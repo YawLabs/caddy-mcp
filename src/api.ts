@@ -11,6 +11,15 @@ export interface ApiResponse<T = any> {
 
 /** Cache of path → ETag from successful config GETs, used for optimistic concurrency */
 const etagCache = new Map<string, string>();
+const MAX_ETAG_CACHE = 256;
+
+function setEtag(path: string, etag: string): void {
+  if (etagCache.size >= MAX_ETAG_CACHE && !etagCache.has(path)) {
+    const oldest = etagCache.keys().next().value;
+    if (oldest !== undefined) etagCache.delete(oldest);
+  }
+  etagCache.set(path, etag);
+}
 
 function getBaseUrl(): string {
   return (process.env.CADDY_ADMIN_URL || DEFAULT_URL).replace(/\/+$/, "");
@@ -61,7 +70,7 @@ async function caddyRequest<T = any>(
     // Capture ETag from config GET responses
     const etag = res.headers.get("ETag") || undefined;
     if (method === "GET" && etag && isConfigPath) {
-      etagCache.set(path, etag);
+      setEtag(path, etag);
     }
 
     // Invalidate cached ETags after successful config writes
@@ -92,10 +101,17 @@ async function caddyRequest<T = any>(
   } catch (err: unknown) {
     const msg = err instanceof Error ? err.message : String(err);
     if (msg.includes("ECONNREFUSED") || msg.includes("fetch failed")) {
+      const baseUrl = getBaseUrl();
+      let origin = baseUrl;
+      try {
+        origin = new URL(baseUrl).origin;
+      } catch {
+        // fall through — show raw value if unparseable
+      }
       return {
         ok: false,
         status: 0,
-        error: `Cannot connect to Caddy admin API at ${getBaseUrl()} — is Caddy running?`,
+        error: `Cannot connect to Caddy admin API at ${origin} — is Caddy running?`,
       };
     }
     if (msg.includes("abort") || msg.includes("timeout")) {

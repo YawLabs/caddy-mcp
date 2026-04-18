@@ -9,7 +9,13 @@ export function registerAdaptTools(server: McpServer) {
     "Convert a Caddyfile or other config format to Caddy JSON without loading it. Useful for previewing what a Caddyfile produces. Returns the adapted JSON and any warnings separately.",
     {
       config: z.string().describe("The raw config text (e.g., Caddyfile contents)"),
-      adapter: z.string().optional().default("caddyfile").describe("Config format adapter (default: 'caddyfile')"),
+      adapter: z
+        .string()
+        .regex(/^[a-z0-9_-]+$/i, "Adapter must be alphanumeric, hyphens, or underscores")
+        .max(64)
+        .optional()
+        .default("caddyfile")
+        .describe("Config format adapter (default: 'caddyfile')"),
     },
     { readOnlyHint: true, destructiveHint: false, idempotentHint: true, openWorldHint: false },
     async ({ config, adapter }) => {

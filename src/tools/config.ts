@@ -14,16 +14,16 @@ export function registerConfigTools(server: McpServer) {
 
   server.tool(
     "caddy_config_set",
-    "Write config at a JSON path. Mode 'append' (default) adds to arrays or creates keys (POST). Mode 'overwrite' replaces existing values (PATCH). Mode 'insert' places at a specific array index (PUT) — useful for route ordering.",
+    "Write config at a JSON path. Mode 'overwrite' (default) replaces existing values (PATCH) — safe and idempotent. Mode 'append' adds to arrays or creates keys (POST) — NOT idempotent: calling twice with the same route duplicates it. Mode 'insert' places at a specific array index (PUT) — useful for route ordering.",
     {
       path: z.string().describe("Config path to write to (e.g., 'apps/http/servers/srv0/routes')"),
       value: z.any().describe("The JSON value to set at the path"),
       mode: z
         .enum(["append", "overwrite", "insert"])
         .optional()
-        .default("append")
+        .default("overwrite")
         .describe(
-          "'append' = POST (add to arrays, create on objects), 'overwrite' = PATCH (replace existing), 'insert' = PUT (insert at array index)",
+          "'overwrite' = PATCH (replace existing, default, idempotent), 'append' = POST (add to arrays / create keys, NOT idempotent), 'insert' = PUT (insert at array index)",
         ),
     },
     { readOnlyHint: false, destructiveHint: false, idempotentHint: false, openWorldHint: false },
@@ -72,7 +72,7 @@ export function registerConfigTools(server: McpServer) {
     {
       id: z
         .string()
-        .regex(/^[\w-]+$/)
+        .regex(/^[\w-]{1,128}$/)
         .describe("The @id value of the config object"),
       action: z.enum(["get", "set", "delete"]).optional().default("get").describe("Action to perform"),
       value: z.any().optional().describe("New value (required for 'set' action)"),
