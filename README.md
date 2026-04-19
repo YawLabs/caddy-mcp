@@ -200,7 +200,7 @@ Browsable read-only data — MCP clients can fetch these directly without a tool
 
 ## Requirements
 
-- Node.js 18+
+- Node.js 20+
 - Caddy 2.x with admin API enabled (default: `localhost:2019`)
 
 ## Contributing
