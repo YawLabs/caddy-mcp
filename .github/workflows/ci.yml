@@ -57,7 +57,7 @@ jobs:
 
       - name: Start Caddy (admin API on localhost:2019)
         run: |
-          caddy start
+          caddy start 2>&1 | tee caddy.log &
           for i in $(seq 1 30); do
             if curl -sf http://localhost:2019/config/ > /dev/null; then
               echo "Caddy ready after ${i}s"
@@ -77,6 +77,12 @@ jobs:
           CADDY_MCP_INTEGRATION: "1"
           CADDY_ADMIN_URL: http://localhost:2019
         run: npm test
+
+      - name: Dump Caddy log
+        if: always()
+        run: |
+          echo "=== caddy.log ==="
+          cat caddy.log || echo "no caddy.log"
 
       - name: Stop Caddy
         if: always()

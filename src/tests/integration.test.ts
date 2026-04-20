@@ -1,7 +1,14 @@
 import { beforeAll, beforeEach, describe, expect, it } from "vitest";
+import type { ApiResponse } from "../api.js";
 import * as api from "../api.js";
 
 const RUN = process.env.CADDY_MCP_INTEGRATION === "1";
+
+function assertOk<T>(res: ApiResponse<T>, label: string): asserts res is ApiResponse<T> & { ok: true } {
+  if (!res.ok) {
+    throw new Error(`${label} failed: status=${res.status} error=${res.error ?? "(none)"}`);
+  }
+}
 
 /**
  * Live-Caddy integration tests. Skipped unless CADDY_MCP_INTEGRATION=1 is set.
@@ -10,6 +17,9 @@ const RUN = process.env.CADDY_MCP_INTEGRATION === "1";
  */
 describe.skipIf(!RUN)("integration: live Caddy admin API", () => {
   beforeAll(async () => {
+    console.error(
+      `[integration] env: CADDY_ADMIN_URL=${process.env.CADDY_ADMIN_URL} CADDY_MAX_RETRIES=${process.env.CADDY_MAX_RETRIES}`,
+    );
     const res = await api.configGet();
     if (!res.ok) {
       throw new Error(`Cannot reach Caddy at ${process.env.CADDY_ADMIN_URL || "http://localhost:2019"}: ${res.error}`);
@@ -39,9 +49,10 @@ describe.skipIf(!RUN)("integration: live Caddy admin API", () => {
   });
 
   it("POSTs a reverse_proxy route and reads it back", async () => {
-    await api.loadConfig({
+    const loadRes = await api.loadConfig({
       apps: { http: { servers: { srv0: { listen: [":18883"], routes: [] } } } },
     });
+    assertOk(loadRes, "loadConfig");
 
     const route = {
       match: [{ host: ["api.test"] }],
@@ -49,16 +60,16 @@ describe.skipIf(!RUN)("integration: live Caddy admin API", () => {
       terminal: true,
     };
     const postRes = await api.configPost("apps/http/servers/srv0/routes", route);
-    expect(postRes.ok).toBe(true);
+    assertOk(postRes, "configPost route");
 
     const getRes = await api.configGet<unknown[]>("apps/http/servers/srv0/routes");
-    expect(getRes.ok).toBe(true);
+    assertOk(getRes, "configGet routes");
     expect(Array.isArray(getRes.data)).toBe(true);
     expect(getRes.data).toHaveLength(1);
   });
 
   it("DELETE removes a route by path", async () => {
-    await api.loadConfig({
+    const loadRes = await api.loadConfig({
       apps: {
         http: {
           servers: {
@@ -75,12 +86,13 @@ describe.skipIf(!RUN)("integration: live Caddy admin API", () => {
         },
       },
     });
+    assertOk(loadRes, "loadConfig");
 
     const del = await api.configDelete("apps/http/servers/srv0/routes/0");
-    expect(del.ok).toBe(true);
+    assertOk(del, "configDelete route");
 
     const get = await api.configGet<unknown[]>("apps/http/servers/srv0/routes");
-    expect(get.ok).toBe(true);
+    assertOk(get, "configGet after delete");
     expect(get.data).toEqual([]);
   });
 
@@ -121,7 +133,7 @@ describe.skipIf(!RUN)("integration: live Caddy admin API", () => {
   });
 
   it("configByIdGet + Delete works end-to-end", async () => {
-    await api.loadConfig({
+    const loadRes = await api.loadConfig({
       apps: {
         http: {
           servers: {
@@ -139,12 +151,13 @@ describe.skipIf(!RUN)("integration: live Caddy admin API", () => {
         },
       },
     });
+    assertOk(loadRes, "loadConfig with @id");
 
     const get = await api.configByIdGet("integration-route");
-    expect(get.ok).toBe(true);
+    assertOk(get, "configByIdGet");
 
     const del = await api.configByIdDelete("integration-route");
-    expect(del.ok).toBe(true);
+    assertOk(del, "configByIdDelete");
 
     const getAfter = await api.configByIdGet("integration-route");
     expect(getAfter.ok).toBe(false);
