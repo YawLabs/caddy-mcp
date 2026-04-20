@@ -3,6 +3,60 @@ import { z } from "zod";
 import * as api from "../api.js";
 import { formatResult } from "../format.js";
 
+interface CaddyServerSummary {
+  listen?: unknown;
+  routes?: unknown;
+  tls_connection_policies?: unknown;
+}
+
+interface CaddyTlsIssuer {
+  email?: unknown;
+  ca?: unknown;
+  module?: unknown;
+}
+
+interface CaddyTlsPolicy {
+  issuers?: unknown;
+}
+
+interface CaddyConfigShape {
+  apps?: {
+    http?: {
+      servers?: Record<string, CaddyServerSummary>;
+    };
+    tls?: {
+      automation?: {
+        policies?: unknown;
+      };
+    };
+  };
+}
+
+function describeServer(raw: CaddyServerSummary): string {
+  const listen: unknown[] = Array.isArray(raw.listen) ? raw.listen : [];
+  const routes: unknown[] = Array.isArray(raw.routes) ? raw.routes : [];
+  const hasExplicitTls = !!raw.tls_connection_policies;
+  const listensHttps = listen.some((l) => typeof l === "string" && l.includes(":443"));
+  const tls = hasExplicitTls ? "enabled" : listensHttps ? "auto (HTTPS)" : "off (HTTP only)";
+  const listenStr = listen.length > 0 ? listen.map(String).join(", ") : "default";
+  return `${routes.length} route(s), listen: ${listenStr}, TLS: ${tls}`;
+}
+
+function findAcmeEmail(policies: unknown): string | undefined {
+  if (!Array.isArray(policies)) return undefined;
+  for (const rawPolicy of policies) {
+    if (!rawPolicy || typeof rawPolicy !== "object") continue;
+    const policy = rawPolicy as CaddyTlsPolicy;
+    if (!Array.isArray(policy.issuers)) continue;
+    for (const rawIssuer of policy.issuers) {
+      if (!rawIssuer || typeof rawIssuer !== "object") continue;
+      const issuer = rawIssuer as CaddyTlsIssuer;
+      if (typeof issuer.email === "string") return issuer.email;
+    }
+  }
+  return undefined;
+}
+
 export function registerOperationalTools(server: McpServer) {
   server.tool(
     "caddy_status",
@@ -10,12 +64,11 @@ export function registerOperationalTools(server: McpServer) {
     {},
     { readOnlyHint: true, destructiveHint: false, idempotentHint: true, openWorldHint: false },
     async () => {
-      const res = await api.configGet();
+      const res = await api.configGet<CaddyConfigShape>();
       if (!res.ok) return formatResult(res);
 
-      const config = res.data || {};
-      const httpApp = config?.apps?.http;
-      const servers = httpApp?.servers || {};
+      const config = res.data ?? {};
+      const servers = config.apps?.http?.servers ?? {};
       const serverNames = Object.keys(servers);
 
       const lines: string[] = ["Caddy is running", ""];
@@ -24,23 +77,12 @@ export function registerOperationalTools(server: McpServer) {
         lines.push("No HTTP servers configured");
       } else {
         for (const name of serverNames) {
-          const srv = servers[name];
-          const listen = srv.listen || [];
-          const routes = srv.routes || [];
-          const hasExplicitTls = !!srv.tls_connection_policies;
-          const listensHttps = listen.some((l: string) => l.includes(":443"));
-          const tls = hasExplicitTls ? "enabled" : listensHttps ? "auto (HTTPS)" : "off (HTTP only)";
-          lines.push(
-            `Server "${name}": ${routes.length} route(s), listen: ${listen.join(", ") || "default"}, TLS: ${tls}`,
-          );
+          lines.push(`Server "${name}": ${describeServer(servers[name])}`);
         }
       }
 
-      const tlsApp = config?.apps?.tls;
-      if (tlsApp?.automation?.policies) {
-        const email = tlsApp.automation.policies.find((p: any) => p.issuers)?.issuers?.[0]?.email;
-        if (email) lines.push(`\nACME email: ${email}`);
-      }
+      const email = findAcmeEmail(config.apps?.tls?.automation?.policies);
+      if (email) lines.push(`\nACME email: ${email}`);
 
       return { content: [{ type: "text" as const, text: lines.join("\n") }] };
     },
@@ -52,25 +94,16 @@ export function registerOperationalTools(server: McpServer) {
     {},
     { readOnlyHint: true, destructiveHint: false, idempotentHint: true, openWorldHint: false },
     async () => {
-      const res = await api.configGet("apps/http/servers");
+      const res = await api.configGet<Record<string, CaddyServerSummary>>("apps/http/servers");
       if (!res.ok) return formatResult(res);
 
-      const servers = res.data || {};
+      const servers = res.data ?? {};
       const names = Object.keys(servers);
       if (names.length === 0) {
         return { content: [{ type: "text" as const, text: "No HTTP servers configured" }] };
       }
 
-      const lines: string[] = [];
-      for (const name of names) {
-        const srv = servers[name];
-        const listen = srv.listen || [];
-        const routes = srv.routes || [];
-        const hasExplicitTls = !!srv.tls_connection_policies;
-        const listensHttps = listen.some((l: string) => l.includes(":443"));
-        const tls = hasExplicitTls ? "enabled" : listensHttps ? "auto (HTTPS)" : "off (HTTP only)";
-        lines.push(`  ${name}: ${routes.length} route(s), listen: ${listen.join(", ") || "default"}, TLS: ${tls}`);
-      }
+      const lines = names.map((name) => `  ${name}: ${describeServer(servers[name])}`);
       return {
         content: [{ type: "text" as const, text: `HTTP Servers:\n${lines.join("\n")}` }],
       };

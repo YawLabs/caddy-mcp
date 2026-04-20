@@ -551,6 +551,8 @@ describe("tool handler behavior", () => {
     let handler: (...args: any[]) => Promise<any>;
 
     beforeEach(async () => {
+      const { clearSnapshots } = await import("../snapshots.js");
+      clearSnapshots();
       const mockServer = { tool: vi.fn(), resource: vi.fn() };
       const { registerConfigTools } = await import("../tools/config.js");
       registerConfigTools(mockServer as any);
@@ -558,6 +560,7 @@ describe("tool handler behavior", () => {
     });
 
     it("sends JSON content type by default", async () => {
+      api.configGet.mockResolvedValue(ok({ apps: { http: {} } }));
       api.loadConfig.mockResolvedValue(ok());
 
       await handler({ config: { apps: {} }, format: "json" });
@@ -566,11 +569,114 @@ describe("tool handler behavior", () => {
     });
 
     it("sends caddyfile content type when format is caddyfile", async () => {
+      api.configGet.mockResolvedValue(ok({ apps: { http: {} } }));
       api.loadConfig.mockResolvedValue(ok());
 
       await handler({ config: "example.com { }", format: "caddyfile" });
 
       expect(api.loadConfig).toHaveBeenCalledWith("example.com { }", "text/caddyfile");
+    });
+
+    it("snapshots the current config before loading", async () => {
+      const prior = { apps: { http: { servers: { srv0: { listen: [":80"] } } } } };
+      api.configGet.mockResolvedValue(ok(prior));
+      api.loadConfig.mockResolvedValue(ok());
+
+      await handler({ config: { apps: {} }, format: "json" });
+
+      const { listSnapshots } = await import("../snapshots.js");
+      const snaps = listSnapshots();
+      expect(snaps).toHaveLength(1);
+      expect(snaps[0].trigger).toBe("caddy_load");
+      expect(snaps[0].config).toEqual(prior);
+    });
+
+    it("does not snapshot when the prior GET fails", async () => {
+      api.configGet.mockResolvedValue(err(500, "down"));
+      api.loadConfig.mockResolvedValue(ok());
+
+      await handler({ config: { apps: {} }, format: "json" });
+
+      const { listSnapshots } = await import("../snapshots.js");
+      expect(listSnapshots()).toHaveLength(0);
+    });
+  });
+
+  // ─── caddy_revert ─────────────────────────────────────────────────────
+
+  describe("caddy_revert", () => {
+    let handler: (...args: any[]) => Promise<any>;
+
+    beforeEach(async () => {
+      const { clearSnapshots } = await import("../snapshots.js");
+      clearSnapshots();
+      const mockServer = { tool: vi.fn(), resource: vi.fn() };
+      const { registerConfigTools } = await import("../tools/config.js");
+      registerConfigTools(mockServer as any);
+      handler = getToolHandler(mockServer, "caddy_revert");
+    });
+
+    it("list returns 'no snapshots' when empty", async () => {
+      const result = await handler({ action: "list", index: 0, confirm: false });
+      expect(result.content[0].text).toContain("No snapshots");
+    });
+
+    it("save captures current config as a snapshot", async () => {
+      api.configGet.mockResolvedValue(ok({ apps: { http: {} } }));
+
+      const result = await handler({ action: "save", index: 0, confirm: false });
+      expect(result.isError).toBeFalsy();
+
+      const { listSnapshots } = await import("../snapshots.js");
+      const snaps = listSnapshots();
+      expect(snaps).toHaveLength(1);
+      expect(snaps[0].trigger).toBe("manual");
+    });
+
+    it("apply refuses without confirm=true", async () => {
+      const { saveSnapshot } = await import("../snapshots.js");
+      saveSnapshot({ apps: {} }, "caddy_load");
+
+      const result = await handler({ action: "apply", index: 0, confirm: false });
+      expect(result.isError).toBe(true);
+      expect(result.content[0].text).toContain("confirm=true");
+      expect(api.loadConfig).not.toHaveBeenCalled();
+    });
+
+    it("apply errors when index is out of range", async () => {
+      const result = await handler({ action: "apply", index: 5, confirm: true });
+      expect(result.isError).toBe(true);
+      expect(result.content[0].text).toContain("no snapshot at index 5");
+    });
+
+    it("apply reverts by loading the snapshotted config", async () => {
+      const { saveSnapshot } = await import("../snapshots.js");
+      const priorConfig = { apps: { http: { servers: { srv0: {} } } } };
+      saveSnapshot(priorConfig, "caddy_load");
+
+      api.configGet.mockResolvedValue(ok({ apps: { http: {} } }));
+      api.loadConfig.mockResolvedValue(ok());
+
+      const result = await handler({ action: "apply", index: 0, confirm: true });
+      expect(result.isError).toBeFalsy();
+      expect(api.loadConfig).toHaveBeenCalledWith(priorConfig, "application/json");
+      expect(result.content[0].text).toContain("Reverted to snapshot");
+    });
+
+    it("apply snapshots current config before reverting", async () => {
+      const { saveSnapshot, listSnapshots } = await import("../snapshots.js");
+      saveSnapshot({ apps: { a: 1 } }, "caddy_load");
+
+      const currentBefore = { apps: { b: 2 } };
+      api.configGet.mockResolvedValue(ok(currentBefore));
+      api.loadConfig.mockResolvedValue(ok());
+
+      await handler({ action: "apply", index: 0, confirm: true });
+
+      const snaps = listSnapshots();
+      // Most recent snapshot should now be the caddy_revert trigger (the current config)
+      expect(snaps[0].trigger).toBe("caddy_revert");
+      expect(snaps[0].config).toEqual(currentBefore);
     });
   });
 

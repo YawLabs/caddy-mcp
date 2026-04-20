@@ -2,6 +2,7 @@ import type { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { z } from "zod";
 import * as api from "../api.js";
 import { formatResult } from "../format.js";
+import { getSnapshot, listSnapshots, saveSnapshot } from "../snapshots.js";
 
 export function registerConfigTools(server: McpServer) {
   server.tool(
@@ -62,7 +63,86 @@ export function registerConfigTools(server: McpServer) {
     { readOnlyHint: false, destructiveHint: true, idempotentHint: true, openWorldHint: false },
     async ({ config, format }) => {
       const contentType = format === "caddyfile" ? "text/caddyfile" : "application/json";
+      // Snapshot the current config before replacing it, so caddy_revert can undo the change.
+      const current = await api.configGet();
+      if (current.ok && current.data !== undefined) {
+        saveSnapshot(current.data, "caddy_load");
+      }
       return formatResult(await api.loadConfig(config, contentType));
+    },
+  );
+
+  server.tool(
+    "caddy_revert",
+    "Manage config snapshots for rollback. Snapshots are auto-captured before caddy_load and kept in-memory (last 10). Actions: 'list' shows snapshots with timestamps, 'save' manually captures the current config, 'apply' restores a snapshot (requires confirm=true).",
+    {
+      action: z.enum(["list", "save", "apply"]).describe("Action to perform"),
+      index: z
+        .number()
+        .int()
+        .nonnegative()
+        .optional()
+        .default(0)
+        .describe("Snapshot index for 'apply' (0 = most recent, default)"),
+      confirm: z.boolean().optional().default(false).describe("Must be true to actually apply a snapshot (safety)"),
+    },
+    { readOnlyHint: false, destructiveHint: true, idempotentHint: false, openWorldHint: false },
+    async ({ action, index, confirm }) => {
+      if (action === "list") {
+        const snaps = listSnapshots();
+        if (snaps.length === 0) {
+          return { content: [{ type: "text" as const, text: "No snapshots available" }] };
+        }
+        const lines = snaps.map((s, i) => {
+          const when = new Date(s.timestamp).toISOString();
+          const size = JSON.stringify(s.config).length;
+          return `  [${i}] ${when} trigger=${s.trigger} size=${size}B`;
+        });
+        return { content: [{ type: "text" as const, text: `Snapshots:\n${lines.join("\n")}` }] };
+      }
+      if (action === "save") {
+        const current = await api.configGet();
+        if (!current.ok) return formatResult(current);
+        saveSnapshot(current.data, "manual");
+        return { content: [{ type: "text" as const, text: "Snapshot saved." }] };
+      }
+      // apply
+      if (!confirm) {
+        return {
+          isError: true,
+          content: [
+            {
+              type: "text" as const,
+              text: `Refusing to apply snapshot [${index}] without confirm=true. Re-run with confirm:true to proceed.`,
+            },
+          ],
+        };
+      }
+      const snap = getSnapshot(index);
+      if (!snap) {
+        return {
+          isError: true,
+          content: [
+            {
+              type: "text" as const,
+              text: `Error: no snapshot at index ${index}. Use action='list' to see available snapshots.`,
+            },
+          ],
+        };
+      }
+      // Snapshot current config before reverting, so reverts are themselves revertible.
+      const current = await api.configGet();
+      if (current.ok && current.data !== undefined) {
+        saveSnapshot(current.data, "caddy_revert");
+      }
+      const res = await api.loadConfig(snap.config, "application/json");
+      if (!res.ok) return formatResult(res);
+      const when = new Date(snap.timestamp).toISOString();
+      return {
+        content: [
+          { type: "text" as const, text: `Reverted to snapshot [${index}] (${when}, trigger=${snap.trigger}).` },
+        ],
+      };
     },
   );
 

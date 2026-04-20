@@ -1,5 +1,9 @@
 const DEFAULT_URL = "http://localhost:2019";
 const TIMEOUT = 10000;
+const RETRY_BASE_MS = 100;
+const RETRY_MAX_DELAY_MS = 2000;
+const RETRY_MAX_JITTER_MS = 50;
+const RETRY_HARD_CAP = 5;
 
 export interface ApiResponse<T = any> {
   ok: boolean;
@@ -25,6 +29,14 @@ function getBaseUrl(): string {
   return (process.env.CADDY_ADMIN_URL || DEFAULT_URL).replace(/\/+$/, "");
 }
 
+function getMaxRetries(): number {
+  const raw = process.env.CADDY_MAX_RETRIES;
+  if (raw === undefined) return 2;
+  const n = Number(raw);
+  if (!Number.isFinite(n) || n < 0) return 2;
+  return Math.min(Math.floor(n), RETRY_HARD_CAP);
+}
+
 function getHeaders(contentType?: string): Record<string, string> {
   const headers: Record<string, string> = {};
   if (contentType) headers["Content-Type"] = contentType;
@@ -38,7 +50,39 @@ function normalizePath(path: string): string {
   return path.replace(/^\/?(config(\/|$))?/, "");
 }
 
+function sleep(ms: number): Promise<void> {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+/** Retry network failures (status 0) and 5xx. Never 4xx, including 412 (concurrency). */
+function isTransientFailure(res: ApiResponse): boolean {
+  if (res.ok) return false;
+  if (res.status === 0) return true;
+  if (res.status >= 500 && res.status <= 599) return true;
+  return false;
+}
+
 async function caddyRequest<T = any>(
+  method: string,
+  path: string,
+  body?: unknown,
+  contentType?: string,
+  timeout?: number,
+): Promise<ApiResponse<T>> {
+  const maxRetries = getMaxRetries();
+  let attempt = 0;
+  let res: ApiResponse<T> = await attemptRequest<T>(method, path, body, contentType, timeout);
+  while (isTransientFailure(res) && attempt < maxRetries) {
+    attempt++;
+    const backoff = Math.min(RETRY_BASE_MS * 2 ** (attempt - 1), RETRY_MAX_DELAY_MS);
+    const delay = backoff + Math.random() * RETRY_MAX_JITTER_MS;
+    await sleep(delay);
+    res = await attemptRequest<T>(method, path, body, contentType, timeout);
+  }
+  return res;
+}
+
+async function attemptRequest<T = any>(
   method: string,
   path: string,
   body?: unknown,
@@ -154,8 +198,8 @@ export async function loadConfig(config: unknown, contentType?: string): Promise
   return res;
 }
 
-export function adapt(config: string, adapter = "caddyfile"): Promise<ApiResponse> {
-  return caddyRequest("POST", "/adapt", config, `text/${adapter}`);
+export function adapt<T = any>(config: string, adapter = "caddyfile"): Promise<ApiResponse<T>> {
+  return caddyRequest<T>("POST", "/adapt", config, `text/${adapter}`);
 }
 
 export function stop(): Promise<ApiResponse> {

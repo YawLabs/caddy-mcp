@@ -3,6 +3,24 @@ import { z } from "zod";
 import * as api from "../api.js";
 import { formatResult } from "../format.js";
 
+interface AdaptWarning {
+  directive?: unknown;
+  message?: unknown;
+}
+
+interface AdaptResponse {
+  result?: unknown;
+  warnings?: unknown;
+}
+
+function formatWarning(w: unknown): string {
+  if (!w || typeof w !== "object") return `  - unknown: ${JSON.stringify(w)}`;
+  const obj = w as AdaptWarning;
+  const directive = typeof obj.directive === "string" ? obj.directive : "unknown";
+  const message = typeof obj.message === "string" ? obj.message : JSON.stringify(w);
+  return `  - ${directive}: ${message}`;
+}
+
 export function registerAdaptTools(server: McpServer) {
   server.tool(
     "caddy_adapt",
@@ -19,15 +37,14 @@ export function registerAdaptTools(server: McpServer) {
     },
     { readOnlyHint: true, destructiveHint: false, idempotentHint: true, openWorldHint: false },
     async ({ config, adapter }) => {
-      const res = await api.adapt(config, adapter);
+      const res = await api.adapt<AdaptResponse>(config, adapter);
       if (!res.ok) return formatResult(res);
-      const warnings: any[] = res.data?.warnings || [];
-      const result = res.data?.result;
+      const data: AdaptResponse = res.data ?? {};
+      const warnings: unknown[] = Array.isArray(data.warnings) ? data.warnings : [];
+      const result = data.result;
       const content: { type: "text"; text: string }[] = [];
       if (warnings.length > 0) {
-        const warnLines = warnings.map(
-          (w: any) => `  - ${w.directive || "unknown"}: ${w.message || JSON.stringify(w)}`,
-        );
+        const warnLines = warnings.map(formatWarning);
         content.push({ type: "text" as const, text: `Warnings:\n${warnLines.join("\n")}` });
       }
       content.push({

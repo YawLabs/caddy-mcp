@@ -1,7 +1,7 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
 
 describe("caddy-mcp tools", () => {
-  it("registers exactly 17 tools", async () => {
+  it("registers exactly 18 tools", async () => {
     const registeredTools: string[] = [];
     const mockServer = {
       tool: vi.fn((...args: any[]) => {
@@ -25,7 +25,7 @@ describe("caddy-mcp tools", () => {
     registerOperationalTools(mockServer as any);
     registerResources(mockServer as any);
 
-    expect(registeredTools.length).toBe(17);
+    expect(registeredTools.length).toBe(18);
   });
 
   it("all tool names start with caddy_", async () => {
@@ -83,9 +83,11 @@ describe("caddy-mcp tools", () => {
     "caddy_config_set",
     "caddy_config_delete",
     "caddy_load",
+    "caddy_revert",
     "caddy_config_by_id",
     "caddy_reverse_proxy",
     "caddy_add_route",
+    "caddy_remove_route",
     "caddy_list_routes",
     "caddy_adapt",
     "caddy_tls",
@@ -177,7 +179,7 @@ describe("caddy-mcp tools", () => {
     });
   });
 
-  it("registers 2 resources", async () => {
+  it("registers 4 resources", async () => {
     const resources: string[] = [];
     const mockServer = {
       tool: vi.fn(),
