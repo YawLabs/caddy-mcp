@@ -17,14 +17,18 @@ function assertOk<T>(res: ApiResponse<T>, label: string): asserts res is ApiResp
  */
 describe.skipIf(!RUN)("integration: live Caddy admin API", () => {
   beforeAll(async () => {
-    console.error(
-      `[integration] env: CADDY_ADMIN_URL=${process.env.CADDY_ADMIN_URL} CADDY_MAX_RETRIES=${process.env.CADDY_MAX_RETRIES}`,
-    );
     const res = await api.configGet();
     if (!res.ok) {
       throw new Error(`Cannot reach Caddy at ${process.env.CADDY_ADMIN_URL || "http://localhost:2019"}: ${res.error}`);
     }
   });
+
+  /**
+   * Host matchers trigger Caddy's automatic HTTPS, which tries to bind :80 for
+   * HTTP→HTTPS redirects. Non-root CI runners can't bind :80 and Caddy returns
+   * a 500. Every server with host-matched routes must disable redirects.
+   */
+  const noAutoHttps = { automatic_https: { disable_redirects: true } };
 
   beforeEach(async () => {
     // Reset to empty config for a clean slate per test.
@@ -50,7 +54,7 @@ describe.skipIf(!RUN)("integration: live Caddy admin API", () => {
 
   it("POSTs a reverse_proxy route and reads it back", async () => {
     const loadRes = await api.loadConfig({
-      apps: { http: { servers: { srv0: { listen: [":18883"], routes: [] } } } },
+      apps: { http: { servers: { srv0: { listen: [":18883"], routes: [], ...noAutoHttps } } } },
     });
     assertOk(loadRes, "loadConfig");
 
@@ -81,6 +85,7 @@ describe.skipIf(!RUN)("integration: live Caddy admin API", () => {
                   handle: [{ handler: "static_response", status_code: 204 }],
                 },
               ],
+              ...noAutoHttps,
             },
           },
         },
@@ -146,6 +151,7 @@ describe.skipIf(!RUN)("integration: live Caddy admin API", () => {
                   handle: [{ handler: "static_response", status_code: 204 }],
                 },
               ],
+              ...noAutoHttps,
             },
           },
         },
