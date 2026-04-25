@@ -103,6 +103,12 @@ export function registerConfigTools(server: McpServer) {
       if (action === "save") {
         const current = await api.configGet();
         if (!current.ok) return formatResult(current);
+        if (current.data === undefined) {
+          return {
+            isError: true,
+            content: [{ type: "text" as const, text: "Error: no config loaded to snapshot" }],
+          };
+        }
         saveSnapshot(current.data, "manual");
         return { content: [{ type: "text" as const, text: "Snapshot saved." }] };
       }

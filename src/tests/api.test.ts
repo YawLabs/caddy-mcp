@@ -208,4 +208,59 @@ describe("api", () => {
       expect(calls).toBe(3);
     });
   });
+
+  describe("path traversal rejection", () => {
+    it("rejects .. in configGet path without hitting fetch", async () => {
+      const api = await import("../api.js");
+      let called = 0;
+      globalThis.fetch = vi.fn(async () => {
+        called++;
+        return new Response("{}", { status: 200 });
+      }) as any;
+
+      const res = await api.configGet("../load");
+      expect(res.ok).toBe(false);
+      expect(res.error).toContain("'..'");
+      expect(called).toBe(0);
+    });
+
+    it("rejects .. in configPost, configPut, configPatch, configDelete", async () => {
+      const api = await import("../api.js");
+      globalThis.fetch = vi.fn(async () => new Response("{}", { status: 200 })) as any;
+
+      for (const call of [
+        api.configPost("apps/../stop", {}),
+        api.configPut("apps/../load", {}),
+        api.configPatch("apps/../stop", {}),
+        api.configDelete("apps/../config"),
+      ]) {
+        const res = await call;
+        expect(res.ok).toBe(false);
+        expect(res.error).toContain("'..'");
+      }
+    });
+
+    it("rejects .. in configById subpath", async () => {
+      const api = await import("../api.js");
+      let called = 0;
+      globalThis.fetch = vi.fn(async () => {
+        called++;
+        return new Response("{}", { status: 200 });
+      }) as any;
+
+      const res = await api.configByIdGet("my-route", "../../load");
+      expect(res.ok).toBe(false);
+      expect(res.error).toContain("'..'");
+      expect(called).toBe(0);
+    });
+
+    it("allows legitimate paths with .. as a substring of a segment", async () => {
+      const api = await import("../api.js");
+      globalThis.fetch = vi.fn(async () => new Response("{}", { status: 200 })) as any;
+
+      // ".." only matches as a full path segment — substrings are fine.
+      const res = await api.configGet("apps/http/servers/my..name");
+      expect(res.ok).toBe(true);
+    });
+  });
 });

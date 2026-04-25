@@ -5,6 +5,30 @@ All notable changes to this project are documented here.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.0.1] — 2026-04-24
+
+### Security
+
+- **Reject `..` segments in config paths.** `caddy_config_get/set/delete` and
+  `caddy_config_by_id` (subpath) now return an error on paths containing `..`
+  segments, so config-scoped tools can't reach sibling admin endpoints like
+  `/load` or `/stop`.
+
+### Fixed
+
+- **`caddy_remove_route` no longer claims ETag protection it doesn't provide.**
+  The index-based branch reads the parent routes array and deletes a child path;
+  the ETag cache keys didn't match, so `If-Match` was never sent. Tool
+  description and inline comment corrected — prefer `@id`-based removal for
+  concurrent-edit safety.
+- **`caddy_revert action="save"` guards against `undefined` data**, matching
+  `caddy_load` and the `apply` branch. Avoids a later `JSON.stringify`
+  exception on listing.
+
+### Changed
+
+- **Build target bumped from node18 to node20** to match `engines.node >=20`.
+
 ## [1.0.0] — 2026-04-20
 
 First stable release. API surface is now frozen under semver.

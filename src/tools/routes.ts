@@ -312,7 +312,7 @@ export function registerRouteTools(server: McpServer) {
 
   server.tool(
     "caddy_remove_route",
-    "Remove a route. Target by @id (preferred — stable across reorderings) or by array index on a specific server. Uses ETags to prevent concurrent overwrites.",
+    "Remove a route. Target by @id (preferred — stable across reorderings) or by array index on a specific server. Index-based removal is a two-step read-then-delete and can race against concurrent edits; prefer @id when possible.",
     {
       id: z
         .string()
@@ -358,7 +358,7 @@ export function registerRouteTools(server: McpServer) {
         if (res.ok) return { content: [{ type: "text" as const, text: `Route @id="${id}" removed.` }] };
         return formatResult(res);
       }
-      // Read first so we populate the ETag cache, then delete by index
+      // Read first to bounds-check the index and give a clear error if out of range.
       const readRes = await api.configGet(`apps/http/servers/${srv}/routes`);
       if (!readRes.ok) return formatResult(readRes);
       const routes = readRes.data;

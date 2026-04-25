@@ -50,6 +50,18 @@ function normalizePath(path: string): string {
   return path.replace(/^\/?(config(\/|$))?/, "");
 }
 
+/** Reject path-traversal segments so config-scoped tools can't reach sibling admin endpoints like /load or /stop. */
+function rejectTraversal(path: string): ApiResponse | null {
+  if (/(^|\/)\.\.(\/|$)/.test(path)) {
+    return {
+      ok: false,
+      status: 0,
+      error: `Invalid path "${path}": '..' segments are not allowed`,
+    };
+  }
+  return null;
+}
+
 function sleep(ms: number): Promise<void> {
   return new Promise((resolve) => setTimeout(resolve, ms));
 }
@@ -167,26 +179,36 @@ async function attemptRequest<T = any>(
 
 export function configGet<T = any>(path = ""): Promise<ApiResponse<T>> {
   const normalized = normalizePath(path);
+  const bad = rejectTraversal(normalized);
+  if (bad) return Promise.resolve(bad);
   return caddyRequest("GET", `/config/${normalized}`);
 }
 
 export function configPost<T = any>(path: string, value: unknown): Promise<ApiResponse<T>> {
   const normalized = normalizePath(path);
+  const bad = rejectTraversal(normalized);
+  if (bad) return Promise.resolve(bad);
   return caddyRequest("POST", `/config/${normalized}`, value);
 }
 
 export function configPut<T = any>(path: string, value: unknown): Promise<ApiResponse<T>> {
   const normalized = normalizePath(path);
+  const bad = rejectTraversal(normalized);
+  if (bad) return Promise.resolve(bad);
   return caddyRequest("PUT", `/config/${normalized}`, value);
 }
 
 export function configPatch<T = any>(path: string, value: unknown): Promise<ApiResponse<T>> {
   const normalized = normalizePath(path);
+  const bad = rejectTraversal(normalized);
+  if (bad) return Promise.resolve(bad);
   return caddyRequest("PATCH", `/config/${normalized}`, value);
 }
 
 export function configDelete<T = any>(path: string): Promise<ApiResponse<T>> {
   const normalized = normalizePath(path);
+  const bad = rejectTraversal(normalized);
+  if (bad) return Promise.resolve(bad);
   return caddyRequest("DELETE", `/config/${normalized}`);
 }
 
@@ -219,6 +241,8 @@ export function getPkiCertificates(ca = "local"): Promise<ApiResponse> {
 }
 
 export function configByIdGet<T = any>(id: string, subpath = ""): Promise<ApiResponse<T>> {
+  const bad = rejectTraversal(subpath);
+  if (bad) return Promise.resolve(bad);
   const path = subpath ? `/id/${id}/${subpath}` : `/id/${id}`;
   return caddyRequest("GET", path);
 }
@@ -229,11 +253,15 @@ export function configByIdSet<T = any>(
   method: "POST" | "PATCH" | "PUT" = "PATCH",
   subpath = "",
 ): Promise<ApiResponse<T>> {
+  const bad = rejectTraversal(subpath);
+  if (bad) return Promise.resolve(bad);
   const path = subpath ? `/id/${id}/${subpath}` : `/id/${id}`;
   return caddyRequest(method, path, value);
 }
 
 export function configByIdDelete<T = any>(id: string, subpath = ""): Promise<ApiResponse<T>> {
+  const bad = rejectTraversal(subpath);
+  if (bad) return Promise.resolve(bad);
   const path = subpath ? `/id/${id}/${subpath}` : `/id/${id}`;
   return caddyRequest("DELETE", path);
 }
