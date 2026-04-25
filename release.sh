@@ -1,6 +1,6 @@
 #!/bin/bash
 set -euo pipefail
-trap 'echo -e "\n\033[0;31m  ✗ Release failed at line $LINENO (exit code $?)\033[0m"' ERR
+trap 'echo -e "\n\033[0;31m  x Release failed at line $LINENO (exit code $?)\033[0m"' ERR
 
 RED='\033[0;31m'
 GREEN='\033[0;32m'
@@ -9,23 +9,17 @@ CYAN='\033[0;36m'
 NC='\033[0m'
 
 step() { echo -e "\n${CYAN}=== [$1/$TOTAL_STEPS] $2 ===${NC}"; }
-info() { echo -e "${GREEN}  ✓ $1${NC}"; }
+info() { echo -e "${GREEN}  - $1${NC}"; }
 warn() { echo -e "${YELLOW}  ! $1${NC}"; }
-fail() { echo -e "${RED}  ✗ $1${NC}"; exit 1; }
+fail() { echo -e "${RED}  x $1${NC}"; exit 1; }
 
 TOTAL_STEPS=7
 
 VERSION="${1:-}"
-IS_CI="${CI:-false}"
 
 if [ -z "$VERSION" ]; then
-  if [ "$IS_CI" = "true" ] && [ -n "${GITHUB_REF_NAME:-}" ]; then
-    VERSION="${GITHUB_REF_NAME#v}"
-    info "CI mode — version $VERSION from tag $GITHUB_REF_NAME"
-  else
-    echo "Usage: ./release.sh <version>"
-    exit 1
-  fi
+  echo "Usage: ./release.sh <version>"
+  exit 1
 fi
 
 [[ "$VERSION" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]] || fail "Invalid version: $VERSION"
@@ -37,17 +31,15 @@ command -v npm >/dev/null  || fail "npm not installed"
 
 CURRENT_VERSION=$(node -p "require('./package.json').version")
 
-if [ "$IS_CI" != "true" ]; then
-  [ -z "$(git status --porcelain)" ] || fail "Working directory not clean — commit or stash changes before releasing"
-fi
+[ -z "$(git status --porcelain)" ] || fail "Working directory not clean -- commit or stash changes before releasing"
 
 if [ "$CURRENT_VERSION" = "$VERSION" ]; then
   info "Resuming release v${VERSION}"
 else
-  info "Current version: $CURRENT_VERSION → $VERSION"
+  info "Current version: $CURRENT_VERSION -> $VERSION"
 fi
 
-if [ -z "${CI:-}" ] && [ "$CURRENT_VERSION" != "$VERSION" ]; then
+if [ "$CURRENT_VERSION" != "$VERSION" ]; then
   echo -e "\n${YELLOW}About to release v${VERSION}.${NC}"
   read -p "Continue? (y/N) " -n 1 -r
   echo
@@ -63,43 +55,35 @@ info "All checks passed"
 
 step 2 "Bump version to $VERSION"
 if [ "$CURRENT_VERSION" = "$VERSION" ]; then
-  info "Already at v${VERSION} — skipping"
+  info "Already at v${VERSION} -- skipping"
 else
   npm version "$VERSION" --no-git-tag-version
   info "package.json updated"
 fi
 
 step 3 "Commit and tag"
-if [ "$IS_CI" = "true" ]; then
-  info "CI mode — skipping commit/tag (tag triggered the workflow)"
+if [ -n "$(git status --porcelain package.json package-lock.json 2>/dev/null)" ]; then
+  git add package.json package-lock.json
+  git commit -m "v${VERSION}"
+  info "Committed version bump"
 else
-  if [ -n "$(git status --porcelain package.json package-lock.json 2>/dev/null)" ]; then
-    git add package.json package-lock.json
-    git commit -m "v${VERSION}"
-    info "Committed version bump"
-  else
-    info "Already committed — skipping"
-  fi
-  if git tag -l "v${VERSION}" | grep -q "v${VERSION}"; then
-    info "Tag v${VERSION} already exists — skipping"
-  else
-    git tag "v${VERSION}"
-    info "Tag v${VERSION} created"
-  fi
+  info "Already committed -- skipping"
+fi
+if git tag -l "v${VERSION}" | grep -q "v${VERSION}"; then
+  info "Tag v${VERSION} already exists -- skipping"
+else
+  git tag "v${VERSION}"
+  info "Tag v${VERSION} created"
 fi
 
 step 4 "Push to origin"
-if [ "$IS_CI" = "true" ]; then
-  info "CI mode — skipping push (tag was already pushed to trigger this workflow)"
-else
-  git push origin main --tags
-  info "Pushed commit and tag"
-fi
+git push origin main --tags
+info "Pushed commit and tag"
 
 step 5 "Publish to npm"
 NPM_VERSION=$(npm view @yawlabs/caddy-mcp version 2>/dev/null || echo "")
 if [ "$NPM_VERSION" = "$VERSION" ]; then
-  info "Already published to npm — skipping"
+  info "Already published to npm -- skipping"
 else
   npm publish --access public --provenance
   info "Published @yawlabs/caddy-mcp@${VERSION} to npm"
@@ -107,7 +91,7 @@ fi
 
 step 6 "Create GitHub release"
 if gh release view "v${VERSION}" >/dev/null 2>&1; then
-  info "GitHub release v${VERSION} already exists — skipping"
+  info "GitHub release v${VERSION} already exists -- skipping"
 else
   PREV_TAG=$(git tag --sort=-v:refname | grep -A1 "^v${VERSION}$" | tail -1)
   if [ -n "$PREV_TAG" ] && [ "$PREV_TAG" != "v${VERSION}" ]; then

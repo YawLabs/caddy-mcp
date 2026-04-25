@@ -13,7 +13,8 @@ function assertOk<T>(res: ApiResponse<T>, label: string): asserts res is ApiResp
 /**
  * Live-Caddy integration tests. Skipped unless CADDY_MCP_INTEGRATION=1 is set.
  * Requires a running Caddy admin API at CADDY_ADMIN_URL (default: http://localhost:2019).
- * CI provisions this via the `integration` job in .github/workflows/ci.yml.
+ * Run locally before a release: start Caddy (`caddy start`), then
+ * `CADDY_MCP_INTEGRATION=1 npm test`.
  */
 describe.skipIf(!RUN)("integration: live Caddy admin API", () => {
   beforeAll(async () => {
@@ -25,8 +26,8 @@ describe.skipIf(!RUN)("integration: live Caddy admin API", () => {
 
   /**
    * Host matchers trigger Caddy's automatic HTTPS, which tries to bind :80 for
-   * HTTP→HTTPS redirects. Non-root CI runners can't bind :80 and Caddy returns
-   * a 500. Every server with host-matched routes must disable redirects.
+   * HTTP->HTTPS redirects. Non-root test environments can't bind :80 and Caddy
+   * returns a 500. Every server with host-matched routes must disable redirects.
    */
   const noAutoHttps = { automatic_https: { disable_redirects: true } };
 

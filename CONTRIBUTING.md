@@ -25,7 +25,7 @@ npm test
 
 1. **One PR per change.** Keep PRs focused — a bug fix, a new feature, or a refactor, not all three.
 2. **Branch from `main`** (or `master` if that's the default branch).
-3. **Run `npm run lint:fix`** before committing — CI will reject formatting issues.
+3. **Run `npm run lint:fix`** before committing — merges to `main` require a clean lint/build/test locally.
 4. **Run `npm test`** and confirm all tests pass.
 5. **Write a clear PR title and description** — explain *what* changed and *why*.
 6. **All PRs require approval** from a maintainer before merging.
