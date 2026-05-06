@@ -1,4 +1,17 @@
 #!/bin/bash
+# =============================================================================
+# Release script -- build, tag, publish to npm, create GitHub release.
+# =============================================================================
+# Usage:
+#   ./release.sh <version>     local mode -- bumps, commits, tags, pushes, then
+#                              relies on CI (or local npm session) to publish.
+#   ./release.sh               CI mode -- derives version from $GITHUB_REF_NAME,
+#                              skips commit/tag/push (already done), publishes
+#                              via $NODE_AUTH_TOKEN.
+#
+# If interrupted, re-run with the same version -- each step is idempotent.
+# =============================================================================
+
 set -euo pipefail
 trap 'echo -e "\n\033[0;31m  x Release failed at line $LINENO (exit code $?)\033[0m"' ERR
 
@@ -16,22 +29,34 @@ fail() { echo -e "${RED}  x $1${NC}"; exit 1; }
 TOTAL_STEPS=7
 
 VERSION="${1:-}"
+IS_CI="${CI:-false}"
 
+# In CI the version comes from the tag that triggered the workflow.
 if [ -z "$VERSION" ]; then
-  echo "Usage: ./release.sh <version>"
-  exit 1
+  if [ "$IS_CI" = "true" ] && [ -n "${GITHUB_REF_NAME:-}" ]; then
+    VERSION="${GITHUB_REF_NAME#v}"
+    info "CI mode -- version $VERSION from tag $GITHUB_REF_NAME"
+  else
+    echo "Usage: ./release.sh <version>"
+    exit 1
+  fi
 fi
 
 [[ "$VERSION" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]] || fail "Invalid version: $VERSION"
 
 echo -e "${CYAN}Pre-flight checks...${NC}"
-command -v gh >/dev/null   || fail "gh CLI not installed"
 command -v node >/dev/null || fail "node not installed"
 command -v npm >/dev/null  || fail "npm not installed"
+# gh is only required outside CI (CI uses GITHUB_TOKEN via gh, but the binary
+# may not be on the runner image; the GitHub-release step in CI is gh-only too,
+# so still require it there).
+command -v gh >/dev/null   || fail "gh CLI not installed"
 
 CURRENT_VERSION=$(node -p "require('./package.json').version")
 
-[ -z "$(git status --porcelain)" ] || fail "Working directory not clean -- commit or stash changes before releasing"
+if [ "$IS_CI" != "true" ]; then
+  [ -z "$(git status --porcelain)" ] || fail "Working directory not clean -- commit or stash changes before releasing"
+fi
 
 if [ "$CURRENT_VERSION" = "$VERSION" ]; then
   info "Resuming release v${VERSION}"
@@ -39,7 +64,7 @@ else
   info "Current version: $CURRENT_VERSION -> $VERSION"
 fi
 
-if [ "$CURRENT_VERSION" != "$VERSION" ]; then
+if [ "$IS_CI" != "true" ] && [ "$CURRENT_VERSION" != "$VERSION" ]; then
   echo -e "\n${YELLOW}About to release v${VERSION}.${NC}"
   read -p "Continue? (y/N) " -n 1 -r
   echo
@@ -62,30 +87,45 @@ else
 fi
 
 step 3 "Commit and tag"
-if [ -n "$(git status --porcelain package.json package-lock.json 2>/dev/null)" ]; then
-  git add package.json package-lock.json
-  git commit -m "v${VERSION}"
-  info "Committed version bump"
+if [ "$IS_CI" = "true" ]; then
+  info "CI mode -- commit/tag already exist on the triggering ref, skipping"
 else
-  info "Already committed -- skipping"
-fi
-if git tag -l "v${VERSION}" | grep -q "v${VERSION}"; then
-  info "Tag v${VERSION} already exists -- skipping"
-else
-  git tag "v${VERSION}"
-  info "Tag v${VERSION} created"
+  if [ -n "$(git status --porcelain package.json package-lock.json 2>/dev/null)" ]; then
+    git add package.json package-lock.json
+    git commit -m "v${VERSION}"
+    info "Committed version bump"
+  else
+    info "Already committed -- skipping"
+  fi
+  if git tag -l "v${VERSION}" | grep -q "v${VERSION}"; then
+    info "Tag v${VERSION} already exists -- skipping"
+  else
+    git tag "v${VERSION}"
+    info "Tag v${VERSION} created"
+  fi
 fi
 
 step 4 "Push to origin"
-git push origin main --tags
-info "Pushed commit and tag"
+if [ "$IS_CI" = "true" ]; then
+  info "CI mode -- already pushed (this run was triggered by the push), skipping"
+else
+  git push origin main --tags
+  info "Pushed commit and tag"
+fi
 
 step 5 "Publish to npm"
 NPM_VERSION=$(npm view @yawlabs/caddy-mcp version 2>/dev/null || echo "")
 if [ "$NPM_VERSION" = "$VERSION" ]; then
   info "Already published to npm -- skipping"
 else
-  npm publish --access public --provenance
+  # --provenance requires an OIDC-signing-capable environment (GitHub Actions
+  # with id-token: write). Locally the flag aborts the publish with
+  # "Automatic provenance generation not supported for provider: null".
+  if [ "$IS_CI" = "true" ]; then
+    npm publish --access public --provenance
+  else
+    npm publish --access public
+  fi
   info "Published @yawlabs/caddy-mcp@${VERSION} to npm"
 fi
 
@@ -109,6 +149,17 @@ LIVE_VERSION=$(npm view @yawlabs/caddy-mcp version 2>/dev/null || echo "")
 [ "$LIVE_VERSION" = "$VERSION" ] && info "npm: @yawlabs/caddy-mcp@${LIVE_VERSION}" || warn "npm: ${LIVE_VERSION} (propagating)"
 GH_TAG=$(gh release view "v${VERSION}" --json tagName --jq '.tagName' 2>/dev/null || echo "")
 [ "$GH_TAG" = "v${VERSION}" ] && info "GitHub: ${GH_TAG}" || warn "GitHub release: not found"
+
+# In CI, attestations are attached because we publish with --provenance. A
+# missing attestation means the OIDC step regressed; it's a CI-only check.
+if [ "$IS_CI" = "true" ]; then
+  ATTEST=$(npm view "@yawlabs/caddy-mcp@${VERSION}" dist.attestations.provenance.predicateType 2>/dev/null || echo "")
+  if [ -n "$ATTEST" ]; then
+    info "provenance attestation: $ATTEST"
+  else
+    warn "no provenance attestation found on v${VERSION} (expected in CI publish)"
+  fi
+fi
 
 echo -e "\n${GREEN}  v${VERSION} released successfully!${NC}"
 echo -e "${GREEN}  npm i @yawlabs/caddy-mcp@${VERSION}${NC}\n"

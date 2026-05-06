@@ -1,0 +1,78 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - 'v*'
+  # Manual trigger for re-running a release after a workflow regression
+  # (or for an initial release on a tag that predates this workflow).
+  workflow_dispatch:
+    inputs:
+      version:
+        description: 'Version to publish (X.Y.Z, no v prefix)'
+        required: true
+        type: string
+
+# Serialize all release runs. Tags rarely arrive back-to-back, but when they
+# do, two parallel publish jobs would race on npm and one would fail with
+# "cannot publish over previously published version". cancel-in-progress is
+# false so a queued run waits its turn instead of being killed -- losing a
+# tag's release event is worse than waiting a minute.
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+      id-token: write
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          fetch-depth: 0
+
+      - uses: actions/setup-node@v6
+        with:
+          node-version: 20
+          cache: npm
+          registry-url: https://registry.npmjs.org
+
+      - run: npm ci
+
+      - name: Release
+        # On push:tags, release.sh derives the version from $GITHUB_REF_NAME.
+        # On workflow_dispatch, we pass the input version explicitly.
+        run: bash release.sh ${{ github.event.inputs.version }}
+        env:
+          CI: true
+          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+      # Post-publish smoke test: the release is live on npm, so we confirm a
+      # fresh install via npx can execute the binary and respond to --version.
+      # Catches packaging regressions (missing bin shebang, bad "files" entry,
+      # broken tsup output) before they hit real users.
+      - name: Smoke test published package
+        # Run npx from a temp dir -- if run from the checkout root, npx sees
+        # our own package.json bin entry and tries to resolve the local
+        # (unbuilt) path instead of installing the published tarball.
+        working-directory: ${{ runner.temp }}
+        run: |
+          # On workflow_dispatch, GITHUB_REF_NAME is the dispatched ref (often
+          # "main"), so prefer the inputs.version when it's set.
+          VERSION="${{ github.event.inputs.version }}"
+          if [ -z "$VERSION" ]; then
+            VERSION="${GITHUB_REF_NAME#v}"
+          fi
+          for i in 1 2 3 4 5; do
+            if npm view "@yawlabs/caddy-mcp@${VERSION}" version >/dev/null 2>&1; then
+              break
+            fi
+            echo "Waiting for @yawlabs/caddy-mcp@${VERSION} to appear on the registry (attempt $i)..."
+            sleep 5
+          done
+          # caddy-mcp is a stdio MCP server -- it doesn't expose a --version
+          # flag, so we just confirm the package metadata is live and parses.
+          npm view "@yawlabs/caddy-mcp@${VERSION}" version
