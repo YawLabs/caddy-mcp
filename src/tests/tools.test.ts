@@ -177,6 +177,21 @@ describe("caddy-mcp tools", () => {
       const { parseFrom } = await import("../tools/routes.js");
       expect(parseFrom("https://example.com")).toEqual({ host: ["example.com"] });
     });
+
+    it("strips a bare trailing slash (host-only catch-all)", async () => {
+      const { parseFrom } = await import("../tools/routes.js");
+      // "example.com/" must NOT produce path: ["/"] -- that's a useless
+      // catch-all path matcher, equivalent to host-only.
+      expect(parseFrom("example.com/")).toEqual({ host: ["example.com"] });
+    });
+
+    it("preserves trailing slash on a real path", async () => {
+      const { parseFrom } = await import("../tools/routes.js");
+      // Legitimate trailing slashes on real paths must NOT be stripped --
+      // "/api/" is semantically distinct from "/api" in Caddy path matchers.
+      expect(parseFrom("app.local/ws/")).toEqual({ host: ["app.local"], path: ["/ws/"] });
+      expect(parseFrom("example.com/api/")).toEqual({ host: ["example.com"], path: ["/api/"] });
+    });
   });
 
   it("registers 4 resources", async () => {
@@ -408,11 +423,15 @@ describe("caddy-mcp tools", () => {
       return calls.find((c) => c[0] === "caddy_tls")?.[4];
     }
 
-    it("surfaces both PATCH and POST errors when fallback fails", async () => {
+    it("surfaces both PATCH and POST errors when GET says absent and POST fallback fails", async () => {
       const handler = await getTlsHandler();
       globalThis.fetch = vi.fn(async (_url: any, opts: any) => {
         if (opts?.method === "PATCH") {
           return new Response("patch-reason-unique", { status: 500 });
+        }
+        if (opts?.method === "GET") {
+          // Simulate fresh instance — apps/tls absent.
+          return new Response("not found", { status: 404 });
         }
         if (opts?.method === "POST") {
           return new Response("post-reason-unique", { status: 500 });
@@ -425,11 +444,14 @@ describe("caddy-mcp tools", () => {
       expect(result.content[0].text).toContain("post-reason-unique");
     });
 
-    it("surfaces both errors for set_acme_ca too", async () => {
+    it("surfaces both PATCH and POST errors for set_acme_ca too", async () => {
       const handler = await getTlsHandler();
       globalThis.fetch = vi.fn(async (_url: any, opts: any) => {
         if (opts?.method === "PATCH") {
           return new Response("acme-patch-err", { status: 500 });
+        }
+        if (opts?.method === "GET") {
+          return new Response("not found", { status: 404 });
         }
         if (opts?.method === "POST") {
           return new Response("acme-post-err", { status: 500 });
@@ -440,6 +462,60 @@ describe("caddy-mcp tools", () => {
       expect(result.isError).toBe(true);
       expect(result.content[0].text).toContain("acme-patch-err");
       expect(result.content[0].text).toContain("acme-post-err");
+    });
+
+    it("refuses to clobber when GET returns existing config with unexpected shape", async () => {
+      const handler = await getTlsHandler();
+      globalThis.fetch = vi.fn(async (_url: any, opts: any) => {
+        if (opts?.method === "PATCH") {
+          return new Response("patch-failed", { status: 500 });
+        }
+        if (opts?.method === "GET") {
+          // Config exists but has no automation block (e.g. user has only certificates).
+          return new Response(JSON.stringify({ certificates: { load_files: [] } }), { status: 200 });
+        }
+        // POST/PUT must NOT be called — fail loudly if they are.
+        return new Response("should-not-be-called", { status: 500 });
+      }) as any;
+      const result = await handler({ action: "set_email", email: "foo@bar.com" });
+      expect(result.isError).toBe(true);
+      expect(result.content[0].text).toContain("Refusing to clobber");
+      expect(result.content[0].text).toContain("automation");
+      expect(result.content[0].text).toContain("caddy_config_set");
+    });
+
+    it("PUTs merged config when GET returns expected shape, preserving siblings", async () => {
+      const handler = await getTlsHandler();
+      const existing = {
+        automation: {
+          policies: [{ issuers: [{ module: "acme", email: "old@example.com" }] }],
+          on_demand: { rate_limit: { interval: "10s" } },
+        },
+      };
+      const captured: { method?: string; body?: any } = {};
+      globalThis.fetch = vi.fn(async (_url: any, opts: any) => {
+        if (opts?.method === "PATCH") {
+          return new Response("patch-failed", { status: 500 });
+        }
+        if (opts?.method === "GET") {
+          return new Response(JSON.stringify(existing), { status: 200 });
+        }
+        if (opts?.method === "PUT") {
+          captured.method = "PUT";
+          captured.body = JSON.parse(opts.body);
+          return new Response("", { status: 200 });
+        }
+        return new Response("nope", { status: 500 });
+      }) as any;
+      const result = await handler({ action: "set_acme_ca", ca: "https://new.ca/dir" });
+      expect(result.isError).toBeFalsy();
+      expect(captured.method).toBe("PUT");
+      expect(captured.body.automation.on_demand).toEqual({ rate_limit: { interval: "10s" } });
+      expect(captured.body.automation.policies[0].issuers[0]).toEqual({
+        module: "acme",
+        email: "old@example.com",
+        ca: "https://new.ca/dir",
+      });
     });
   });
 

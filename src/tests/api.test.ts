@@ -258,9 +258,266 @@ describe("api", () => {
       const api = await import("../api.js");
       globalThis.fetch = vi.fn(async () => new Response("{}", { status: 200 })) as any;
 
-      // ".." only matches as a full path segment — substrings are fine.
+      // ".." only matches as a full path segment -- substrings are fine.
       const res = await api.configGet("apps/http/servers/my..name");
       expect(res.ok).toBe(true);
+    });
+
+    it("rejects .. in configByIdGet id without hitting fetch", async () => {
+      const api = await import("../api.js");
+      let called = 0;
+      globalThis.fetch = vi.fn(async () => {
+        called++;
+        return new Response("{}", { status: 200 });
+      }) as any;
+
+      const res = await api.configByIdGet("../load");
+      expect(res.ok).toBe(false);
+      expect(res.error).toContain("'..'");
+      expect(called).toBe(0);
+    });
+
+    it("rejects .. in configByIdSet id without hitting fetch", async () => {
+      const api = await import("../api.js");
+      let called = 0;
+      globalThis.fetch = vi.fn(async () => {
+        called++;
+        return new Response("{}", { status: 200 });
+      }) as any;
+
+      const res = await api.configByIdSet("../load", {});
+      expect(res.ok).toBe(false);
+      expect(res.error).toContain("'..'");
+      expect(called).toBe(0);
+    });
+
+    it("rejects .. in configByIdDelete id without hitting fetch", async () => {
+      const api = await import("../api.js");
+      let called = 0;
+      globalThis.fetch = vi.fn(async () => {
+        called++;
+        return new Response("{}", { status: 200 });
+      }) as any;
+
+      const res = await api.configByIdDelete("../load");
+      expect(res.ok).toBe(false);
+      expect(res.error).toContain("'..'");
+      expect(called).toBe(0);
+    });
+
+    it("rejects .. in getPki ca arg without hitting fetch", async () => {
+      const api = await import("../api.js");
+      let called = 0;
+      globalThis.fetch = vi.fn(async () => {
+        called++;
+        return new Response("{}", { status: 200 });
+      }) as any;
+
+      const res = await api.getPki("../stop");
+      expect(res.ok).toBe(false);
+      expect(res.error).toContain("'..'");
+      expect(called).toBe(0);
+    });
+
+    it("rejects .. in getPkiCertificates ca arg without hitting fetch", async () => {
+      const api = await import("../api.js");
+      let called = 0;
+      globalThis.fetch = vi.fn(async () => {
+        called++;
+        return new Response("{}", { status: 200 });
+      }) as any;
+
+      const res = await api.getPkiCertificates("../stop");
+      expect(res.ok).toBe(false);
+      expect(res.error).toContain("'..'");
+      expect(called).toBe(0);
+    });
+  });
+
+  describe("ETag cache refresh on writes", () => {
+    it("refreshes cached ETag from a successful write response and uses it on the next chained write", async () => {
+      const api = await import("../api.js");
+      // Use a unique path so prior tests don't leak cache state.
+      const target = "etag-refresh-target";
+      const calls: Array<{ method: string; ifMatch: string | null }> = [];
+      globalThis.fetch = vi.fn(async (_url: any, opts: any) => {
+        const method = opts?.method ?? "GET";
+        const ifMatch = opts?.headers?.["If-Match"] ?? null;
+        calls.push({ method, ifMatch });
+        if (method === "GET") {
+          return new Response("{}", { status: 200, headers: { ETag: "etag-1" } });
+        }
+        if (calls.length === 2) {
+          // First PATCH -- return new ETag for refresh.
+          return new Response("", { status: 200, headers: { ETag: "etag-2" } });
+        }
+        // Subsequent writes -- echo back so we can inspect headers.
+        return new Response("", { status: 200 });
+      }) as any;
+
+      // Prime cache with a GET.
+      const getRes = await api.configGet(target);
+      expect(getRes.ok).toBe(true);
+
+      // First PATCH -- should send If-Match: etag-1, then refresh to etag-2.
+      const patch1 = await api.configPatch(target, { foo: 1 });
+      expect(patch1.ok).toBe(true);
+
+      // Second PATCH -- should send If-Match: etag-2 (refreshed from previous response).
+      const patch2 = await api.configPatch(target, { foo: 2 });
+      expect(patch2.ok).toBe(true);
+
+      expect(calls).toHaveLength(3);
+      expect(calls[0]?.method).toBe("GET");
+      expect(calls[1]?.method).toBe("PATCH");
+      expect(calls[1]?.ifMatch).toBe("etag-1");
+      expect(calls[2]?.method).toBe("PATCH");
+      expect(calls[2]?.ifMatch).toBe("etag-2");
+    });
+
+    it("refreshes cached ETag from a successful PUT and uses it on the next chained write", async () => {
+      const api = await import("../api.js");
+      const target = "etag-put-refresh-target";
+      const calls: Array<{ method: string; ifMatch: string | null }> = [];
+      globalThis.fetch = vi.fn(async (_url: any, opts: any) => {
+        const method = opts?.method ?? "GET";
+        const ifMatch = opts?.headers?.["If-Match"] ?? null;
+        calls.push({ method, ifMatch });
+        if (method === "GET") {
+          return new Response("{}", { status: 200, headers: { ETag: "put-etag-1" } });
+        }
+        if (method === "PUT") {
+          return new Response("", { status: 200, headers: { ETag: "put-etag-2" } });
+        }
+        // Follow-up PATCH -- echo back so we can inspect headers.
+        return new Response("", { status: 200 });
+      }) as any;
+
+      // Prime cache with a GET.
+      await api.configGet(target);
+
+      // PUT -- should send If-Match: put-etag-1, then refresh to put-etag-2.
+      const putRes = await api.configPut(target, { foo: 1 });
+      expect(putRes.ok).toBe(true);
+
+      // Chained PATCH -- should send If-Match: put-etag-2 (refreshed from PUT response).
+      const patchRes = await api.configPatch(target, { foo: 2 });
+      expect(patchRes.ok).toBe(true);
+
+      expect(calls).toHaveLength(3);
+      expect(calls[0]?.method).toBe("GET");
+      expect(calls[1]?.method).toBe("PUT");
+      expect(calls[1]?.ifMatch).toBe("put-etag-1");
+      expect(calls[2]?.method).toBe("PATCH");
+      expect(calls[2]?.ifMatch).toBe("put-etag-2");
+    });
+
+    it("invalidates cache after a successful POST, even if response carries an ETag", async () => {
+      const api = await import("../api.js");
+      const target = "etag-post-invalidate-target";
+      const calls: Array<{ method: string; ifMatch: string | null }> = [];
+      globalThis.fetch = vi.fn(async (_url: any, opts: any) => {
+        const method = opts?.method ?? "GET";
+        const ifMatch = opts?.headers?.["If-Match"] ?? null;
+        calls.push({ method, ifMatch });
+        if (method === "GET") {
+          return new Response("{}", { status: 200, headers: { ETag: "post-etag-1" } });
+        }
+        if (method === "POST") {
+          // POST returns an ETag, but it may describe the parent/root config --
+          // policy says invalidate, don't trust it for the path-resource.
+          return new Response("", { status: 200, headers: { ETag: "post-etag-bogus" } });
+        }
+        return new Response("", { status: 200 });
+      }) as any;
+
+      // Prime cache with a GET.
+      await api.configGet(target);
+
+      // POST -- sends If-Match: post-etag-1, then cache should be invalidated
+      // regardless of the returned ETag.
+      const postRes = await api.configPost(target, { foo: 1 });
+      expect(postRes.ok).toBe(true);
+
+      // Follow-up PATCH at the same path -- cache empty, no If-Match.
+      const patchRes = await api.configPatch(target, { foo: 2 });
+      expect(patchRes.ok).toBe(true);
+
+      expect(calls).toHaveLength(3);
+      expect(calls[0]?.method).toBe("GET");
+      expect(calls[1]?.method).toBe("POST");
+      expect(calls[1]?.ifMatch).toBe("post-etag-1");
+      expect(calls[2]?.method).toBe("PATCH");
+      expect(calls[2]?.ifMatch).toBe(null);
+    });
+
+    it("invalidates cache after a successful DELETE", async () => {
+      const api = await import("../api.js");
+      const target = "etag-delete-invalidate-target";
+      const calls: Array<{ method: string; ifMatch: string | null }> = [];
+      globalThis.fetch = vi.fn(async (_url: any, opts: any) => {
+        const method = opts?.method ?? "GET";
+        const ifMatch = opts?.headers?.["If-Match"] ?? null;
+        calls.push({ method, ifMatch });
+        if (method === "GET") {
+          return new Response("{}", { status: 200, headers: { ETag: "delete-etag-1" } });
+        }
+        if (method === "DELETE") {
+          // Even if DELETE returns an ETag, the resource is gone -- invalidate.
+          return new Response("", { status: 200, headers: { ETag: "delete-etag-bogus" } });
+        }
+        return new Response("", { status: 200 });
+      }) as any;
+
+      // Prime cache with a GET.
+      await api.configGet(target);
+
+      // DELETE -- sends If-Match: delete-etag-1, then cache should be invalidated.
+      const delRes = await api.configDelete(target);
+      expect(delRes.ok).toBe(true);
+
+      // Follow-up PATCH at the same path -- cache empty, no If-Match.
+      const patchRes = await api.configPatch(target, { foo: 1 });
+      expect(patchRes.ok).toBe(true);
+
+      expect(calls).toHaveLength(3);
+      expect(calls[0]?.method).toBe("GET");
+      expect(calls[1]?.method).toBe("DELETE");
+      expect(calls[1]?.ifMatch).toBe("delete-etag-1");
+      expect(calls[2]?.method).toBe("PATCH");
+      expect(calls[2]?.ifMatch).toBe(null);
+    });
+
+    it("invalidates cache when a successful write returns no ETag", async () => {
+      const api = await import("../api.js");
+      const target = "etag-no-header-target";
+      const calls: Array<{ method: string; ifMatch: string | null }> = [];
+      globalThis.fetch = vi.fn(async (_url: any, opts: any) => {
+        const method = opts?.method ?? "GET";
+        const ifMatch = opts?.headers?.["If-Match"] ?? null;
+        calls.push({ method, ifMatch });
+        if (method === "GET") {
+          return new Response("{}", { status: 200, headers: { ETag: "etag-only-on-get" } });
+        }
+        // Writes return 200 OK with no ETag header.
+        return new Response("", { status: 200 });
+      }) as any;
+
+      // Prime cache.
+      await api.configGet(target);
+
+      // First PATCH -- should send If-Match: etag-only-on-get, response has no ETag -> cache cleared.
+      await api.configPatch(target, { foo: 1 });
+
+      // Second PATCH -- cache is empty, no If-Match should be sent.
+      await api.configPatch(target, { foo: 2 });
+
+      expect(calls).toHaveLength(3);
+      expect(calls[0]?.method).toBe("GET");
+      expect(calls[1]?.method).toBe("PATCH");
+      expect(calls[1]?.ifMatch).toBe("etag-only-on-get");
+      expect(calls[2]?.method).toBe("PATCH");
+      expect(calls[2]?.ifMatch).toBe(null);
     });
   });
 });

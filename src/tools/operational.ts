@@ -42,6 +42,63 @@ function describeServer(raw: CaddyServerSummary): string {
   return `${routes.length} route(s), listen: ${listenStr}, TLS: ${tls}`;
 }
 
+/** Default max_lines for caddy_metrics. Prometheus output on busy servers can be megabytes; 500 lines is enough to skim. */
+const METRICS_DEFAULT_MAX_LINES = 500;
+
+/**
+ * Extract the metric name from a Prometheus exposition line.
+ * Returns undefined for blank lines or unrecognizable comments (e.g. `# arbitrary comment`).
+ *
+ * Handled forms:
+ *   - `# HELP metric_name help text`
+ *   - `# TYPE metric_name counter`
+ *   - `metric_name{label="v"} 1.0`
+ *   - `metric_name 1.0`
+ */
+function metricNameFromLine(line: string): string | undefined {
+  const trimmed = line.trimStart();
+  if (trimmed === "") return undefined;
+  if (trimmed.startsWith("#")) {
+    const m = trimmed.match(/^#\s+(?:HELP|TYPE)\s+([A-Za-z_:][A-Za-z0-9_:]*)/);
+    return m ? m[1] : undefined;
+  }
+  const m = trimmed.match(/^([A-Za-z_:][A-Za-z0-9_:]*)/);
+  return m ? m[1] : undefined;
+}
+
+/**
+ * Apply the optional substring filter and max_lines truncation to raw Prometheus exposition text.
+ *
+ * Filter rule: a line is kept if the metric name on that line contains the filter substring.
+ * Both `# HELP` / `# TYPE` comment lines and sample lines are matched on their metric name, so any
+ * retained metric keeps its descriptive comments alongside its samples. Lines with no parseable
+ * metric name (blank lines, free-form `#` comments) are dropped when filtering.
+ *
+ * Truncation: if the resulting line count exceeds `maxLines`, output is cut at `maxLines` and a
+ * trailing `# [truncated, N lines omitted -- use filter to narrow]` comment is appended.
+ */
+export function applyMetricsControls(raw: string, filter: string | undefined, maxLines: number): string {
+  const lines = raw.split("\n");
+  if (lines.length > 0 && lines[lines.length - 1] === "") lines.pop();
+
+  let filtered: string[];
+  if (filter && filter.length > 0) {
+    filtered = lines.filter((line) => {
+      const name = metricNameFromLine(line);
+      return name?.includes(filter) ?? false;
+    });
+  } else {
+    filtered = lines;
+  }
+
+  if (filtered.length <= maxLines) return filtered.join("\n");
+
+  const dropped = filtered.length - maxLines;
+  const kept = filtered.slice(0, maxLines);
+  kept.push(`# [truncated, ${dropped} lines omitted -- use filter to narrow]`);
+  return kept.join("\n");
+}
+
 function findAcmeEmail(policies: unknown): string | undefined {
   if (!Array.isArray(policies)) return undefined;
   for (const rawPolicy of policies) {
@@ -139,10 +196,36 @@ export function registerOperationalTools(server: McpServer) {
 
   server.tool(
     "caddy_metrics",
-    "Get Prometheus metrics from Caddy. Shows request counts, durations, TLS handshake stats, active connections, and more.",
-    {},
+    "Get Prometheus metrics from Caddy. Shows request counts, durations, TLS handshake stats, active connections, and more. " +
+      "Output can be megabytes on busy servers -- use `filter` to keep only metrics whose name contains a substring " +
+      "(e.g. 'http_requests' or 'tls'); HELP/TYPE comment lines for retained metrics are kept. " +
+      "Filter-mode drops blank lines and free-form '# comment' lines (including '# EOF'); only '# HELP'/'# TYPE' lines for matching metrics are kept. " +
+      "Use `max_lines` to cap the response (default 500); a trailing comment reports how many lines were dropped.",
+    {
+      filter: z
+        .string()
+        .optional()
+        .describe(
+          "Substring to match against metric names. Keeps sample lines whose metric name contains this substring, " +
+            "plus their `# HELP` and `# TYPE` comment lines. Empty/absent = no filtering.",
+        ),
+      max_lines: z
+        .number()
+        .int()
+        .positive()
+        .optional()
+        .describe("Maximum number of output lines (default 500). Excess lines are dropped and a summary is appended."),
+    },
     { readOnlyHint: true, destructiveHint: false, idempotentHint: true, openWorldHint: false },
-    async () => formatResult(await api.getMetrics()),
+    async ({ filter, max_lines }) => {
+      const res = await api.getMetrics();
+      if (!res.ok) return formatResult(res);
+
+      const raw = typeof res.data === "string" ? res.data : res.data !== undefined ? String(res.data) : "";
+      const limit = max_lines ?? METRICS_DEFAULT_MAX_LINES;
+      const text = applyMetricsControls(raw, filter, limit);
+      return { content: [{ type: "text" as const, text: text || "OK" }] };
+    },
   );
 
   server.tool(

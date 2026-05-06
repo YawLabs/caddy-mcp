@@ -129,9 +129,26 @@ async function attemptRequest<T = any>(
       setEtag(path, etag);
     }
 
-    // Invalidate cached ETags after successful config writes
+    // Method-aware ETag cache policy on successful config writes:
+    //   PATCH / PUT: refresh cache from the response ETag (the response
+    //     describes the same path-resource we just modified). Fall back to
+    //     invalidation when no ETag is returned.
+    //   POST: invalidate. POST appends to a collection, so the returned ETag
+    //     (if any) may describe the parent or root config rather than the
+    //     path-resource -- trusting it would risk a stale If-Match.
+    //   DELETE: invalidate. The path-resource is gone; any returned ETag
+    //     describes a different scope.
     if (isWrite && res.ok && isConfigPath) {
-      etagCache.delete(path);
+      if (method === "PATCH" || method === "PUT") {
+        if (etag) {
+          setEtag(path, etag);
+        } else {
+          etagCache.delete(path);
+        }
+      } else {
+        // POST or DELETE -- invalidate regardless of returned ETag.
+        etagCache.delete(path);
+      }
     }
 
     if (!res.ok) {
@@ -233,14 +250,20 @@ export function getUpstreams(): Promise<ApiResponse> {
 }
 
 export function getPki(ca = "local"): Promise<ApiResponse> {
+  const bad = rejectTraversal(ca);
+  if (bad) return Promise.resolve(bad);
   return caddyRequest("GET", `/pki/ca/${ca}`);
 }
 
 export function getPkiCertificates(ca = "local"): Promise<ApiResponse> {
+  const bad = rejectTraversal(ca);
+  if (bad) return Promise.resolve(bad);
   return caddyRequest("GET", `/pki/ca/${ca}/certificates`);
 }
 
 export function configByIdGet<T = any>(id: string, subpath = ""): Promise<ApiResponse<T>> {
+  const badId = rejectTraversal(id);
+  if (badId) return Promise.resolve(badId);
   const bad = rejectTraversal(subpath);
   if (bad) return Promise.resolve(bad);
   const path = subpath ? `/id/${id}/${subpath}` : `/id/${id}`;
@@ -253,6 +276,8 @@ export function configByIdSet<T = any>(
   method: "POST" | "PATCH" | "PUT" = "PATCH",
   subpath = "",
 ): Promise<ApiResponse<T>> {
+  const badId = rejectTraversal(id);
+  if (badId) return Promise.resolve(badId);
   const bad = rejectTraversal(subpath);
   if (bad) return Promise.resolve(bad);
   const path = subpath ? `/id/${id}/${subpath}` : `/id/${id}`;
@@ -260,6 +285,8 @@ export function configByIdSet<T = any>(
 }
 
 export function configByIdDelete<T = any>(id: string, subpath = ""): Promise<ApiResponse<T>> {
+  const badId = rejectTraversal(id);
+  if (badId) return Promise.resolve(badId);
   const bad = rejectTraversal(subpath);
   if (bad) return Promise.resolve(bad);
   const path = subpath ? `/id/${id}/${subpath}` : `/id/${id}`;

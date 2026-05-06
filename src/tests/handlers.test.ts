@@ -82,7 +82,8 @@ describe("tool handler behavior", () => {
       expect(routeArg.handle[0].upstreams[0].dial).toBe("localhost:3000");
     });
 
-    it("returns server-not-found error when server does not exist", async () => {
+    it("returns server-not-found error when server does not exist (legacy body match, 500)", async () => {
+      // Regression: keep the existing body-match path working even when status is non-404.
       api.configPost.mockResolvedValue(err(500, "key does not exist"));
 
       const result = await handler({ from: "app.local", to: ["localhost:3000"], server: "srv99" });
@@ -90,6 +91,207 @@ describe("tool handler behavior", () => {
       expect(result.isError).toBe(true);
       expect(result.content[0].text).toContain('Server "srv99" does not exist');
       expect(result.content[0].text).toContain("caddy_list_servers");
+    });
+
+    it("returns server-not-found on a 404 status alone (no body match)", async () => {
+      // Belt-and-braces: 404 must be treated as parent-missing even when the
+      // body doesn't carry the legacy "key does not exist" phrase.
+      api.configPost.mockResolvedValue(err(404, "Not Found"));
+
+      const result = await handler({ from: "app.local", to: ["localhost:3000"], server: "srv99" });
+
+      expect(result.isError).toBe(true);
+      expect(result.content[0].text).toContain('Server "srv99" does not exist');
+    });
+
+    it("replaces in place via PUT when @id resolves to an existing route", async () => {
+      // GET /id/<id> returns a route-shaped object (top-level handle array)
+      // -> tool PUTs the new body in place. No POST, no clobber check fires.
+      api.configByIdGet.mockResolvedValue(
+        ok({
+          "@id": "my-api-route",
+          match: [{ host: ["old.local"] }],
+          handle: [{ handler: "reverse_proxy", upstreams: [{ dial: "localhost:9999" }] }],
+          terminal: true,
+        }),
+      );
+      api.configByIdSet.mockResolvedValue(ok());
+
+      const result = await handler({
+        from: "api.local",
+        to: ["localhost:3000"],
+        server: "srv0",
+        id: "my-api-route",
+      });
+
+      expect(api.configByIdGet).toHaveBeenCalledWith("my-api-route");
+      expect(api.configPost).not.toHaveBeenCalled();
+      expect(api.configByIdSet).toHaveBeenCalledWith(
+        "my-api-route",
+        {
+          "@id": "my-api-route",
+          match: [{ host: ["api.local"] }],
+          handle: [{ handler: "reverse_proxy", upstreams: [{ dial: "localhost:3000" }] }],
+          terminal: true,
+        },
+        "PUT",
+      );
+      expect(result.content[0].text).toContain('Route set @id="my-api-route"');
+    });
+
+    it("refuses to clobber when @id resolves to a non-route object", async () => {
+      // The supplied id collides with a TLS issuer that the user @id'd. @ids
+      // are config-global; the tool MUST refuse rather than silently overwrite
+      // an unrelated subsystem's object with a route body.
+      api.configByIdGet.mockResolvedValue(
+        ok({
+          "@id": "my-api-route",
+          module: "acme",
+          email: "ops@example.com",
+          ca: "https://acme.example.com/dir",
+        }),
+      );
+
+      const result = await handler({
+        from: "api.local",
+        to: ["localhost:3000"],
+        server: "srv0",
+        id: "my-api-route",
+      });
+
+      expect(api.configByIdGet).toHaveBeenCalledWith("my-api-route");
+      // No write of any kind must happen.
+      expect(api.configByIdSet).not.toHaveBeenCalled();
+      expect(api.configPost).not.toHaveBeenCalled();
+      expect(result.isError).toBe(true);
+      expect(result.content[0].text).toContain("non-route config object");
+      expect(result.content[0].text).toContain("config-global");
+      // Error message should point at the recovery path so the caller doesn't
+      // have to grep docs.
+      expect(result.content[0].text).toContain("caddy_config_by_id");
+    });
+
+    it("refuses to clobber when @id resolves to a server (no top-level handle)", async () => {
+      // Defense-in-depth: any non-route shape must refuse, not just TLS.
+      api.configByIdGet.mockResolvedValue(ok({ "@id": "my-api-route", listen: [":443"], routes: [] }));
+
+      const result = await handler({
+        from: "api.local",
+        to: ["localhost:3000"],
+        server: "srv0",
+        id: "my-api-route",
+      });
+
+      expect(api.configByIdSet).not.toHaveBeenCalled();
+      expect(api.configPost).not.toHaveBeenCalled();
+      expect(result.isError).toBe(true);
+      expect(result.content[0].text).toContain("non-route config object");
+    });
+
+    it("first-create via id: GET 404 -> POST registers the @id", async () => {
+      // GET reports the @id doesn't exist yet -> tool POSTs the route body
+      // (with @id embedded) under the real config path so the @id registers.
+      api.configByIdGet.mockResolvedValue(err(404, "unknown object ID"));
+      api.configPost.mockResolvedValue(ok());
+
+      const result = await handler({
+        from: "api.local",
+        to: ["localhost:3000"],
+        server: "srv0",
+        id: "new-route",
+      });
+
+      expect(api.configByIdGet).toHaveBeenCalledTimes(1);
+      // Speculative PUT must NOT happen -- the GET already confirmed absent.
+      expect(api.configByIdSet).not.toHaveBeenCalled();
+      expect(api.configPost).toHaveBeenCalledWith("apps/http/servers/srv0/routes", {
+        "@id": "new-route",
+        match: [{ host: ["api.local"] }],
+        handle: [{ handler: "reverse_proxy", upstreams: [{ dial: "localhost:3000" }] }],
+        terminal: true,
+      });
+      expect(result.isError).toBeFalsy();
+      expect(result.content[0].text).toContain('Route created @id="new-route"');
+    });
+
+    it("first-create via id: GET 404 + POST 'key does not exist' -> server-not-found", async () => {
+      // GET 404 confirms the @id is absent. POST then fails parent-missing,
+      // which now genuinely means the server doesn't exist.
+      api.configByIdGet.mockResolvedValue(err(404, "unknown object ID"));
+      api.configPost.mockResolvedValue(err(500, "key does not exist"));
+
+      const result = await handler({
+        from: "app.local",
+        to: ["localhost:3000"],
+        server: "srv99",
+        id: "some-id",
+      });
+
+      expect(api.configPost).toHaveBeenCalled();
+      expect(result.isError).toBe(true);
+      expect(result.content[0].text).toContain('Server "srv99" does not exist');
+    });
+
+    it("first-create via id: GET 404 + POST 404 -> server-not-found", async () => {
+      api.configByIdGet.mockResolvedValue(err(404, ""));
+      api.configPost.mockResolvedValue(err(404, "Not Found"));
+
+      const result = await handler({
+        from: "app.local",
+        to: ["localhost:3000"],
+        server: "srv99",
+        id: "some-id",
+      });
+
+      expect(api.configPost).toHaveBeenCalled();
+      expect(result.isError).toBe(true);
+      expect(result.content[0].text).toContain('Server "srv99" does not exist');
+    });
+
+    it("non-404 GET failure (e.g. 500 unrelated body) is surfaced verbatim, no speculative write", async () => {
+      // A real GET error (auth failure, transport, server-side bug) must NOT
+      // be reinterpreted as "first-create" -- otherwise we'd POST a route the
+      // caller didn't ask to create. Loose token "unknown" by itself must not
+      // trigger fallback either; only tight markers ("unknown object id" /
+      // "no id found") + status 404 do.
+      api.configByIdGet.mockResolvedValue(err(500, "unknown handler 'foo'"));
+
+      const result = await handler({
+        from: "api.local",
+        to: ["localhost:3000"],
+        server: "srv0",
+        id: "some-id",
+      });
+
+      expect(api.configByIdSet).not.toHaveBeenCalled();
+      expect(api.configPost).not.toHaveBeenCalled();
+      expect(result.isError).toBe(true);
+      expect(result.content[0].text).toContain("unknown handler 'foo'");
+    });
+
+    it("PUT failure on the replace path is surfaced verbatim", async () => {
+      // GET said route is there; PUT then fails for a real reason (concurrency
+      // conflict, validation, transport). Must not retry as POST -- that would
+      // append a duplicate alongside the existing @id'd route.
+      api.configByIdGet.mockResolvedValue(
+        ok({
+          "@id": "my-api-route",
+          match: [{ host: ["old.local"] }],
+          handle: [{ handler: "reverse_proxy", upstreams: [{ dial: "localhost:9999" }] }],
+        }),
+      );
+      api.configByIdSet.mockResolvedValue(err(412, "Config has been modified"));
+
+      const result = await handler({
+        from: "api.local",
+        to: ["localhost:3000"],
+        server: "srv0",
+        id: "my-api-route",
+      });
+
+      expect(api.configPost).not.toHaveBeenCalled();
+      expect(result.isError).toBe(true);
+      expect(result.content[0].text).toContain("Config has been modified");
     });
   });
 
@@ -105,8 +307,23 @@ describe("tool handler behavior", () => {
       handler = getToolHandler(mockServer, "caddy_add_route");
     });
 
-    it("returns server-not-found error when server does not exist", async () => {
+    it("returns server-not-found error when server does not exist (legacy body match, 500)", async () => {
+      // Regression: body-match path still works for non-404 statuses.
       api.configPost.mockResolvedValue(err(500, "key does not exist"));
+
+      const result = await handler({
+        match: [{ host: ["x.local"] }],
+        handle: [{ handler: "file_server" }],
+        server: "missing",
+        terminal: true,
+      });
+
+      expect(result.isError).toBe(true);
+      expect(result.content[0].text).toContain('Server "missing" does not exist');
+    });
+
+    it("returns server-not-found on a 404 status alone (no body match)", async () => {
+      api.configPost.mockResolvedValue(err(404, "Not Found"));
 
       const result = await handler({
         match: [{ host: ["x.local"] }],
@@ -304,7 +521,7 @@ describe("tool handler behavior", () => {
     });
   });
 
-  // ─── caddy_tls fallback ───────────────────────────────────────────────
+  // ─── caddy_tls (PATCH happy-path + safe-fallback branches) ────────────
 
   describe("caddy_tls", () => {
     let handler: (...args: any[]) => Promise<any>;
@@ -316,33 +533,39 @@ describe("tool handler behavior", () => {
       handler = getToolHandler(mockServer, "caddy_tls");
     });
 
-    it("uses PATCH when path already exists", async () => {
+    it("uses PATCH when path already exists (no GET, no POST/PUT)", async () => {
       api.configPatch.mockResolvedValue(ok());
 
       const result = await handler({ action: "set_email", email: "test@example.com" });
 
       expect(api.configPatch).toHaveBeenCalled();
+      expect(api.configGet).not.toHaveBeenCalled();
       expect(api.configPost).not.toHaveBeenCalled();
+      expect(api.configPut).not.toHaveBeenCalled();
       expect(result.content[0].text).toContain("test@example.com");
     });
 
-    it("falls back to POST when PATCH fails (fresh instance)", async () => {
+    // Branch 1: apps/tls absent — POST a fresh structure.
+    it("PATCH fails + apps/tls 404 -> POSTs fresh apps/tls", async () => {
       api.configPatch.mockResolvedValue(err(500, "key does not exist"));
+      api.configGet.mockResolvedValue(err(404, "not found"));
       api.configPost.mockResolvedValue(ok());
 
       const result = await handler({ action: "set_email", email: "test@example.com" });
 
-      expect(api.configPatch).toHaveBeenCalled();
+      expect(api.configGet).toHaveBeenCalledWith("apps/tls");
       expect(api.configPost).toHaveBeenCalledWith("apps/tls", {
         automation: {
           policies: [{ issuers: [{ module: "acme", email: "test@example.com" }] }],
         },
       });
+      expect(api.configPut).not.toHaveBeenCalled();
       expect(result.content[0].text).toContain("test@example.com");
     });
 
-    it("falls back to POST for set_acme_ca on fresh instance", async () => {
+    it("PATCH fails + GET returns undefined data -> POSTs fresh apps/tls", async () => {
       api.configPatch.mockResolvedValue(err(500, "key does not exist"));
+      api.configGet.mockResolvedValue(ok(undefined));
       api.configPost.mockResolvedValue(ok());
 
       const result = await handler({ action: "set_acme_ca", ca: "https://acme.example.com/dir" });
@@ -352,7 +575,152 @@ describe("tool handler behavior", () => {
           policies: [{ issuers: [{ module: "acme", ca: "https://acme.example.com/dir" }] }],
         },
       });
+      expect(api.configPut).not.toHaveBeenCalled();
       expect(result.content[0].text).toContain("https://acme.example.com/dir");
+    });
+
+    // Branch 2: shape OK — deep-merge into existing config and PUT it back.
+    it("PATCH fails + apps/tls exists with expected shape -> PUTs merged config (preserves siblings)", async () => {
+      const existing = {
+        automation: {
+          policies: [{ issuers: [{ module: "acme", email: "old@example.com" }] }],
+          on_demand: { rate_limit: { interval: "10s", burst: 5 } },
+        },
+        certificate_authorities: { custom: { name: "internal" } },
+      };
+      api.configPatch.mockResolvedValue(err(500, "key does not exist"));
+      api.configGet.mockResolvedValue(ok(existing));
+      api.configPut.mockResolvedValue(ok());
+
+      const result = await handler({ action: "set_acme_ca", ca: "https://new.example.com/dir" });
+
+      expect(api.configPut).toHaveBeenCalledTimes(1);
+      const [putPath, putBody] = api.configPut.mock.calls[0];
+      expect(putPath).toBe("apps/tls");
+      // Sibling fields preserved
+      expect(putBody.automation.on_demand).toEqual({ rate_limit: { interval: "10s", burst: 5 } });
+      expect(putBody.certificate_authorities).toEqual({ custom: { name: "internal" } });
+      // Existing email kept, ca added
+      expect(putBody.automation.policies[0].issuers[0]).toEqual({
+        module: "acme",
+        email: "old@example.com",
+        ca: "https://new.example.com/dir",
+      });
+      // Deep clone — original input untouched
+      expect(existing.automation.policies[0].issuers[0]).toEqual({ module: "acme", email: "old@example.com" });
+      expect(api.configPost).not.toHaveBeenCalled();
+      expect(result.isError).toBeFalsy();
+      expect(result.content[0].text).toContain("https://new.example.com/dir");
+    });
+
+    it("merge overwrites existing email when set_email targets a populated issuer", async () => {
+      const existing = {
+        automation: {
+          policies: [{ issuers: [{ module: "acme", email: "old@example.com", ca: "https://old.example.com" }] }],
+        },
+      };
+      api.configPatch.mockResolvedValue(err(500, "key does not exist"));
+      api.configGet.mockResolvedValue(ok(existing));
+      api.configPut.mockResolvedValue(ok());
+
+      await handler({ action: "set_email", email: "new@example.com" });
+
+      const [, putBody] = api.configPut.mock.calls[0];
+      expect(putBody.automation.policies[0].issuers[0]).toEqual({
+        module: "acme",
+        email: "new@example.com",
+        ca: "https://old.example.com",
+      });
+    });
+
+    // Branch 3: unexpected shape — refuse, do not clobber.
+    it("PATCH fails + apps/tls exists without automation -> refuses with shape-specific error", async () => {
+      api.configPatch.mockResolvedValue(err(500, "key does not exist"));
+      api.configGet.mockResolvedValue(ok({ certificate_authorities: { local: {} } }));
+
+      const result = await handler({ action: "set_email", email: "test@example.com" });
+
+      expect(api.configPost).not.toHaveBeenCalled();
+      expect(api.configPut).not.toHaveBeenCalled();
+      expect(result.isError).toBe(true);
+      expect(result.content[0].text).toContain("Refusing to clobber");
+      expect(result.content[0].text).toContain("automation");
+      expect(result.content[0].text).toContain("caddy_config_set");
+    });
+
+    it("PATCH fails + apps/tls.automation.policies is empty -> refuses with shape-specific error", async () => {
+      api.configPatch.mockResolvedValue(err(500, "key does not exist"));
+      api.configGet.mockResolvedValue(ok({ automation: { policies: [] } }));
+
+      const result = await handler({ action: "set_acme_ca", ca: "https://acme.example.com/dir" });
+
+      expect(api.configPost).not.toHaveBeenCalled();
+      expect(api.configPut).not.toHaveBeenCalled();
+      expect(result.isError).toBe(true);
+      expect(result.content[0].text).toContain("policies");
+      expect(result.content[0].text).toContain("caddy_config_set");
+    });
+
+    it("PATCH fails + issuers empty -> refuses with shape-specific error", async () => {
+      api.configPatch.mockResolvedValue(err(500, "key does not exist"));
+      api.configGet.mockResolvedValue(ok({ automation: { policies: [{ issuers: [] }] } }));
+
+      const result = await handler({ action: "set_email", email: "test@example.com" });
+
+      expect(api.configPost).not.toHaveBeenCalled();
+      expect(api.configPut).not.toHaveBeenCalled();
+      expect(result.isError).toBe(true);
+      expect(result.content[0].text).toContain("issuers");
+    });
+
+    it("PATCH fails + issuers[0] is non-object -> refuses with shape-specific error", async () => {
+      api.configPatch.mockResolvedValue(err(500, "key does not exist"));
+      api.configGet.mockResolvedValue(ok({ automation: { policies: [{ issuers: ["acme"] }] } }));
+
+      const result = await handler({ action: "set_email", email: "test@example.com" });
+
+      expect(api.configPost).not.toHaveBeenCalled();
+      expect(api.configPut).not.toHaveBeenCalled();
+      expect(result.isError).toBe(true);
+      expect(result.content[0].text).toContain("issuers[0]");
+    });
+
+    // Failure paths through bothErrors.
+    it("PATCH fails + GET non-404 error -> surfaces both PATCH and GET errors", async () => {
+      api.configPatch.mockResolvedValue(err(500, "patch-err-here"));
+      api.configGet.mockResolvedValue(err(500, "get-err-here"));
+
+      const result = await handler({ action: "set_email", email: "test@example.com" });
+
+      expect(api.configPost).not.toHaveBeenCalled();
+      expect(api.configPut).not.toHaveBeenCalled();
+      expect(result.isError).toBe(true);
+      expect(result.content[0].text).toContain("patch-err-here");
+      expect(result.content[0].text).toContain("get-err-here");
+    });
+
+    it("PATCH fails + GET 404 + POST fails -> surfaces both PATCH and POST errors", async () => {
+      api.configPatch.mockResolvedValue(err(500, "patch-fail"));
+      api.configGet.mockResolvedValue(err(404, "not found"));
+      api.configPost.mockResolvedValue(err(500, "post-fail"));
+
+      const result = await handler({ action: "set_email", email: "test@example.com" });
+
+      expect(result.isError).toBe(true);
+      expect(result.content[0].text).toContain("patch-fail");
+      expect(result.content[0].text).toContain("post-fail");
+    });
+
+    it("PATCH fails + shape OK + PUT fails -> surfaces both PATCH and PUT errors", async () => {
+      api.configPatch.mockResolvedValue(err(500, "patch-fail"));
+      api.configGet.mockResolvedValue(ok({ automation: { policies: [{ issuers: [{ module: "acme" }] }] } }));
+      api.configPut.mockResolvedValue(err(500, "put-fail"));
+
+      const result = await handler({ action: "set_email", email: "test@example.com" });
+
+      expect(result.isError).toBe(true);
+      expect(result.content[0].text).toContain("patch-fail");
+      expect(result.content[0].text).toContain("put-fail");
     });
 
     it("returns error when email is missing for set_email", async () => {
@@ -513,6 +881,115 @@ describe("tool handler behavior", () => {
       const result = await handler({});
 
       expect(result.content[0].text).toContain("No HTTP servers configured");
+    });
+  });
+
+  // ─── caddy_metrics ────────────────────────────────────────────────────
+
+  describe("caddy_metrics", () => {
+    let handler: (...args: any[]) => Promise<any>;
+
+    beforeEach(async () => {
+      const mockServer = { tool: vi.fn(), resource: vi.fn() };
+      const { registerOperationalTools } = await import("../tools/operational.js");
+      registerOperationalTools(mockServer as any);
+      handler = getToolHandler(mockServer, "caddy_metrics");
+    });
+
+    const sampleMetrics = [
+      "# HELP caddy_http_requests_total Counter of HTTP requests.",
+      "# TYPE caddy_http_requests_total counter",
+      'caddy_http_requests_total{server="srv0",code="200"} 42',
+      'caddy_http_requests_total{server="srv0",code="500"} 1',
+      "# HELP caddy_tls_handshakes_total Counter of TLS handshakes.",
+      "# TYPE caddy_tls_handshakes_total counter",
+      "caddy_tls_handshakes_total 17",
+      "# HELP go_goroutines Number of active goroutines.",
+      "# TYPE go_goroutines gauge",
+      "go_goroutines 23",
+    ].join("\n");
+
+    it("returns the full body when neither filter nor max_lines is provided and body is small", async () => {
+      api.getMetrics.mockResolvedValue(ok(sampleMetrics));
+
+      const result = await handler({});
+
+      expect(result.isError).toBeFalsy();
+      expect(result.content[0].text).toBe(sampleMetrics);
+    });
+
+    it("filter substring keeps matching sample lines and their HELP/TYPE; drops others", async () => {
+      api.getMetrics.mockResolvedValue(ok(sampleMetrics));
+
+      const result = await handler({ filter: "http_requests" });
+      const text = result.content[0].text;
+
+      // Kept: HELP, TYPE, two sample lines for caddy_http_requests_total.
+      expect(text).toContain("# HELP caddy_http_requests_total");
+      expect(text).toContain("# TYPE caddy_http_requests_total");
+      expect(text).toContain('caddy_http_requests_total{server="srv0",code="200"} 42');
+      expect(text).toContain('caddy_http_requests_total{server="srv0",code="500"} 1');
+
+      // Dropped: TLS and goroutines metrics (HELP, TYPE, samples).
+      expect(text).not.toContain("caddy_tls_handshakes_total");
+      expect(text).not.toContain("go_goroutines");
+    });
+
+    it("filter with no matches returns an empty body gracefully", async () => {
+      api.getMetrics.mockResolvedValue(ok(sampleMetrics));
+
+      const result = await handler({ filter: "no_such_metric_anywhere" });
+
+      expect(result.isError).toBeFalsy();
+      // No lines kept -> applyMetricsControls returns "" -> handler emits "OK".
+      expect(result.content[0].text).toBe("OK");
+    });
+
+    it("max_lines truncation produces the expected trailing line with the correct dropped count", async () => {
+      // 10 lines in sampleMetrics; max_lines=4 -> keep 4, drop 6.
+      api.getMetrics.mockResolvedValue(ok(sampleMetrics));
+
+      const result = await handler({ max_lines: 4 });
+      const text = result.content[0].text;
+      const lines = text.split("\n");
+
+      // 4 kept lines + 1 truncation comment.
+      expect(lines).toHaveLength(5);
+      expect(lines[lines.length - 1]).toBe("# [truncated, 6 lines omitted -- use filter to narrow]");
+      // First four lines should be the first four of the input.
+      expect(lines.slice(0, 4)).toEqual(sampleMetrics.split("\n").slice(0, 4));
+    });
+
+    it("does not truncate when line count is within max_lines", async () => {
+      api.getMetrics.mockResolvedValue(ok(sampleMetrics));
+
+      const result = await handler({ max_lines: 100 });
+
+      expect(result.content[0].text).toBe(sampleMetrics);
+      expect(result.content[0].text).not.toContain("# [truncated");
+    });
+
+    it("error path (api.getMetrics returns ok=false) surfaces the error via formatResult", async () => {
+      api.getMetrics.mockResolvedValue(
+        err(0, "Cannot connect to Caddy admin API at http://localhost:2019 -- is Caddy running?"),
+      );
+
+      const result = await handler({});
+
+      expect(result.isError).toBe(true);
+      expect(result.content[0].text).toContain("Cannot connect to Caddy");
+    });
+
+    it("filter and max_lines compose: filter narrows first, then truncation applies", async () => {
+      api.getMetrics.mockResolvedValue(ok(sampleMetrics));
+
+      // Filter to caddy_http_requests_total (4 lines: HELP, TYPE, 2 samples), then cap at 2.
+      const result = await handler({ filter: "http_requests", max_lines: 2 });
+      const text = result.content[0].text;
+      const lines = text.split("\n");
+
+      expect(lines).toHaveLength(3); // 2 kept + 1 truncation comment
+      expect(lines[2]).toBe("# [truncated, 2 lines omitted -- use filter to narrow]");
     });
   });
 
