@@ -138,6 +138,61 @@ describe.skipIf(!RUN)("integration: live Caddy admin API", () => {
     expect(second.status).toBe(412);
   });
 
+  // Validates Caddy's @id round-trip semantics that caddy_reverse_proxy's
+  // GET-first dispatch depends on:
+  //   1. POST a route with "@id" embedded under the routes path -> @id registers
+  //      and is resolvable via /id/<id>.
+  //   2. GET /id/<unknown> returns a non-OK response (the tool treats this as
+  //      "first-create" and falls through to POST).
+  //   3. PUT /id/<known> with a new body replaces in place; a follow-up GET
+  //      via the original config path returns the new content.
+  // If a future Caddy version regresses any of these contracts the tool's
+  // "supply id for idempotent writes" promise breaks; this test catches it.
+  it("@id round-trip: POST registers, GET resolves, PUT replaces in place", async () => {
+    const loadRes = await api.loadConfig({
+      apps: { http: { servers: { srv0: { listen: [":18891"], routes: [], ...noAutoHttps } } } },
+    });
+    assertOk(loadRes, "loadConfig empty server");
+
+    // 1. Unknown @id resolves to a not-OK response (the tool's first-create signal).
+    const missing = await api.configByIdGet("rp-route");
+    expect(missing.ok).toBe(false);
+
+    // 2. POST a route with @id embedded under the routes path -> @id registers.
+    const initialRoute = {
+      "@id": "rp-route",
+      match: [{ host: ["v1.test"] }],
+      handle: [{ handler: "static_response", status_code: 201 }],
+      terminal: true,
+    };
+    const postRes = await api.configPost("apps/http/servers/srv0/routes", initialRoute);
+    assertOk(postRes, "configPost route with @id");
+
+    // 3. /id/<rp-route> now resolves to that route.
+    const afterPost = await api.configByIdGet<{ handle?: Array<{ status_code?: unknown }> }>("rp-route");
+    assertOk(afterPost, "configByIdGet after POST");
+    expect(afterPost.data?.handle?.[0]?.status_code).toBe(201);
+
+    // 4. PUT /id/<rp-route> with a new body replaces in place.
+    const replacement = {
+      "@id": "rp-route",
+      match: [{ host: ["v2.test"] }],
+      handle: [{ handler: "static_response", status_code: 202 }],
+      terminal: true,
+    };
+    const putRes = await api.configByIdSet("rp-route", replacement, "PUT");
+    assertOk(putRes, "configByIdSet PUT replace");
+
+    // 5. The route at the original config path reflects the replacement, AND
+    //    we still have exactly one route (no duplicate appended).
+    const routes = await api.configGet<Array<{ handle?: Array<{ status_code?: unknown }> }>>(
+      "apps/http/servers/srv0/routes",
+    );
+    assertOk(routes, "configGet routes after PUT");
+    expect(routes.data).toHaveLength(1);
+    expect(routes.data?.[0]?.handle?.[0]?.status_code).toBe(202);
+  });
+
   it("configByIdGet + Delete works end-to-end", async () => {
     const loadRes = await api.loadConfig({
       apps: {

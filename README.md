@@ -107,14 +107,14 @@ Use the same JSON block shown above in any of these.
 
 ### Route operations (4)
 
-- **caddy_reverse_proxy** — Add a reverse proxy in one call: `from='api.local' to=['localhost:3000']`.
+- **caddy_reverse_proxy** — Add a reverse proxy in one call: `from='api.local' to=['localhost:3000']`. Pass an optional `id` for idempotent writes — repeat calls replace the route in place instead of duplicating.
 - **caddy_add_route** — Add a route with full match/handle control (any Caddy handler).
 - **caddy_remove_route** — Remove a route by `@id` (preferred) or by index. Requires `confirm=true`.
 - **caddy_list_routes** — Human-readable route summary. Defensive: never crashes on weird config.
 
 ### TLS & config conversion (2)
 
-- **caddy_tls** — Check or set TLS settings: ACME email, ACME CA URL. Falls back gracefully when paths don't yet exist.
+- **caddy_tls** — Check or set TLS settings: ACME email, ACME CA URL. PATCH first; on a fresh install, POSTs a minimal config. On an existing config it deep-merges into the issuer path and PUTs the result back, preserving siblings (custom certs, `on_demand`, additional policies). Refuses with a shape-specific error if the existing structure is unexpected — never clobbers.
 - **caddy_adapt** — Convert a Caddyfile (or nginx config) to Caddy JSON without applying it. Great for previewing.
 
 ### Server operations (6)
@@ -122,7 +122,7 @@ Use the same JSON block shown above in any of these.
 - **caddy_status** — Connectivity check + config summary (server count, routes, TLS mode).
 - **caddy_list_servers** — List all HTTP servers with names, addresses, route counts, and TLS status.
 - **caddy_upstreams** — Reverse proxy backend health.
-- **caddy_metrics** — Prometheus metrics (request counts, durations, connections, TLS handshakes).
+- **caddy_metrics** — Prometheus metrics (request counts, durations, connections, TLS handshakes). Optional `filter` (substring match on metric name, keeps `# HELP` / `# TYPE` lines for retained metrics) and `max_lines` (default 500) keep responses compact on busy servers.
 - **caddy_pki** — CA info and certificate chains (default CA: `local`).
 - **caddy_stop** — Graceful shutdown. Requires `confirm=true` to prevent accidents.
 
@@ -142,6 +142,26 @@ Browsable read-only data — MCP clients can fetch these directly without a tool
 ```
 > "Proxy api.example.com to my app on port 3000"
 → caddy_reverse_proxy({ from: "api.example.com", to: ["localhost:3000"] })
+```
+
+### Idempotent reverse proxy (safe to re-run from automation)
+
+```
+> "Make sure api.example.com points at localhost:3000, with a stable id"
+→ caddy_reverse_proxy({ from: "api.example.com", to: ["localhost:3000"], id: "api-prod" })
+  # First call creates the route under @id="api-prod".
+  # Subsequent calls with the same id REPLACE in place — no duplicate routes.
+  # Refuses with a clear error if "api-prod" is already in use by a non-route
+  # config object (TLS issuer, server, etc.) — @ids are config-global in Caddy.
+```
+
+### Filter Prometheus metrics
+
+```
+> "Just the HTTP request metrics, please"
+→ caddy_metrics({ filter: "http_requests" })
+  # Keeps sample lines whose metric name contains "http_requests",
+  # plus their `# HELP` / `# TYPE` lines. Drops the rest.
 ```
 
 ### Preview a Caddyfile before applying it
@@ -213,7 +233,7 @@ npm install
 npm run lint       # Biome check
 npm run lint:fix   # Auto-fix
 npm run build      # tsup bundle
-npm test           # Vitest (106 unit tests; +7 live-Caddy integration tests gated by CADDY_MCP_INTEGRATION=1)
+npm test           # Vitest (150 unit tests; +8 live-Caddy integration tests gated by CADDY_MCP_INTEGRATION=1)
 npm run typecheck  # tsc --noEmit
 ```
 
