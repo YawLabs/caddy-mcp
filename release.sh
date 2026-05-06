@@ -100,7 +100,10 @@ else
   if git tag -l "v${VERSION}" | grep -q "v${VERSION}"; then
     info "Tag v${VERSION} already exists -- skipping"
   else
-    git tag "v${VERSION}"
+    # Annotated (-a) so `git push --follow-tags` below picks it up;
+    # lightweight tags are ignored by --follow-tags and would silently
+    # fail to publish (release commit lands but tag-push is a no-op).
+    git tag -a "v${VERSION}" -m "v${VERSION}"
     info "Tag v${VERSION} created"
   fi
 fi
@@ -109,12 +112,15 @@ step 4 "Push to origin"
 if [ "$IS_CI" = "true" ]; then
   info "CI mode -- already pushed (this run was triggered by the push), skipping"
 else
-  git push origin main --tags
+  # --follow-tags pushes only annotated tags reachable from the pushed
+  # commits, not every local tag. Avoids accidentally publishing dangling
+  # experimental tags that happen to be lying around.
+  git push origin main --follow-tags
   info "Pushed commit and tag"
 fi
 
 step 5 "Publish to npm"
-NPM_VERSION=$(npm view @yawlabs/caddy-mcp version 2>/dev/null || echo "")
+NPM_VERSION=$(npm view "@yawlabs/caddy-mcp@${VERSION}" version 2>/dev/null || echo "")
 if [ "$NPM_VERSION" = "$VERSION" ]; then
   info "Already published to npm -- skipping"
 else
@@ -145,7 +151,7 @@ fi
 
 step 7 "Verify"
 sleep 3
-LIVE_VERSION=$(npm view @yawlabs/caddy-mcp version 2>/dev/null || echo "")
+LIVE_VERSION=$(npm view "@yawlabs/caddy-mcp@${VERSION}" version 2>/dev/null || echo "")
 [ "$LIVE_VERSION" = "$VERSION" ] && info "npm: @yawlabs/caddy-mcp@${LIVE_VERSION}" || warn "npm: ${LIVE_VERSION} (propagating)"
 GH_TAG=$(gh release view "v${VERSION}" --json tagName --jq '.tagName' 2>/dev/null || echo "")
 [ "$GH_TAG" = "v${VERSION}" ] && info "GitHub: ${GH_TAG}" || warn "GitHub release: not found"
