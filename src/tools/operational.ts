@@ -84,6 +84,8 @@ export function applyMetricsControls(raw: string, filter: string | undefined, ma
   let filtered: string[];
   if (filter && filter.length > 0) {
     filtered = lines.filter((line) => {
+      // Preserve the Prometheus end-of-file marker so strict downstream parsers don't break.
+      if (line.trimStart() === "# EOF") return true;
       const name = metricNameFromLine(line);
       return name?.includes(filter) ?? false;
     });
@@ -99,19 +101,22 @@ export function applyMetricsControls(raw: string, filter: string | undefined, ma
   return kept.join("\n");
 }
 
+/**
+ * Read the ACME email strictly from `policies[0].issuers[0].email`, mirroring the
+ * write path in `caddy_tls set_email`. Returns undefined if any step of the path is
+ * missing or non-conforming, so the read can never report an email that
+ * `set_email` would not actually update.
+ */
 function findAcmeEmail(policies: unknown): string | undefined {
-  if (!Array.isArray(policies)) return undefined;
-  for (const rawPolicy of policies) {
-    if (!rawPolicy || typeof rawPolicy !== "object") continue;
-    const policy = rawPolicy as CaddyTlsPolicy;
-    if (!Array.isArray(policy.issuers)) continue;
-    for (const rawIssuer of policy.issuers) {
-      if (!rawIssuer || typeof rawIssuer !== "object") continue;
-      const issuer = rawIssuer as CaddyTlsIssuer;
-      if (typeof issuer.email === "string") return issuer.email;
-    }
-  }
-  return undefined;
+  if (!Array.isArray(policies) || policies.length === 0) return undefined;
+  const rawPolicy = policies[0];
+  if (!rawPolicy || typeof rawPolicy !== "object" || Array.isArray(rawPolicy)) return undefined;
+  const policy = rawPolicy as CaddyTlsPolicy;
+  if (!Array.isArray(policy.issuers) || policy.issuers.length === 0) return undefined;
+  const rawIssuer = policy.issuers[0];
+  if (!rawIssuer || typeof rawIssuer !== "object" || Array.isArray(rawIssuer)) return undefined;
+  const issuer = rawIssuer as CaddyTlsIssuer;
+  return typeof issuer.email === "string" ? issuer.email : undefined;
 }
 
 export function registerOperationalTools(server: McpServer) {
@@ -207,7 +212,8 @@ export function registerOperationalTools(server: McpServer) {
         .optional()
         .describe(
           "Substring to match against metric names. Keeps sample lines whose metric name contains this substring, " +
-            "plus their `# HELP` and `# TYPE` comment lines. Empty/absent = no filtering.",
+            "plus their `# HELP` and `# TYPE` comment lines. Empty/absent = no filtering. " +
+            "Label values are NOT matched -- use a Prometheus-aware client for label filtering.",
         ),
       max_lines: z
         .number()

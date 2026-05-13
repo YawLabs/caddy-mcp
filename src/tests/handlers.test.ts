@@ -846,6 +846,49 @@ describe("tool handler behavior", () => {
       const result = await handler({});
       expect(result.content[0].text).toContain("TLS: enabled");
     });
+
+    it("shows ACME email when present at policies[0].issuers[0].email", async () => {
+      api.configGet.mockResolvedValue(
+        ok({
+          apps: {
+            http: { servers: {} },
+            tls: {
+              automation: {
+                policies: [{ issuers: [{ module: "acme", email: "ops@example.com" }] }],
+              },
+            },
+          },
+        }),
+      );
+
+      const result = await handler({});
+      expect(result.content[0].text).toContain("ACME email: ops@example.com");
+    });
+
+    it("does not show ACME email when [0][0] is absent but later policies/issuers have one", async () => {
+      api.configGet.mockResolvedValue(
+        ok({
+          apps: {
+            http: { servers: {} },
+            tls: {
+              automation: {
+                policies: [
+                  // [0][0] has no email; [0][1] and [1][0] do.
+                  { issuers: [{ module: "acme" }, { module: "acme", email: "second@example.com" }] },
+                  { issuers: [{ module: "acme", email: "other-policy@example.com" }] },
+                ],
+              },
+            },
+          },
+        }),
+      );
+
+      const result = await handler({});
+      const text = result.content[0].text;
+      expect(text).not.toContain("ACME email");
+      expect(text).not.toContain("second@example.com");
+      expect(text).not.toContain("other-policy@example.com");
+    });
   });
 
   // ─── caddy_list_servers ───────────────────────────────────────────────
@@ -991,6 +1034,17 @@ describe("tool handler behavior", () => {
       expect(lines).toHaveLength(3); // 2 kept + 1 truncation comment
       expect(lines[2]).toBe("# [truncated, 2 lines omitted -- use filter to narrow]");
     });
+
+    it("preserves the `# EOF` end-of-file marker when a filter is applied", async () => {
+      const body = ["# HELP foo a counter", "# TYPE foo counter", "foo 1", "# EOF"].join("\n");
+      api.getMetrics.mockResolvedValue(ok(body));
+
+      const result = await handler({ filter: "foo" });
+      const text = result.content[0].text;
+      const lines = text.split("\n");
+
+      expect(lines).toEqual(["# HELP foo a counter", "# TYPE foo counter", "foo 1", "# EOF"]);
+    });
   });
 
   // ─── caddy_stop ───────────────────────────────────────────────────────
@@ -1077,6 +1131,18 @@ describe("tool handler behavior", () => {
       const { listSnapshots } = await import("../snapshots.js");
       expect(listSnapshots()).toHaveLength(0);
     });
+
+    it("does not snapshot when the prior GET returns a non-object body", async () => {
+      // Re-applying "" / [] / null / a string via /load would fail or replay
+      // garbage. Only object roots are snapshotable.
+      const { listSnapshots } = await import("../snapshots.js");
+      for (const bogus of ["", "raw-text", null, [], 42]) {
+        api.configGet.mockResolvedValueOnce(ok(bogus));
+        api.loadConfig.mockResolvedValueOnce(ok());
+        await handler({ config: { apps: {} }, format: "json" });
+        expect(listSnapshots()).toHaveLength(0);
+      }
+    });
   });
 
   // ─── caddy_revert ─────────────────────────────────────────────────────
@@ -1154,6 +1220,38 @@ describe("tool handler behavior", () => {
       // Most recent snapshot should now be the caddy_revert trigger (the current config)
       expect(snaps[0].trigger).toBe("caddy_revert");
       expect(snaps[0].config).toEqual(currentBefore);
+    });
+
+    it("apply does NOT push a snapshot when loadConfig fails", async () => {
+      // Regression: a failed revert must not shift the snapshot index. If the
+      // pre-revert state were pushed unconditionally, a retried `apply 0` would
+      // target the failed-revert's pre-state instead of the original target.
+      const { saveSnapshot, listSnapshots } = await import("../snapshots.js");
+      const target = { apps: { intended: true } };
+      saveSnapshot(target, "caddy_load");
+
+      api.configGet.mockResolvedValue(ok({ apps: { current: true } }));
+      api.loadConfig.mockResolvedValue(err(500, "load failed"));
+
+      const result = await handler({ action: "apply", index: 0, confirm: true });
+
+      expect(result.isError).toBe(true);
+      const snaps = listSnapshots();
+      // Exactly one snapshot still -- the original target the user meant to apply.
+      expect(snaps).toHaveLength(1);
+      expect(snaps[0].trigger).toBe("caddy_load");
+      expect(snaps[0].config).toEqual(target);
+    });
+
+    it("save refuses to capture a non-object config body", async () => {
+      const { listSnapshots } = await import("../snapshots.js");
+      for (const bogus of ["", "raw-text", null, [], 42]) {
+        api.configGet.mockResolvedValueOnce(ok(bogus));
+        const result = await handler({ action: "save", index: 0, confirm: false });
+        expect(result.isError).toBe(true);
+        expect(result.content[0].text).toContain("no config loaded to snapshot");
+      }
+      expect(listSnapshots()).toHaveLength(0);
     });
   });
 

@@ -229,10 +229,16 @@ export function configDelete<T = any>(path: string): Promise<ApiResponse<T>> {
   return caddyRequest("DELETE", `/config/${normalized}`);
 }
 
-const LOAD_TIMEOUT = 60000;
+function getLoadTimeout(): number {
+  const raw = process.env.CADDY_LOAD_TIMEOUT;
+  if (raw === undefined) return 60000;
+  const n = Number(raw);
+  if (!Number.isFinite(n) || n <= 0) return 60000;
+  return Math.floor(n);
+}
 
 export async function loadConfig(config: unknown, contentType?: string): Promise<ApiResponse> {
-  const res = await caddyRequest("POST", "/load", config, contentType, LOAD_TIMEOUT);
+  const res = await caddyRequest("POST", "/load", config, contentType, getLoadTimeout());
   if (res.ok) etagCache.clear();
   return res;
 }

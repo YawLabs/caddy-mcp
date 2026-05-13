@@ -5,10 +5,12 @@ describe("api", () => {
   const savedUrl = process.env.CADDY_ADMIN_URL;
   const savedToken = process.env.CADDY_API_TOKEN;
   const savedRetries = process.env.CADDY_MAX_RETRIES;
+  const savedLoadTimeout = process.env.CADDY_LOAD_TIMEOUT;
 
   beforeEach(() => {
     delete process.env.CADDY_ADMIN_URL;
     delete process.env.CADDY_API_TOKEN;
+    delete process.env.CADDY_LOAD_TIMEOUT;
     // Disable retries by default so existing tests run in a single attempt.
     process.env.CADDY_MAX_RETRIES = "0";
   });
@@ -29,6 +31,11 @@ describe("api", () => {
       process.env.CADDY_MAX_RETRIES = savedRetries;
     } else {
       delete process.env.CADDY_MAX_RETRIES;
+    }
+    if (savedLoadTimeout !== undefined) {
+      process.env.CADDY_LOAD_TIMEOUT = savedLoadTimeout;
+    } else {
+      delete process.env.CADDY_LOAD_TIMEOUT;
     }
   });
 
@@ -518,6 +525,40 @@ describe("api", () => {
       expect(calls[1]?.ifMatch).toBe("etag-only-on-get");
       expect(calls[2]?.method).toBe("PATCH");
       expect(calls[2]?.ifMatch).toBe(null);
+    });
+  });
+
+  describe("CADDY_LOAD_TIMEOUT", () => {
+    it("defaults to 60000 when env unset", async () => {
+      const api = await import("../api.js");
+      const timeoutSpy = vi.spyOn(AbortSignal, "timeout");
+      globalThis.fetch = vi.fn(async () => new Response("", { status: 200 })) as any;
+
+      await api.loadConfig({});
+      expect(timeoutSpy).toHaveBeenCalledWith(60000);
+      timeoutSpy.mockRestore();
+    });
+
+    it("uses custom value from CADDY_LOAD_TIMEOUT", async () => {
+      process.env.CADDY_LOAD_TIMEOUT = "30000";
+      const api = await import("../api.js");
+      const timeoutSpy = vi.spyOn(AbortSignal, "timeout");
+      globalThis.fetch = vi.fn(async () => new Response("", { status: 200 })) as any;
+
+      await api.loadConfig({});
+      expect(timeoutSpy).toHaveBeenCalledWith(30000);
+      timeoutSpy.mockRestore();
+    });
+
+    it.each(["not-a-number", "0", "-100"])("falls back to 60000 for invalid value %p", async (invalid) => {
+      process.env.CADDY_LOAD_TIMEOUT = invalid;
+      const api = await import("../api.js");
+      const timeoutSpy = vi.spyOn(AbortSignal, "timeout");
+      globalThis.fetch = vi.fn(async () => new Response("", { status: 200 })) as any;
+
+      await api.loadConfig({});
+      expect(timeoutSpy).toHaveBeenCalledWith(60000);
+      timeoutSpy.mockRestore();
     });
   });
 });

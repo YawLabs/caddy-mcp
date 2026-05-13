@@ -4,6 +4,15 @@ import * as api from "../api.js";
 import { formatResult } from "../format.js";
 import { getSnapshot, listSnapshots, saveSnapshot } from "../snapshots.js";
 
+/**
+ * A snapshot must be re-applyable via /load, which requires a JSON object root.
+ * Strings, arrays, null, and primitives are not valid Caddy configs -- refuse
+ * to capture them so a later `caddy_revert apply` can't replay garbage.
+ */
+function isSnapshotableConfig(data: unknown): data is Record<string, unknown> {
+  return data !== null && typeof data === "object" && !Array.isArray(data);
+}
+
 export function registerConfigTools(server: McpServer) {
   server.tool(
     "caddy_config_get",
@@ -65,7 +74,7 @@ export function registerConfigTools(server: McpServer) {
       const contentType = format === "caddyfile" ? "text/caddyfile" : "application/json";
       // Snapshot the current config before replacing it, so caddy_revert can undo the change.
       const current = await api.configGet();
-      if (current.ok && current.data !== undefined) {
+      if (current.ok && isSnapshotableConfig(current.data)) {
         saveSnapshot(current.data, "caddy_load");
       }
       return formatResult(await api.loadConfig(config, contentType));
@@ -103,7 +112,7 @@ export function registerConfigTools(server: McpServer) {
       if (action === "save") {
         const current = await api.configGet();
         if (!current.ok) return formatResult(current);
-        if (current.data === undefined) {
+        if (!isSnapshotableConfig(current.data)) {
           return {
             isError: true,
             content: [{ type: "text" as const, text: "Error: no config loaded to snapshot" }],
@@ -136,13 +145,17 @@ export function registerConfigTools(server: McpServer) {
           ],
         };
       }
-      // Snapshot current config before reverting, so reverts are themselves revertible.
+      // Capture pre-revert state but defer the snapshot push until AFTER the
+      // load returns ok. If we pushed unconditionally and the load failed, the
+      // pre-revert snapshot would sit at index 0 -- a retried `apply 0` would
+      // then target the failed-revert's pre-state instead of the original
+      // snapshot the user meant to apply, silently shifting the target by one.
       const current = await api.configGet();
-      if (current.ok && current.data !== undefined) {
-        saveSnapshot(current.data, "caddy_revert");
-      }
       const res = await api.loadConfig(snap.config, "application/json");
       if (!res.ok) return formatResult(res);
+      if (current.ok && isSnapshotableConfig(current.data)) {
+        saveSnapshot(current.data, "caddy_revert");
+      }
       const when = new Date(snap.timestamp).toISOString();
       return {
         content: [
