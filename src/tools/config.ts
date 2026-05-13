@@ -115,7 +115,12 @@ export function registerConfigTools(server: McpServer) {
         if (!isSnapshotableConfig(current.data)) {
           return {
             isError: true,
-            content: [{ type: "text" as const, text: "Error: no config loaded to snapshot" }],
+            content: [
+              {
+                type: "text" as const,
+                text: "Error: cannot snapshot -- config response is empty or not a JSON object",
+              },
+            ],
           };
         }
         saveSnapshot(current.data, "manual");

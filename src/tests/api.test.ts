@@ -550,7 +550,13 @@ describe("api", () => {
       timeoutSpy.mockRestore();
     });
 
-    it.each(["not-a-number", "0", "-100"])("falls back to 60000 for invalid value %p", async (invalid) => {
+    it.each([
+      "not-a-number",
+      "0",
+      "-100",
+      "0.5",
+      "0.999",
+    ])("falls back to 60000 for invalid value %p", async (invalid) => {
       process.env.CADDY_LOAD_TIMEOUT = invalid;
       const api = await import("../api.js");
       const timeoutSpy = vi.spyOn(AbortSignal, "timeout");

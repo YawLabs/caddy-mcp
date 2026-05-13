@@ -85,7 +85,8 @@ export function applyMetricsControls(raw: string, filter: string | undefined, ma
   if (filter && filter.length > 0) {
     filtered = lines.filter((line) => {
       // Preserve the Prometheus end-of-file marker so strict downstream parsers don't break.
-      if (line.trimStart() === "# EOF") return true;
+      // Use trim() (not trimStart()) so CRLF inputs and stray trailing whitespace still match.
+      if (line.trim() === "# EOF") return true;
       const name = metricNameFromLine(line);
       return name?.includes(filter) ?? false;
     });

@@ -1045,6 +1045,18 @@ describe("tool handler behavior", () => {
 
       expect(lines).toEqual(["# HELP foo a counter", "# TYPE foo counter", "foo 1", "# EOF"]);
     });
+
+    it("preserves the `# EOF` marker even with trailing CR or whitespace (CRLF inputs)", async () => {
+      // CRLF input -- the trailing \r stays attached to "# EOF" after split-on-\n.
+      const body = "# HELP foo c\r\n# TYPE foo counter\r\nfoo 1\r\n# EOF\r\n";
+      api.getMetrics.mockResolvedValue(ok(body));
+
+      const result = await handler({ filter: "foo" });
+      const lines = result.content[0].text.split("\n");
+
+      // The "# EOF\r" line must be preserved; trim() tolerates the stray \r.
+      expect(lines.some((l: string) => l.trim() === "# EOF")).toBe(true);
+    });
   });
 
   // ─── caddy_stop ───────────────────────────────────────────────────────
@@ -1249,7 +1261,7 @@ describe("tool handler behavior", () => {
         api.configGet.mockResolvedValueOnce(ok(bogus));
         const result = await handler({ action: "save", index: 0, confirm: false });
         expect(result.isError).toBe(true);
-        expect(result.content[0].text).toContain("no config loaded to snapshot");
+        expect(result.content[0].text).toContain("empty or not a JSON object");
       }
       expect(listSnapshots()).toHaveLength(0);
     });

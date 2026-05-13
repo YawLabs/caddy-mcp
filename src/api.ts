@@ -233,8 +233,12 @@ function getLoadTimeout(): number {
   const raw = process.env.CADDY_LOAD_TIMEOUT;
   if (raw === undefined) return 60000;
   const n = Number(raw);
-  if (!Number.isFinite(n) || n <= 0) return 60000;
-  return Math.floor(n);
+  // Reject anything that floors below 1ms -- "0.5" passes n>0 but Math.floor(0.5)=0
+  // would produce an immediate-abort timeout. Floor first, then bounds-check.
+  if (!Number.isFinite(n)) return 60000;
+  const floored = Math.floor(n);
+  if (floored < 1) return 60000;
+  return floored;
 }
 
 export async function loadConfig(config: unknown, contentType?: string): Promise<ApiResponse> {
