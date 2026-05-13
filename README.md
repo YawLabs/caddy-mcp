@@ -81,6 +81,7 @@ That's it. Now ask your AI assistant:
 | `CADDY_ADMIN_URL` | `http://localhost:2019` | Caddy admin API URL. Set to `http://caddy:2019` inside Docker, or an https URL for remote admin. |
 | `CADDY_API_TOKEN` | (none) | Optional Bearer token for authenticated admin endpoints. Only needed if you've configured Caddy with auth. |
 | `CADDY_MAX_RETRIES` | `2` | Number of retries on transient failures (5xx, network errors). 4xx and 412 never retry. Hard-capped at 5. Set to `0` to disable. |
+| `CADDY_LOAD_TIMEOUT` | `60000` | Timeout in ms for the `/load` endpoint; raise for ACME-heavy bring-ups where provisioning many certificates can exceed the default. Non-numeric, `<= 0`, or fractional values below 1ms fall back to the default. |
 
 **Alternate MCP clients:**
 
