@@ -116,7 +116,7 @@ Use the same JSON block shown above in any of these.
 ### TLS & config conversion (2)
 
 - **caddy_tls** — Check or set TLS settings: ACME email, ACME CA URL. PATCH first; on a fresh install, POSTs a minimal config. On an existing config it deep-merges into the issuer path and PUTs the result back, preserving siblings (custom certs, `on_demand`, additional policies). Refuses with a shape-specific error if the existing structure is unexpected — never clobbers.
-- **caddy_adapt** — Convert a Caddyfile (or nginx config) to Caddy JSON without applying it. Great for previewing.
+- **caddy_adapt** — Convert a config in any registered adapter format to Caddy JSON without applying it. `caddyfile` (built-in, default) plus any adapter module compiled into your Caddy binary — e.g., `nginx` ([caddy-nginx-adapter](https://github.com/caddyserver/nginx-adapter)), `yaml` ([caddy-yaml](https://github.com/abiosoft/caddy-yaml)). Great for previewing or porting from existing configs.
 
 ### Server operations (6)
 

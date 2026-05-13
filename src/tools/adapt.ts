@@ -24,16 +24,18 @@ function formatWarning(w: unknown): string {
 export function registerAdaptTools(server: McpServer) {
   server.tool(
     "caddy_adapt",
-    "Convert a Caddyfile or other config format to Caddy JSON without loading it. Useful for previewing what a Caddyfile produces. Returns the adapted JSON and any warnings separately.",
+    "Convert a config in any registered adapter format to Caddy JSON without loading it. Useful for previewing what a Caddyfile produces, or for porting from nginx/yaml configs when Caddy is built with the matching adapter module ('caddyfile' is built-in; 'nginx', 'yaml', etc. require their adapter modules to be compiled into the Caddy binary). Returns the adapted JSON and any warnings separately.",
     {
-      config: z.string().describe("The raw config text (e.g., Caddyfile contents)"),
+      config: z.string().describe("The raw config text (e.g., Caddyfile contents, nginx.conf, yaml)"),
       adapter: z
         .string()
         .regex(/^[a-z0-9_-]+$/i, "Adapter must be alphanumeric, hyphens, or underscores")
         .max(64)
         .optional()
         .default("caddyfile")
-        .describe("Config format adapter (default: 'caddyfile')"),
+        .describe(
+          "Config format adapter. Must match an adapter Caddy was built with. Built-in: 'caddyfile' (default). Common external adapters: 'nginx' (caddy-nginx-adapter), 'yaml' (caddy-yaml).",
+        ),
     },
     { readOnlyHint: true, destructiveHint: false, idempotentHint: true, openWorldHint: false },
     async ({ config, adapter }) => {
