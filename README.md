@@ -80,7 +80,7 @@ That's it. Now ask your AI assistant:
 |---|---|---|
 | `CADDY_ADMIN_URL` | `http://localhost:2019` | Caddy admin API URL. Set to `http://caddy:2019` inside Docker, or an https URL for remote admin. |
 | `CADDY_API_TOKEN` | (none) | Optional Bearer token for authenticated admin endpoints. Only needed if you've configured Caddy with auth. |
-| `CADDY_MAX_RETRIES` | `2` | Number of retries on transient failures (5xx, network errors). 4xx and 412 never retry. Hard-capped at 5. Set to `0` to disable. |
+| `CADDY_MAX_RETRIES` | `2` | Number of retries on transient failures (5xx, network errors). 4xx and 412 never retry. POSTs to `/config/*` and `/id/*` also skip retry (non-idempotent appends/creates -- retrying could duplicate routes or 409 a half-applied create). POSTs to `/load`, `/adapt`, `/stop` still retry. Hard-capped at 5. Set to `0` to disable. |
 | `CADDY_LOAD_TIMEOUT` | `60000` | Timeout in ms for the `/load` endpoint; raise for ACME-heavy bring-ups where provisioning many certificates can exceed the default. Non-numeric, `<= 0`, or fractional values below 1ms fall back to the default. |
 
 **Alternate MCP clients:**
@@ -134,7 +134,7 @@ Browsable read-only data — MCP clients can fetch these directly without a tool
 - `caddy://config` — Current full Caddy JSON configuration.
 - `caddy://servers` — Summary of all configured HTTP servers.
 - `caddy://upstreams` — Reverse proxy upstream health status.
-- `caddy://metrics` — Prometheus metrics (text exposition format).
+- `caddy://metrics` — Prometheus metrics (text exposition format). Capped at the first 500 lines to keep client context bounded; use the `caddy_metrics` tool with `filter` / `max_lines` for filtered or larger output.
 
 ## Examples
 
@@ -234,7 +234,7 @@ npm install
 npm run lint       # Biome check
 npm run lint:fix   # Auto-fix
 npm run build      # tsup bundle
-npm test           # Vitest (150 unit tests; +8 live-Caddy integration tests gated by CADDY_MCP_INTEGRATION=1)
+npm test           # Vitest (182 unit tests; +8 live-Caddy integration tests gated by CADDY_MCP_INTEGRATION=1)
 npm run typecheck  # tsc --noEmit
 ```
 
