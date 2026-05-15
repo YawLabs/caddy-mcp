@@ -214,6 +214,134 @@ describe("api", () => {
       await api.configGet();
       expect(calls).toBe(3);
     });
+
+    // POST against /config/<path> and /id/<id> is non-idempotent: it appends
+    // to arrays or creates new keys. A retry after a server-side
+    // success-but-lost-response would silently duplicate the write. Skip the
+    // retry loop for those paths and surface the failure verbatim.
+    it("does NOT retry POST to /config/<path> on 5xx", async () => {
+      process.env.CADDY_MAX_RETRIES = "3";
+      const api = await import("../api.js");
+      let calls = 0;
+      globalThis.fetch = vi.fn(async () => {
+        calls++;
+        return new Response("upstream down", { status: 503 });
+      }) as any;
+
+      const res = await api.configPost("apps/http/servers/srv0/routes", {});
+      expect(res.ok).toBe(false);
+      expect(res.status).toBe(503);
+      expect(calls).toBe(1);
+    });
+
+    it("does NOT retry POST to /config/<path> on network error (status 0)", async () => {
+      process.env.CADDY_MAX_RETRIES = "3";
+      const api = await import("../api.js");
+      let calls = 0;
+      globalThis.fetch = vi.fn(async () => {
+        calls++;
+        throw new TypeError("fetch failed");
+      }) as any;
+
+      const res = await api.configPost("apps/http/servers/srv0/routes", {});
+      expect(res.ok).toBe(false);
+      expect(res.status).toBe(0);
+      expect(calls).toBe(1);
+    });
+
+    it("does NOT retry POST to /id/<id> on 5xx (non-idempotent append/create)", async () => {
+      process.env.CADDY_MAX_RETRIES = "3";
+      const api = await import("../api.js");
+      let calls = 0;
+      globalThis.fetch = vi.fn(async () => {
+        calls++;
+        return new Response("upstream down", { status: 503 });
+      }) as any;
+
+      const res = await api.configByIdSet("my-route", { handle: [] }, "POST");
+      expect(res.ok).toBe(false);
+      expect(res.status).toBe(503);
+      expect(calls).toBe(1);
+    });
+
+    // POST to /load is an atomic full-config replace -- same input yields the
+    // same end state. Retrying on a flaky server is safe and useful.
+    it("retries POST to /load on 5xx (idempotent full-config replace)", async () => {
+      process.env.CADDY_MAX_RETRIES = "2";
+      const api = await import("../api.js");
+      let calls = 0;
+      globalThis.fetch = vi.fn(async () => {
+        calls++;
+        if (calls < 3) return new Response("upstream down", { status: 503 });
+        return new Response("", { status: 200 });
+      }) as any;
+
+      const res = await api.loadConfig({ apps: {} }, "application/json");
+      expect(res.ok).toBe(true);
+      expect(calls).toBe(3);
+    });
+
+    // POST to /adapt is a pure transformation (Caddyfile/etc -> JSON), no side
+    // effects, safe to retry.
+    it("retries POST to /adapt on 5xx (pure transformation)", async () => {
+      process.env.CADDY_MAX_RETRIES = "2";
+      const api = await import("../api.js");
+      let calls = 0;
+      globalThis.fetch = vi.fn(async () => {
+        calls++;
+        if (calls < 3) return new Response("upstream down", { status: 503 });
+        return new Response('{"result":{}}', { status: 200 });
+      }) as any;
+
+      const res = await api.adapt("example.com { }");
+      expect(res.ok).toBe(true);
+      expect(calls).toBe(3);
+    });
+
+    it("still retries PATCH on 5xx (idempotent method)", async () => {
+      process.env.CADDY_MAX_RETRIES = "2";
+      const api = await import("../api.js");
+      let calls = 0;
+      globalThis.fetch = vi.fn(async () => {
+        calls++;
+        if (calls < 3) return new Response("upstream down", { status: 503 });
+        return new Response("{}", { status: 200 });
+      }) as any;
+
+      const res = await api.configPatch("apps/http/servers/srv0", { listen: [":443"] });
+      expect(res.ok).toBe(true);
+      expect(calls).toBe(3);
+    });
+
+    it("still retries DELETE on 5xx (idempotent method)", async () => {
+      process.env.CADDY_MAX_RETRIES = "2";
+      const api = await import("../api.js");
+      let calls = 0;
+      globalThis.fetch = vi.fn(async () => {
+        calls++;
+        if (calls < 3) return new Response("upstream down", { status: 503 });
+        return new Response("", { status: 200 });
+      }) as any;
+
+      const res = await api.configDelete("apps/http/servers/srv0/routes/0");
+      expect(res.ok).toBe(true);
+      expect(calls).toBe(3);
+    });
+
+    it("still retries PUT on 5xx (idempotent method)", async () => {
+      process.env.CADDY_MAX_RETRIES = "2";
+      const api = await import("../api.js");
+      let calls = 0;
+      globalThis.fetch = vi.fn(async () => {
+        calls++;
+        if (calls < 3) return new Response("upstream down", { status: 503 });
+        return new Response("", { status: 200 });
+      }) as any;
+
+      const res = await api.configPut("apps/http/servers/srv0/routes/0", {});
+      expect(res.ok).toBe(true);
+      expect(calls).toBe(3);
+    });
   });
 
   describe("path traversal rejection", () => {

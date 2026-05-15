@@ -52,13 +52,43 @@ function safeJoin(value: unknown): string {
     .join(",");
 }
 
+/**
+ * Strip an explicit `:port` suffix from a host string. Caddy `host` matchers
+ * are evaluated against the Host header value with the port removed, so a
+ * matcher of "example.com:8080" never fires for a real request hitting that
+ * port. Callers commonly write the port to signal "this listener" -- accept
+ * it but normalize it out so the route actually matches.
+ *
+ * Supports:
+ *   - "example.com:8080"  -> "example.com"
+ *   - "1.2.3.4:80"        -> "1.2.3.4"
+ *   - "[::1]:8080"        -> "[::1]" (IPv6 bracket form)
+ *   - "[::1]"             -> "[::1]" (no port — unchanged)
+ *   - "example.com"       -> "example.com" (no port — unchanged)
+ *   - "foo:bar"           -> "foo:bar" (non-numeric suffix — leave alone
+ *                            rather than silently losing data we don't
+ *                            recognize as a port).
+ */
+function stripPort(host: string): string {
+  if (host.startsWith("[")) {
+    const closeIdx = host.indexOf("]");
+    if (closeIdx !== -1) return host.substring(0, closeIdx + 1);
+    return host;
+  }
+  const colonIdx = host.lastIndexOf(":");
+  if (colonIdx === -1) return host;
+  const portCandidate = host.substring(colonIdx + 1);
+  if (portCandidate.length === 0 || !/^\d+$/.test(portCandidate)) return host;
+  return host.substring(0, colonIdx);
+}
+
 /** Parse a "from" string like "api.example.com" or "example.com/api/*" into match object */
 export function parseFrom(from: string): { host?: string[]; path?: string[] } {
   const cleaned = from.replace(/^https?:\/\//, "");
   const match: { host?: string[]; path?: string[] } = {};
   const slashIdx = cleaned.indexOf("/");
   if (slashIdx > 0) {
-    match.host = [cleaned.substring(0, slashIdx)];
+    match.host = [stripPort(cleaned.substring(0, slashIdx))];
     const path = cleaned.substring(slashIdx);
     // A bare trailing slash (path === "/") is dropped: Caddy path matchers are
     // exact-string (with optional trailing "*"), so path: ["/"] would match
@@ -72,7 +102,7 @@ export function parseFrom(from: string): { host?: string[]; path?: string[] } {
   } else if (cleaned.startsWith("/")) {
     match.path = [cleaned];
   } else {
-    match.host = [cleaned];
+    match.host = [stripPort(cleaned)];
   }
   return match;
 }

@@ -192,6 +192,39 @@ describe("caddy-mcp tools", () => {
       expect(parseFrom("app.local/ws/")).toEqual({ host: ["app.local"], path: ["/ws/"] });
       expect(parseFrom("example.com/api/")).toEqual({ host: ["example.com"], path: ["/api/"] });
     });
+
+    it("strips an explicit port from a bare host", async () => {
+      const { parseFrom } = await import("../tools/routes.js");
+      // Caddy host matchers match the Host header without port -- a matcher
+      // of "example.com:8080" never fires. Normalize the port away so the
+      // route actually matches the requests the caller meant.
+      expect(parseFrom("example.com:8080")).toEqual({ host: ["example.com"] });
+      expect(parseFrom("1.2.3.4:80")).toEqual({ host: ["1.2.3.4"] });
+    });
+
+    it("strips an explicit port when host is followed by a path", async () => {
+      const { parseFrom } = await import("../tools/routes.js");
+      expect(parseFrom("example.com:8080/api")).toEqual({ host: ["example.com"], path: ["/api"] });
+      expect(parseFrom("https://api.local:3000/v1/*")).toEqual({ host: ["api.local"], path: ["/v1/*"] });
+    });
+
+    it("strips port from an IPv6 bracketed host", async () => {
+      const { parseFrom } = await import("../tools/routes.js");
+      expect(parseFrom("[::1]:8080")).toEqual({ host: ["[::1]"] });
+      expect(parseFrom("[::1]:8080/api")).toEqual({ host: ["[::1]"], path: ["/api"] });
+    });
+
+    it("leaves an IPv6 bracketed host without a port unchanged", async () => {
+      const { parseFrom } = await import("../tools/routes.js");
+      expect(parseFrom("[::1]")).toEqual({ host: ["[::1]"] });
+    });
+
+    it("does not strip a non-numeric colon suffix (unrecognized form)", async () => {
+      const { parseFrom } = await import("../tools/routes.js");
+      // "foo:bar" isn't a host:port form we recognize -- keep it intact rather
+      // than silently dropping data the caller may have meant.
+      expect(parseFrom("foo:bar")).toEqual({ host: ["foo:bar"] });
+    });
   });
 
   it("registers 4 resources", async () => {
@@ -241,6 +274,16 @@ describe("caddy-mcp tools", () => {
       expect(() => schema.adapter.parse("bad;value")).toThrow();
       expect(() => schema.adapter.parse("bad value")).toThrow();
       expect(() => schema.adapter.parse("")).toThrow();
+    });
+
+    it("rejects uppercase adapter names (Caddy adapters are lowercase)", async () => {
+      const schema = await getAdaptSchema();
+      // Caddy registers adapters under lowercase names ("caddyfile", "nginx",
+      // "yaml"). Accepting "Caddyfile" would compose a Content-Type the server
+      // does not recognize and fail at request time -- reject up front.
+      expect(() => schema.adapter.parse("Caddyfile")).toThrow();
+      expect(() => schema.adapter.parse("CADDYFILE")).toThrow();
+      expect(() => schema.adapter.parse("Nginx")).toThrow();
     });
   });
 

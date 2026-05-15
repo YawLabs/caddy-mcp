@@ -29,7 +29,7 @@ export function registerAdaptTools(server: McpServer) {
       config: z.string().describe("The raw config text (e.g., Caddyfile contents, nginx.conf, yaml)"),
       adapter: z
         .string()
-        .regex(/^[a-z0-9_-]+$/i, "Adapter must be alphanumeric, hyphens, or underscores")
+        .regex(/^[a-z0-9_-]+$/, "Adapter must be lowercase alphanumeric, hyphens, or underscores")
         .max(64)
         .optional()
         .default("caddyfile")

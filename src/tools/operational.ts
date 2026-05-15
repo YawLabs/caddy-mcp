@@ -43,7 +43,7 @@ function describeServer(raw: CaddyServerSummary): string {
 }
 
 /** Default max_lines for caddy_metrics. Prometheus output on busy servers can be megabytes; 500 lines is enough to skim. */
-const METRICS_DEFAULT_MAX_LINES = 500;
+export const METRICS_DEFAULT_MAX_LINES = 500;
 
 /**
  * Extract the metric name from a Prometheus exposition line.
@@ -75,7 +75,10 @@ function metricNameFromLine(line: string): string | undefined {
  * metric name (blank lines, free-form `#` comments) are dropped when filtering.
  *
  * Truncation: if the resulting line count exceeds `maxLines`, output is cut at `maxLines` and a
- * trailing `# [truncated, N lines omitted -- use filter to narrow]` comment is appended.
+ * trailing `# [truncated, N lines omitted -- use filter to narrow]` comment is appended. If the
+ * input contained a `# EOF` end-of-file marker that would have been dropped by the cut, it is
+ * re-appended after the truncation comment so strict downstream parsers still see a terminated
+ * stream.
  */
 export function applyMetricsControls(raw: string, filter: string | undefined, maxLines: number): string {
   const lines = raw.split("\n");
@@ -99,6 +102,13 @@ export function applyMetricsControls(raw: string, filter: string | undefined, ma
   const dropped = filtered.length - maxLines;
   const kept = filtered.slice(0, maxLines);
   kept.push(`# [truncated, ${dropped} lines omitted -- use filter to narrow]`);
+  // If the input had a `# EOF` marker and it landed in the dropped tail, re-emit it so the
+  // output remains a well-formed Prometheus exposition. The filter path above already keeps
+  // EOF unconditionally; only the unfiltered/truncated case can lose it.
+  const keptHasEof = kept.some((l) => l.trim() === "# EOF");
+  if (!keptHasEof && filtered.slice(maxLines).some((l) => l.trim() === "# EOF")) {
+    kept.push("# EOF");
+  }
   return kept.join("\n");
 }
 

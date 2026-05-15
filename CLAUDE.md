@@ -1,6 +1,6 @@
 # caddy-mcp
 
-MCP server for managing Caddy web servers via the admin API. 16 tools across config management, route operations, TLS, and server operations.
+MCP server for managing Caddy web servers via the admin API. 18 tools across config management, route operations, TLS, and server operations.
 
 ## Architecture
 
@@ -13,7 +13,7 @@ MCP server for managing Caddy web servers via the admin API. 16 tools across con
 - `src/tools/adapt.ts` — Config format conversion (Caddyfile → JSON).
 - `src/tools/tls.ts` — TLS/HTTPS settings management.
 - `src/tools/operational.ts` — Status, list_servers, upstreams, PKI, metrics, stop.
-- `src/resources.ts` — MCP resources: caddy://config, caddy://upstreams.
+- `src/resources.ts` — MCP resources: caddy://config, caddy://upstreams, caddy://metrics, caddy://servers.
 
 ## Build
 

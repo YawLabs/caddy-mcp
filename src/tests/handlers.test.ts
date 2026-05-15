@@ -1057,6 +1057,55 @@ describe("tool handler behavior", () => {
       // The "# EOF\r" line must be preserved; trim() tolerates the stray \r.
       expect(lines.some((l: string) => l.trim() === "# EOF")).toBe(true);
     });
+
+    it("re-appends `# EOF` after truncation when the marker was in the dropped tail", async () => {
+      // No filter: truncation cuts from the tail. If # EOF was in the dropped
+      // segment, the contract is to re-emit it after the truncation comment so
+      // strict downstream parsers still see a terminated stream.
+      const body = [
+        "# HELP a counter a",
+        "# TYPE a counter",
+        "a 1",
+        "# HELP b counter b",
+        "# TYPE b counter",
+        "b 1",
+        "# EOF",
+      ].join("\n");
+      api.getMetrics.mockResolvedValue(ok(body));
+
+      // 7 lines total, cap at 3 -> 4 dropped (including # EOF). Output should be
+      // 3 kept + truncation comment + re-emitted EOF = 5 lines.
+      const result = await handler({ max_lines: 3 });
+      const lines = result.content[0].text.split("\n");
+
+      expect(lines).toHaveLength(5);
+      expect(lines.slice(0, 3)).toEqual(["# HELP a counter a", "# TYPE a counter", "a 1"]);
+      expect(lines[3]).toBe("# [truncated, 4 lines omitted -- use filter to narrow]");
+      expect(lines[4]).toBe("# EOF");
+    });
+
+    it("does not duplicate `# EOF` when it survives truncation in the kept slice", async () => {
+      // If # EOF is within max_lines it stays in place; the re-append guard
+      // must not duplicate it.
+      const body = ["a 1", "# EOF", "trailing junk dropped"].join("\n");
+      api.getMetrics.mockResolvedValue(ok(body));
+
+      const result = await handler({ max_lines: 2 });
+      const lines = result.content[0].text.split("\n");
+
+      const eofCount = lines.filter((l: string) => l.trim() === "# EOF").length;
+      expect(eofCount).toBe(1);
+    });
+
+    it("does not invent a `# EOF` when input had none", async () => {
+      const body = ["a 1", "a 2", "a 3", "a 4"].join("\n");
+      api.getMetrics.mockResolvedValue(ok(body));
+
+      const result = await handler({ max_lines: 2 });
+      const text = result.content[0].text;
+
+      expect(text).not.toContain("# EOF");
+    });
   });
 
   // ─── caddy_stop ───────────────────────────────────────────────────────
@@ -1120,7 +1169,7 @@ describe("tool handler behavior", () => {
       expect(api.loadConfig).toHaveBeenCalledWith("example.com { }", "text/caddyfile");
     });
 
-    it("snapshots the current config before loading", async () => {
+    it("snapshots the current config after a successful load", async () => {
       const prior = { apps: { http: { servers: { srv0: { listen: [":80"] } } } } };
       api.configGet.mockResolvedValue(ok(prior));
       api.loadConfig.mockResolvedValue(ok());
@@ -1154,6 +1203,22 @@ describe("tool handler behavior", () => {
         await handler({ config: { apps: {} }, format: "json" });
         expect(listSnapshots()).toHaveLength(0);
       }
+    });
+
+    it("does NOT snapshot when loadConfig fails", async () => {
+      // A failed load did not change anything server-side. Pushing a "pre-load"
+      // snapshot would just consume a slot in the 10-deep ring and shift older
+      // rollback targets one position deeper for no gain. Mirrors the same
+      // deferral in caddy_revert apply.
+      const prior = { apps: { http: { servers: { srv0: { listen: [":80"] } } } } };
+      api.configGet.mockResolvedValue(ok(prior));
+      api.loadConfig.mockResolvedValue(err(500, "config invalid"));
+
+      const result = await handler({ config: { apps: {} }, format: "json" });
+
+      expect(result.isError).toBe(true);
+      const { listSnapshots } = await import("../snapshots.js");
+      expect(listSnapshots()).toHaveLength(0);
     });
   });
 

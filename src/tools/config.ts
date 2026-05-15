@@ -72,12 +72,17 @@ export function registerConfigTools(server: McpServer) {
     { readOnlyHint: false, destructiveHint: true, idempotentHint: true, openWorldHint: false },
     async ({ config, format }) => {
       const contentType = format === "caddyfile" ? "text/caddyfile" : "application/json";
-      // Snapshot the current config before replacing it, so caddy_revert can undo the change.
+      // Capture the pre-load state but defer the snapshot push until AFTER the
+      // load returns ok. Mirrors the deferral in caddy_revert apply: a failed
+      // load did not change anything server-side, so pushing a "pre-load"
+      // snapshot would just consume a slot in the 10-deep ring and shift the
+      // user's earlier rollback targets one position deeper for no gain.
       const current = await api.configGet();
-      if (current.ok && isSnapshotableConfig(current.data)) {
+      const res = await api.loadConfig(config, contentType);
+      if (res.ok && current.ok && isSnapshotableConfig(current.data)) {
         saveSnapshot(current.data, "caddy_load");
       }
-      return formatResult(await api.loadConfig(config, contentType));
+      return formatResult(res);
     },
   );
 

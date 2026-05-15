@@ -74,6 +74,33 @@ function isTransientFailure(res: ApiResponse): boolean {
   return false;
 }
 
+/**
+ * Whether a (method, path) pair is safe to retry on a transient failure.
+ *
+ * GET / PUT / PATCH / DELETE are idempotent on every Caddy admin endpoint --
+ * replaying them yields the same end state, so they always retry under the
+ * normal transient-failure policy.
+ *
+ * POST is split by path:
+ *  - `/config/<path>` and `/id/<id>` are non-idempotent: they append to
+ *    arrays (e.g. routes) or create new keys. On a network failure (status 0)
+ *    the request may already have been processed server-side; retrying
+ *    produces a duplicate append. On a 5xx, the server may have completed
+ *    the mutation before erroring downstream. Either way, retry risks a
+ *    silent duplicate -- skip the loop and surface the failure verbatim.
+ *  - `/load` is an atomic full-config replace: same input yields the same
+ *    end state, so retry is safe and is genuinely useful against a flaky
+ *    server during a large config push.
+ *  - `/adapt` is a pure transformation (Caddyfile/etc -> JSON) with no
+ *    side effects.
+ *  - `/stop` is destructive but a second call against an already-stopped
+ *    server is a no-op (it just yields ECONNREFUSED), so retry is benign.
+ */
+function isRetryableMethod(method: string, path: string): boolean {
+  if (method !== "POST") return true;
+  return !path.startsWith("/config/") && !path.startsWith("/id/");
+}
+
 async function caddyRequest<T = any>(
   method: string,
   path: string,
@@ -84,7 +111,7 @@ async function caddyRequest<T = any>(
   const maxRetries = getMaxRetries();
   let attempt = 0;
   let res: ApiResponse<T> = await attemptRequest<T>(method, path, body, contentType, timeout);
-  while (isTransientFailure(res) && attempt < maxRetries) {
+  while (isRetryableMethod(method, path) && isTransientFailure(res) && attempt < maxRetries) {
     attempt++;
     const backoff = Math.min(RETRY_BASE_MS * 2 ** (attempt - 1), RETRY_MAX_DELAY_MS);
     const delay = backoff + Math.random() * RETRY_MAX_JITTER_MS;
