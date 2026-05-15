@@ -79,3 +79,35 @@ jobs:
           # caddy-mcp is a stdio MCP server -- it doesn't expose a --version
           # flag, so we just confirm the package metadata is live and parses.
           npm view "@yawlabs/caddy-mcp@${VERSION}" version
+
+      # Publish to the Official MCP Registry (registry.modelcontextprotocol.io)
+      # so downstream registries (Glama, PulseMCP, mcpservers.org, etc.) that
+      # auto-source from it pick this release up. Uses GitHub OIDC: the runner
+      # is inside the YawLabs org, GitHub mints a token whose `repository_owner`
+      # claim is "YawLabs", and the registry grants publish permission on the
+      # `io.github.YawLabs/*` namespace from that claim alone (no pre-
+      # registration with the registry needed -- the auth is purely OIDC).
+      #
+      # The `jq` step below overwrites server.json's `version` field from the
+      # pushed tag so a forgotten manual bump on server.json can't publish a
+      # stale version to the registry. package.json is the workstation-owned
+      # source of truth; server.json is treated as derived at release time.
+      - name: Install mcp-publisher
+        run: |
+          curl -L "https://github.com/modelcontextprotocol/registry/releases/latest/download/mcp-publisher_$(uname -s | tr '[:upper:]' '[:lower:]')_$(uname -m | sed 's/x86_64/amd64/;s/aarch64/arm64/').tar.gz" \
+            | tar xz mcp-publisher
+
+      - name: Sync server.json version to the pushed tag
+        run: |
+          VERSION="${{ github.event.inputs.version }}"
+          if [ -z "$VERSION" ]; then
+            VERSION="${GITHUB_REF_NAME#v}"
+          fi
+          jq --arg v "$VERSION" '.version = $v | .packages[0].version = $v' server.json > server.tmp
+          mv server.tmp server.json
+
+      - name: Authenticate to MCP Registry (GitHub OIDC)
+        run: ./mcp-publisher login github-oidc
+
+      - name: Publish to MCP Registry
+        run: ./mcp-publisher publish
