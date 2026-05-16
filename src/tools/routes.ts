@@ -254,14 +254,12 @@ export function registerRouteTools(server: McpServer) {
               ],
             };
           }
-          // Narrow TOCTOU: the @id resolved on the GET above, but the parent
-          // server was torn down before the PUT landed. Caddy surfaces this
-          // with the same parent-missing markers as a first-create POST -- map
-          // it to the friendly "server gone" message so the caller doesn't
-          // get a raw "key does not exist" they have to decode.
-          if (isParentMissing(putRes)) {
-            return serverNotFoundError(srv);
-          }
+          // PUT failures surface verbatim. A 404 / parent-missing body here
+          // does NOT reliably mean "server gone" -- the more common cause is
+          // a concurrent caddy_remove_route deleting the @id between the GET
+          // above and the PUT. Translating to serverNotFoundError would
+          // mislead the caller about which thing is missing, so leave the
+          // raw body in place for them to read.
           return formatResult(putRes);
         }
         // GET failed. Only treat tight unknown-id markers as "first-create";

@@ -9,6 +9,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 > entries. See the [git tag list](https://github.com/YawLabs/caddy-mcp/tags)
 > and release notes for those versions.
 
+## [1.2.6] — 2026-05-16
+
+### Fixed
+
+- **Revert the `caddy_reverse_proxy` @id PUT "parent-missing -> server-not-found"
+  translation introduced in 1.2.5.** A 404 on `PUT /id/<id>` is far more often
+  caused by a concurrent `caddy_remove_route` deleting the @id between the GET
+  and PUT than by the parent server being torn down; the friendly message
+  mislabelled the routine race. PUT failures now surface verbatim again, as
+  they did pre-1.2.5.
+
 ## [1.2.5] — 2026-05-16
 
 ### Fixed
@@ -21,7 +32,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **`caddy_reverse_proxy` with `@id`: friendlier error when the parent
   server is torn down between the GET and PUT.** The narrow TOCTOU now
   surfaces the standard "server does not exist" message rather than the raw
-  `key does not exist` body.
+  `key does not exist` body. **(Reverted in 1.2.6 -- it mislabelled the
+  more common "@id was deleted" race.)**
 
 ### Changed
 

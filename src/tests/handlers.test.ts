@@ -294,11 +294,13 @@ describe("tool handler behavior", () => {
       expect(result.content[0].text).toContain("Config has been modified");
     });
 
-    it("PUT replace path: parent-missing on PUT translates to server-not-found", async () => {
-      // Narrow TOCTOU: the @id resolved on GET, but the parent server was
-      // torn down before the PUT landed. The PUT comes back with the same
-      // parent-missing markers as a fresh first-create POST -- the tool must
-      // surface the friendly "server gone" message rather than the raw error.
+    it("PUT replace path: parent-missing body surfaces verbatim, NOT as server-not-found", async () => {
+      // A 404 / "key does not exist" on PUT /id/<id> is ambiguous -- the more
+      // common cause is a concurrent caddy_remove_route deleting the @id
+      // between the GET above and the PUT, not the parent server being torn
+      // down. Translating to serverNotFoundError would mislead the caller
+      // about which thing is missing, so the raw body must surface as-is.
+      // Regression guard against re-introducing the buggy translation.
       api.configByIdGet.mockResolvedValue(
         ok({
           "@id": "my-api-route",
@@ -311,13 +313,14 @@ describe("tool handler behavior", () => {
       const result = await handler({
         from: "api.local",
         to: ["localhost:3000"],
-        server: "srv-gone",
+        server: "srv0",
         id: "my-api-route",
       });
 
       expect(api.configPost).not.toHaveBeenCalled();
       expect(result.isError).toBe(true);
-      expect(result.content[0].text).toContain('Server "srv-gone" does not exist');
+      expect(result.content[0].text).toContain("key does not exist");
+      expect(result.content[0].text).not.toContain("does not exist. Use caddy_list_servers");
     });
   });
 
