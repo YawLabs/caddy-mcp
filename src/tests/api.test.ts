@@ -202,6 +202,46 @@ describe("api", () => {
       expect(calls).toBe(6);
     }, 15000);
 
+    it("warns once on stderr when CADDY_MAX_RETRIES exceeds the hard cap", async () => {
+      // Fresh module so the per-process warn-once flag isn't already tripped
+      // by a sibling test that ran 1000-retries earlier.
+      vi.resetModules();
+      process.env.CADDY_MAX_RETRIES = "999";
+      const errSpy = vi.spyOn(console, "error").mockImplementation(() => {});
+      try {
+        const api = await import("../api.js");
+        globalThis.fetch = vi.fn(async () => new Response("down", { status: 503 })) as any;
+
+        // Two requests -- the warning must fire only on the first.
+        await api.configGet();
+        await api.configGet();
+
+        const calls = errSpy.mock.calls.map((c) => String(c[0]));
+        const clampWarnings = calls.filter((c) => c.includes("CADDY_MAX_RETRIES=999"));
+        expect(clampWarnings).toHaveLength(1);
+        expect(clampWarnings[0]).toContain("exceeds hard cap");
+      } finally {
+        errSpy.mockRestore();
+      }
+    }, 15000);
+
+    it("does not warn when CADDY_MAX_RETRIES is within the hard cap", async () => {
+      vi.resetModules();
+      process.env.CADDY_MAX_RETRIES = "3";
+      const errSpy = vi.spyOn(console, "error").mockImplementation(() => {});
+      try {
+        const api = await import("../api.js");
+        globalThis.fetch = vi.fn(async () => new Response("{}", { status: 200 })) as any;
+
+        await api.configGet();
+
+        const clampWarnings = errSpy.mock.calls.map((c) => String(c[0])).filter((c) => c.includes("exceeds hard cap"));
+        expect(clampWarnings).toHaveLength(0);
+      } finally {
+        errSpy.mockRestore();
+      }
+    });
+
     it("treats non-numeric CADDY_MAX_RETRIES as default (2)", async () => {
       process.env.CADDY_MAX_RETRIES = "not-a-number";
       const api = await import("../api.js");

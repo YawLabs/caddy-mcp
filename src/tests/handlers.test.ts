@@ -293,6 +293,32 @@ describe("tool handler behavior", () => {
       expect(result.isError).toBe(true);
       expect(result.content[0].text).toContain("Config has been modified");
     });
+
+    it("PUT replace path: parent-missing on PUT translates to server-not-found", async () => {
+      // Narrow TOCTOU: the @id resolved on GET, but the parent server was
+      // torn down before the PUT landed. The PUT comes back with the same
+      // parent-missing markers as a fresh first-create POST -- the tool must
+      // surface the friendly "server gone" message rather than the raw error.
+      api.configByIdGet.mockResolvedValue(
+        ok({
+          "@id": "my-api-route",
+          match: [{ host: ["api.local"] }],
+          handle: [{ handler: "reverse_proxy", upstreams: [{ dial: "localhost:9999" }] }],
+        }),
+      );
+      api.configByIdSet.mockResolvedValue(err(500, "key does not exist"));
+
+      const result = await handler({
+        from: "api.local",
+        to: ["localhost:3000"],
+        server: "srv-gone",
+        id: "my-api-route",
+      });
+
+      expect(api.configPost).not.toHaveBeenCalled();
+      expect(result.isError).toBe(true);
+      expect(result.content[0].text).toContain('Server "srv-gone" does not exist');
+    });
   });
 
   // ─── caddy_add_route ──────────────────────────────────────────────────
@@ -830,6 +856,57 @@ describe("tool handler behavior", () => {
 
       const result = await handler({});
       expect(result.content[0].text).toContain("off (HTTP only)");
+    });
+
+    it("does not misclassify port 4430 as HTTPS (boundary-aware port match)", async () => {
+      // A naive substring `.includes(":443")` matches ":4430" as well -- a
+      // server on port 4430 must NOT report "auto (HTTPS)" since Caddy only
+      // auto-provisions for port 443.
+      api.configGet.mockResolvedValue(
+        ok({
+          apps: {
+            http: {
+              servers: { srv0: { listen: [":4430"], routes: [] } },
+            },
+          },
+        }),
+      );
+
+      const result = await handler({});
+      expect(result.content[0].text).toContain("off (HTTP only)");
+      expect(result.content[0].text).not.toContain("auto (HTTPS)");
+    });
+
+    it("recognizes port 443 with a protocol suffix (e.g. `:443/h3` for QUIC)", async () => {
+      // Caddy listen strings may carry protocol annotations after the port;
+      // those must still classify as HTTPS-auto.
+      api.configGet.mockResolvedValue(
+        ok({
+          apps: {
+            http: {
+              servers: { srv0: { listen: [":443/h3"], routes: [] } },
+            },
+          },
+        }),
+      );
+
+      const result = await handler({});
+      expect(result.content[0].text).toContain("auto (HTTPS)");
+    });
+
+    it("recognizes port 443 on a bound address (e.g. `127.0.0.1:443`)", async () => {
+      api.configGet.mockResolvedValue(
+        ok({
+          apps: {
+            http: {
+              servers: { srv0: { listen: ["127.0.0.1:443"], routes: [] } },
+            },
+          },
+        }),
+      );
+
+      const result = await handler({});
+      expect(result.content[0].text).toContain("auto (HTTPS)");
     });
 
     it("shows enabled when tls_connection_policies present", async () => {

@@ -29,12 +29,21 @@ function getBaseUrl(): string {
   return (process.env.CADDY_ADMIN_URL || DEFAULT_URL).replace(/\/+$/, "");
 }
 
+let warnedRetryClamp = false;
 function getMaxRetries(): number {
   const raw = process.env.CADDY_MAX_RETRIES;
   if (raw === undefined) return 2;
   const n = Number(raw);
   if (!Number.isFinite(n) || n < 0) return 2;
-  return Math.min(Math.floor(n), RETRY_HARD_CAP);
+  const floored = Math.floor(n);
+  // Warn once per process when the user-supplied value exceeds the hard cap.
+  // getMaxRetries runs on every request, so an unconditional warn would
+  // spam stderr; a per-process flag keeps the signal noticeable but quiet.
+  if (floored > RETRY_HARD_CAP && !warnedRetryClamp) {
+    warnedRetryClamp = true;
+    console.error(`caddy-mcp: CADDY_MAX_RETRIES=${raw} exceeds hard cap; using ${RETRY_HARD_CAP}.`);
+  }
+  return Math.min(floored, RETRY_HARD_CAP);
 }
 
 function getHeaders(contentType?: string): Record<string, string> {

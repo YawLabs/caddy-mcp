@@ -32,11 +32,19 @@ interface CaddyConfigShape {
   };
 }
 
+/**
+ * Match `:443` as a port suffix on a Caddy listen string. Allow trailing
+ * non-digit (e.g. `:443/h3` for QUIC protocol annotation) or end-of-string,
+ * so neighbors like `:4430` / `:4431` don't trigger a false "auto (HTTPS)"
+ * classification under a naive substring check.
+ */
+const HTTPS_PORT_RE = /:443(?:\D|$)/;
+
 function describeServer(raw: CaddyServerSummary): string {
   const listen: unknown[] = Array.isArray(raw.listen) ? raw.listen : [];
   const routes: unknown[] = Array.isArray(raw.routes) ? raw.routes : [];
   const hasExplicitTls = !!raw.tls_connection_policies;
-  const listensHttps = listen.some((l) => typeof l === "string" && l.includes(":443"));
+  const listensHttps = listen.some((l) => typeof l === "string" && HTTPS_PORT_RE.test(l));
   const tls = hasExplicitTls ? "enabled" : listensHttps ? "auto (HTTPS)" : "off (HTTP only)";
   const listenStr = listen.length > 0 ? listen.map(String).join(", ") : "default";
   return `${routes.length} route(s), listen: ${listenStr}, TLS: ${tls}`;

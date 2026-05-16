@@ -107,7 +107,7 @@ export function parseFrom(from: string): { host?: string[]; path?: string[] } {
   return match;
 }
 
-/** Clean an upstream address — strip scheme, validate host:port format */
+/** Strip scheme and trailing slashes from an upstream address. */
 function cleanUpstreamAddr(addr: string): string {
   return addr.replace(/^https?:\/\//, "").replace(/\/+$/, "");
 }
@@ -253,6 +253,14 @@ export function registerRouteTools(server: McpServer) {
                 },
               ],
             };
+          }
+          // Narrow TOCTOU: the @id resolved on the GET above, but the parent
+          // server was torn down before the PUT landed. Caddy surfaces this
+          // with the same parent-missing markers as a first-create POST -- map
+          // it to the friendly "server gone" message so the caller doesn't
+          // get a raw "key does not exist" they have to decode.
+          if (isParentMissing(putRes)) {
+            return serverNotFoundError(srv);
           }
           return formatResult(putRes);
         }
