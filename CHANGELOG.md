@@ -5,6 +5,32 @@ All notable changes to this project are documented here.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+> **Note:** versions 1.1.0 through 1.2.4 were released without changelog
+> entries. See the [git tag list](https://github.com/YawLabs/caddy-mcp/tags)
+> and release notes for those versions.
+
+## [1.2.5] — 2026-05-16
+
+### Fixed
+
+- **`caddy_status` no longer misclassifies non-443 ports as HTTPS-auto.** A
+  naive `:443` substring match also fired for neighbors like `:4430` /
+  `:4431`. Replaced with a boundary-aware regex that still recognizes
+  `:443/h3` (QUIC protocol annotation) and bound addresses like
+  `127.0.0.1:443`.
+- **`caddy_reverse_proxy` with `@id`: friendlier error when the parent
+  server is torn down between the GET and PUT.** The narrow TOCTOU now
+  surfaces the standard "server does not exist" message rather than the raw
+  `key does not exist` body.
+
+### Changed
+
+- **`CADDY_MAX_RETRIES` clamp is now visible.** Values above the hard cap
+  (5) log a one-time stderr notice so a `CADDY_MAX_RETRIES=1000` setter
+  doesn't silently get 5.
+- **Dropped a stale doc claim** on `cleanUpstreamAddr` -- the helper strips
+  scheme and trailing slashes, it does not validate host:port.
+
 ## [1.0.1] — 2026-04-24
 
 ### Security
