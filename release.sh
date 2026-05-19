@@ -131,38 +131,74 @@ else
 fi
 
 step 5 "Publish to npm"
+# Three publish paths, picked by environment:
+#   1. IS_CI=true                    -> WE are CI. Do the publish (NODE_AUTH_TOKEN
+#                                       is set; --provenance for sigstore).
+#   2. IS_CI=false + release.yml     -> CI will publish on the tag we just pushed.
+#      exists with CI publish path      Watch `gh run watch` for that run and
+#                                       verify via `npm view`. Workstation MUST
+#                                       NOT also publish -- stale ~/.npmrc fails
+#                                       E404, valid one races CI for the same
+#                                       version. CI is authoritative. (Replaces
+#                                       the previous DEFER_PUBLISH_TO_CI=1
+#                                       manual flag; detection is now automatic.)
+#   3. IS_CI=false + no CI publish   -> Workstation IS the publisher. Try locally
+#      path                             with EOTP retry for fresh WebAuthn sessions.
 NPM_VERSION=$(npm view "@yawlabs/caddy-mcp@${VERSION}" version 2>/dev/null || echo "")
 if [ "$NPM_VERSION" = "$VERSION" ]; then
   info "Already published to npm -- skipping"
-elif [ "$DEFER_PUBLISH_TO_CI" = "1" ]; then
-  info "Deferring publish to CI -- the v${VERSION} tag pushed in step 4 will trigger .github/workflows/release.yml."
-else
+elif [ "$IS_CI" = "true" ]; then
   # --provenance requires an OIDC-signing-capable environment (GitHub Actions
   # with id-token: write). Locally the flag aborts the publish with
   # "Automatic provenance generation not supported for provider: null".
-  if [ "$IS_CI" = "true" ]; then
-    npm publish --access public --provenance
-  else
-    # WebAuthn propagation: a freshly-logged-in npm web session can take ~30s
-    # to register with npm's auth backend. The first 1-2 publishes after
-    # `npm login --auth-type=web` may EOTP -- WebAuthn has no TOTP fallback,
-    # so the only recovery is to wait and retry. Documented per-shape
-    # exception to the global single-retry rule.
-    publish_attempt=1
-    publish_max=3
-    while true; do
-      if npm publish --access public; then
-        break
-      fi
-      if [ "$publish_attempt" -ge "$publish_max" ]; then
-        fail "npm publish failed after $publish_max attempts"
-      fi
-      warn "publish attempt $publish_attempt failed -- waiting 30s (WebAuthn propagation pattern)"
-      sleep 30
-      publish_attempt=$((publish_attempt + 1))
-    done
+  npm publish --access public --provenance
+  info "Published @yawlabs/caddy-mcp@${VERSION} to npm (with provenance)"
+elif [ -f ".github/workflows/release.yml" ] && grep -q "npm publish\|NODE_AUTH_TOKEN\|release.sh" .github/workflows/release.yml; then
+  info "CI release.yml fires on v* tag push -- workstation hands off to CI"
+  TAG_SHA=$(git rev-parse "v${VERSION}^{}")
+  RUN_ID=""
+  for i in 1 2 3 4 5; do
+    RUN_ID=$(gh run list --workflow=Release --event=push --commit="$TAG_SHA" --limit=1 --json databaseId --jq '.[0].databaseId' 2>/dev/null || echo "")
+    [ -n "$RUN_ID" ] && break
+    sleep 2
+  done
+  if [ -z "$RUN_ID" ]; then
+    fail "Could not find Release workflow run for tag v${VERSION} (commit $TAG_SHA). Push may have failed or CI is misconfigured. Check 'gh run list --limit 5'."
   fi
-  info "Published @yawlabs/caddy-mcp@${VERSION} to npm"
+  info "Watching CI Release run $RUN_ID"
+  gh run watch "$RUN_ID" --exit-status || fail "CI Release run $RUN_ID failed. See 'gh run view $RUN_ID --log-failed'."
+  for i in 1 2 3 4 5; do
+    NPM_NOW=$(npm view "@yawlabs/caddy-mcp@${VERSION}" version 2>/dev/null || echo "")
+    [ "$NPM_NOW" = "$VERSION" ] && break
+    sleep 3
+  done
+  [ "$NPM_NOW" = "$VERSION" ] || fail "CI workflow succeeded but npm registry still shows '$NPM_NOW' for @yawlabs/caddy-mcp@${VERSION}. Likely propagation lag -- retry verification in a minute."
+  info "Published @yawlabs/caddy-mcp@${VERSION} via CI Release run $RUN_ID"
+else
+  # Workstation IS the publisher (no CI fallback). WebAuthn-fresh sessions can
+  # EOTP for ~30s; retry only on OTP-class errors. Fail fast on everything else
+  # so a packaging error or duplicate-version doesn't waste 60s spinning.
+  ATTEMPT=1
+  MAX_ATTEMPTS=3
+  while true; do
+    PUBLISH_LOG=$(mktemp)
+    if npm publish --access public 2>&1 | tee "$PUBLISH_LOG"; then
+      rm -f "$PUBLISH_LOG"
+      break
+    fi
+    if ! grep -qE 'EOTP|EAUTH|one-time password|OTP' "$PUBLISH_LOG"; then
+      rm -f "$PUBLISH_LOG"
+      fail "npm publish failed (non-OTP error -- see output above). If E401/E404, your ~/.npmrc session is stale: run 'npm login --auth-type=web' and retry."
+    fi
+    rm -f "$PUBLISH_LOG"
+    if [ $ATTEMPT -ge $MAX_ATTEMPTS ]; then
+      fail "npm publish failed after $MAX_ATTEMPTS OTP-class attempts. WebAuthn session may not be propagating."
+    fi
+    warn "npm publish attempt $ATTEMPT EOTPed -- waiting 30s for WebAuthn session to propagate"
+    ATTEMPT=$((ATTEMPT + 1))
+    sleep 30
+  done
+  info "Published @yawlabs/caddy-mcp@${VERSION} to npm (workstation)"
 fi
 
 step 6 "Create GitHub release"
