@@ -9,6 +9,25 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 > entries. See the [git tag list](https://github.com/YawLabs/caddy-mcp/tags)
 > and release notes for those versions.
 
+## [1.2.7] — 2026-05-19
+
+### Fixed
+
+- **Prefix-aware ETag cache invalidation.** A successful write at path `P` now
+  also drops cached ETags for ancestors of `P` (e.g. a write to
+  `apps/http/servers/srv0/routes` invalidates a cached
+  `apps/http/servers/srv0`), descendants of `P`, and the cross-namespace
+  entries (a `/id/<id>` write invalidates every `/config/...` entry, and a
+  `/config/...` write invalidates every `/id/<id>` entry). Previously
+  invalidation was path-exact, so a sequence of "GET parent / write child /
+  write parent" sent a stale `If-Match` on the parent write and surfaced a
+  spurious `HTTP 412 Precondition Failed` to the caller.
+- **Resource error responses now report `text/plain`.** When the admin API
+  call backing `caddy://config`, `caddy://upstreams`, or `caddy://servers`
+  fails, the body is `Error: ...` text but `mimeType` was still
+  `application/json` -- a strict client doing `JSON.parse` on the body
+  would crash. `caddy://metrics` already handled this correctly.
+
 ## [1.2.6] — 2026-05-16
 
 ### Fixed
