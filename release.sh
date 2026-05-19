@@ -56,6 +56,11 @@ CURRENT_VERSION=$(node -p "require('./package.json').version")
 
 if [ "$IS_CI" != "true" ]; then
   [ -z "$(git status --porcelain)" ] || fail "Working directory not clean -- commit or stash changes before releasing"
+  # Verify the npm web session is still valid before we run tests + commits +
+  # tags. WebAuthn sessions in ~/.npmrc expire silently; without this check
+  # the script would fail at step 5 (npm publish) with ENEEDAUTH after the
+  # version bump + tag had already been pushed.
+  npm whoami >/dev/null 2>&1 || fail "No active npm session -- run 'npm login --auth-type=web' first."
 fi
 
 if [ "$CURRENT_VERSION" = "$VERSION" ]; then
@@ -130,7 +135,24 @@ else
   if [ "$IS_CI" = "true" ]; then
     npm publish --access public --provenance
   else
-    npm publish --access public
+    # WebAuthn propagation: a freshly-logged-in npm web session can take ~30s
+    # to register with npm's auth backend. The first 1-2 publishes after
+    # `npm login --auth-type=web` may EOTP -- WebAuthn has no TOTP fallback,
+    # so the only recovery is to wait and retry. Documented per-shape
+    # exception to the global single-retry rule.
+    publish_attempt=1
+    publish_max=3
+    while true; do
+      if npm publish --access public; then
+        break
+      fi
+      if [ "$publish_attempt" -ge "$publish_max" ]; then
+        fail "npm publish failed after $publish_max attempts"
+      fi
+      warn "publish attempt $publish_attempt failed -- waiting 30s (WebAuthn propagation pattern)"
+      sleep 30
+      publish_attempt=$((publish_attempt + 1))
+    done
   fi
   info "Published @yawlabs/caddy-mcp@${VERSION} to npm"
 fi
@@ -150,9 +172,15 @@ else
 fi
 
 step 7 "Verify"
-sleep 3
-LIVE_VERSION=$(npm view "@yawlabs/caddy-mcp@${VERSION}" version 2>/dev/null || echo "")
-[ "$LIVE_VERSION" = "$VERSION" ] && info "npm: @yawlabs/caddy-mcp@${LIVE_VERSION}" || warn "npm: ${LIVE_VERSION} (propagating)"
+# A successful `npm publish` doesn't guarantee instant registry visibility.
+# Poll up to 5 times with 5s spacing, matching the CI smoke-test cadence.
+LIVE_VERSION=""
+for i in 1 2 3 4 5; do
+  LIVE_VERSION=$(npm view "@yawlabs/caddy-mcp@${VERSION}" version 2>/dev/null || echo "")
+  [ "$LIVE_VERSION" = "$VERSION" ] && break
+  if [ "$i" -lt 5 ]; then sleep 5; fi
+done
+[ "$LIVE_VERSION" = "$VERSION" ] && info "npm: @yawlabs/caddy-mcp@${LIVE_VERSION}" || warn "npm: not yet visible (registry propagating)"
 GH_TAG=$(gh release view "v${VERSION}" --json tagName --jq '.tagName' 2>/dev/null || echo "")
 [ "$GH_TAG" = "v${VERSION}" ] && info "GitHub: ${GH_TAG}" || warn "GitHub release: not found"
 
