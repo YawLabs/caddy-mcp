@@ -56,12 +56,18 @@ CURRENT_VERSION=$(node -p "require('./package.json').version")
 
 if [ "$IS_CI" != "true" ]; then
   [ -z "$(git status --porcelain)" ] || fail "Working directory not clean -- commit or stash changes before releasing"
-  # Verify the npm web session is still valid before we run tests + commits +
-  # tags. WebAuthn sessions in ~/.npmrc expire silently; without this check
-  # the script would fail at step 5 (npm publish) with ENEEDAUTH after the
-  # version bump + tag had already been pushed.
-  npm whoami >/dev/null 2>&1 || fail "No active npm session -- run 'npm login --auth-type=web' first."
+  # If a CI release workflow exists, a missing local npm session is fine --
+  # pushing the v* tag in step 4 will trigger CI to publish via NPM_TOKEN,
+  # and step 5 here will then see "Already published -- skipping". Only
+  # require a local session when there is no CI fallback to defer to.
+  if [ ! -f .github/workflows/release.yml ]; then
+    npm whoami >/dev/null 2>&1 || fail "No active npm session -- run 'npm login --auth-type=web' first."
+  elif ! npm whoami >/dev/null 2>&1; then
+    warn "No local npm session, but .github/workflows/release.yml exists -- step 5 will defer publish to CI on tag push."
+    DEFER_PUBLISH_TO_CI=1
+  fi
 fi
+: "${DEFER_PUBLISH_TO_CI:=0}"
 
 if [ "$CURRENT_VERSION" = "$VERSION" ]; then
   info "Resuming release v${VERSION}"
@@ -128,6 +134,8 @@ step 5 "Publish to npm"
 NPM_VERSION=$(npm view "@yawlabs/caddy-mcp@${VERSION}" version 2>/dev/null || echo "")
 if [ "$NPM_VERSION" = "$VERSION" ]; then
   info "Already published to npm -- skipping"
+elif [ "$DEFER_PUBLISH_TO_CI" = "1" ]; then
+  info "Deferring publish to CI -- the v${VERSION} tag pushed in step 4 will trigger .github/workflows/release.yml."
 else
   # --provenance requires an OIDC-signing-capable environment (GitHub Actions
   # with id-token: write). Locally the flag aborts the publish with
