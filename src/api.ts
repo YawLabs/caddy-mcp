@@ -25,6 +25,43 @@ function setEtag(path: string, etag: string): void {
   etagCache.set(path, etag);
 }
 
+/**
+ * Invalidate cached ETags whose paths can no longer be trusted after a
+ * successful write to `path`. Without prefix-awareness, a sequence like
+ * "GET parent / POST child / write parent" would send a stale If-Match on the
+ * parent write and get a spurious 412 -- the parent cache entry survived the
+ * child write even though the parent's content changed underneath it.
+ *
+ * Drops, in order:
+ *   1. the exact `path` (the just-written entry; PATCH/PUT may re-set after);
+ *   2. ancestors of `path` (e.g. writing /config/a/b/c invalidates /config/a/b
+ *      and /config/a);
+ *   3. descendants of `path` (e.g. writing /config/a/b invalidates
+ *      /config/a/b/c);
+ *   4. for writes to `/id/<id>`, every `/config/...` entry -- we can't know
+ *      which config sub-path the @id resolves to without an extra round-trip,
+ *      so blow them all away (cheapest correct option). The reverse also holds:
+ *      a write to `/config/...` invalidates any `/id/...` cached for paths that
+ *      may resolve into that subtree.
+ */
+function invalidateRelated(path: string): void {
+  etagCache.delete(path);
+  for (const key of Array.from(etagCache.keys())) {
+    if (key === path) continue;
+    if (path.startsWith(`${key}/`) || key.startsWith(`${path}/`)) {
+      etagCache.delete(key);
+    }
+  }
+  const isIdWrite = path.startsWith("/id/");
+  const isConfigWrite = path.startsWith("/config/");
+  if (isIdWrite || isConfigWrite) {
+    const otherNamespace = isIdWrite ? "/config/" : "/id/";
+    for (const key of Array.from(etagCache.keys())) {
+      if (key.startsWith(otherNamespace)) etagCache.delete(key);
+    }
+  }
+}
+
 function getBaseUrl(): string {
   return (process.env.CADDY_ADMIN_URL || DEFAULT_URL).replace(/\/+$/, "");
 }
@@ -166,24 +203,18 @@ async function attemptRequest<T = any>(
     }
 
     // Method-aware ETag cache policy on successful config writes:
-    //   PATCH / PUT: refresh cache from the response ETag (the response
-    //     describes the same path-resource we just modified). Fall back to
-    //     invalidation when no ETag is returned.
-    //   POST: invalidate. POST appends to a collection, so the returned ETag
-    //     (if any) may describe the parent or root config rather than the
-    //     path-resource -- trusting it would risk a stale If-Match.
-    //   DELETE: invalidate. The path-resource is gone; any returned ETag
-    //     describes a different scope.
+    //   PATCH / PUT: invalidate related entries (ancestors, descendants, cross-namespace),
+    //     then re-set the path's own ETag from the response. The response describes the
+    //     same path-resource we just modified, so it's safe to trust for that key.
+    //   POST: invalidate everything related. POST appends to a collection, so the
+    //     returned ETag (if any) may describe the parent or root config rather than
+    //     the path-resource -- trusting it would risk a stale If-Match.
+    //   DELETE: invalidate everything related. The path-resource is gone; any
+    //     returned ETag describes a different scope.
     if (isWrite && res.ok && isConfigPath) {
-      if (method === "PATCH" || method === "PUT") {
-        if (etag) {
-          setEtag(path, etag);
-        } else {
-          etagCache.delete(path);
-        }
-      } else {
-        // POST or DELETE -- invalidate regardless of returned ETag.
-        etagCache.delete(path);
+      invalidateRelated(path);
+      if ((method === "PATCH" || method === "PUT") && etag) {
+        setEtag(path, etag);
       }
     }
 

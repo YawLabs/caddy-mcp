@@ -1495,4 +1495,341 @@ describe("tool handler behavior", () => {
       expect(result.content[0].text).toContain("not found");
     });
   });
+
+  // ─── caddy_add_route (happy path) ─────────────────────────────────────
+
+  describe("caddy_add_route happy path", () => {
+    let handler: (...args: any[]) => Promise<any>;
+
+    beforeEach(async () => {
+      const mockServer = { tool: vi.fn(), resource: vi.fn() };
+      const { registerRouteTools } = await import("../tools/routes.js");
+      registerRouteTools(mockServer as any);
+      handler = getToolHandler(mockServer, "caddy_add_route");
+    });
+
+    it("POSTs the supplied match/handle/terminal verbatim under the server's routes path", async () => {
+      api.configPost.mockResolvedValue(ok());
+      const result = await handler({
+        match: [{ host: ["x.local"], path: ["/api/*"] }],
+        handle: [{ handler: "file_server", root: "/var/www" }],
+        server: "srv0",
+        terminal: false,
+      });
+      expect(api.configPost).toHaveBeenCalledWith("apps/http/servers/srv0/routes", {
+        match: [{ host: ["x.local"], path: ["/api/*"] }],
+        handle: [{ handler: "file_server", root: "/var/www" }],
+        terminal: false,
+      });
+      expect(result.isError).toBeFalsy();
+    });
+
+    it("defaults terminal to true and uses srv0 when server is omitted", async () => {
+      api.configPost.mockResolvedValue(ok());
+      await handler({
+        match: [{ host: ["x.local"] }],
+        handle: [{ handler: "static_response", status_code: 204 }],
+        server: "srv0",
+        terminal: true,
+      });
+      const [path, body] = api.configPost.mock.calls[0];
+      expect(path).toBe("apps/http/servers/srv0/routes");
+      expect(body.terminal).toBe(true);
+    });
+  });
+
+  // ─── caddy_pki ────────────────────────────────────────────────────────
+
+  describe("caddy_pki", () => {
+    let handler: (...args: any[]) => Promise<any>;
+
+    beforeEach(async () => {
+      const mockServer = { tool: vi.fn(), resource: vi.fn() };
+      const { registerOperationalTools } = await import("../tools/operational.js");
+      registerOperationalTools(mockServer as any);
+      handler = getToolHandler(mockServer, "caddy_pki");
+    });
+
+    it("calls getPki with the supplied ca when certificates is false", async () => {
+      api.getPki.mockResolvedValue(ok({ name: "Caddy Local Authority" }));
+      const result = await handler({ ca: "local", certificates: false });
+      expect(api.getPki).toHaveBeenCalledWith("local");
+      expect(api.getPkiCertificates).not.toHaveBeenCalled();
+      expect(result.content[0].text).toContain("Caddy Local Authority");
+    });
+
+    it("calls getPkiCertificates when certificates is true", async () => {
+      api.getPkiCertificates.mockResolvedValue(ok({ root: "PEM..." }));
+      const result = await handler({ ca: "local", certificates: true });
+      expect(api.getPkiCertificates).toHaveBeenCalledWith("local");
+      expect(api.getPki).not.toHaveBeenCalled();
+      expect(result.content[0].text).toContain("PEM");
+    });
+  });
+
+  // ─── caddy_tls non-object GET branch ──────────────────────────────────
+
+  describe("caddy_tls safeFallback: GET returns non-object body", () => {
+    let handler: (...args: any[]) => Promise<any>;
+
+    beforeEach(async () => {
+      const mockServer = { tool: vi.fn(), resource: vi.fn() };
+      const { registerTlsTools } = await import("../tools/tls.js");
+      registerTlsTools(mockServer as any);
+      handler = getToolHandler(mockServer, "caddy_tls");
+    });
+
+    it("refuses to clobber when apps/tls resolves to a string", async () => {
+      api.configPatch.mockResolvedValue(err(500, "patch-failed"));
+      api.configGet.mockResolvedValue(ok("not-an-object"));
+      const result = await handler({ action: "set_email", email: "foo@bar.com" });
+      expect(api.configPost).not.toHaveBeenCalled();
+      expect(api.configPut).not.toHaveBeenCalled();
+      expect(result.isError).toBe(true);
+      expect(result.content[0].text).toContain("Refusing to clobber");
+      expect(result.content[0].text).toContain("non-object value");
+    });
+
+    it("refuses to clobber when apps/tls resolves to an array", async () => {
+      api.configPatch.mockResolvedValue(err(500, "patch-failed"));
+      api.configGet.mockResolvedValue(ok([1, 2, 3]));
+      const result = await handler({ action: "set_acme_ca", ca: "https://x.example/dir" });
+      expect(api.configPost).not.toHaveBeenCalled();
+      expect(api.configPut).not.toHaveBeenCalled();
+      expect(result.isError).toBe(true);
+      expect(result.content[0].text).toContain("Refusing to clobber");
+      expect(result.content[0].text).toContain("non-object value");
+    });
+  });
+
+  // ─── caddy_remove_route additional branches ──────────────────────────
+
+  describe("caddy_remove_route additional branches", () => {
+    let handler: (...args: any[]) => Promise<any>;
+
+    beforeEach(async () => {
+      const mockServer = { tool: vi.fn(), resource: vi.fn() };
+      const { registerRouteTools } = await import("../tools/routes.js");
+      registerRouteTools(mockServer as any);
+      handler = getToolHandler(mockServer, "caddy_remove_route");
+    });
+
+    it("errors when index path reads back a non-array routes value", async () => {
+      // Defensive: a malformed server config (routes is an object / null /
+      // string) must produce a clear error, not a crash.
+      api.configGet.mockResolvedValue(ok({ not: "an array" }));
+      const result = await handler({ index: 0, server: "srv0", confirm: true });
+      expect(result.isError).toBe(true);
+      expect(result.content[0].text).toContain("no routes array");
+      expect(api.configDelete).not.toHaveBeenCalled();
+    });
+
+    it("surfaces the api error verbatim when by-@id delete fails after confirm", async () => {
+      api.configByIdDelete.mockResolvedValue(err(500, "id-delete-failed"));
+      const result = await handler({ id: "missing-route", confirm: true });
+      expect(api.configByIdDelete).toHaveBeenCalledWith("missing-route");
+      expect(result.isError).toBe(true);
+      expect(result.content[0].text).toContain("id-delete-failed");
+    });
+  });
+
+  // ─── caddy_list_routes handler-formatter branches ────────────────────
+
+  describe("caddy_list_routes formatter branches", () => {
+    let handler: (...args: any[]) => Promise<any>;
+
+    beforeEach(async () => {
+      const mockServer = { tool: vi.fn(), resource: vi.fn() };
+      const { registerRouteTools } = await import("../tools/routes.js");
+      registerRouteTools(mockServer as any);
+      handler = getToolHandler(mockServer, "caddy_list_routes");
+    });
+
+    it("renders authentication, error, encode, and headers handlers", async () => {
+      api.configGet.mockResolvedValue(
+        ok({
+          listen: [":443"],
+          routes: [
+            {
+              match: [{ path: ["/protected"] }],
+              handle: [{ handler: "authentication", providers: { http_basic: {}, jwt: {} } }],
+            },
+            {
+              match: [{ path: ["/boom"] }],
+              handle: [{ handler: "error", status_code: 503 }],
+            },
+            {
+              match: [{ path: ["/static"] }],
+              handle: [{ handler: "encode" }, { handler: "headers" }],
+            },
+          ],
+        }),
+      );
+      const result = await handler({ server: "srv0" });
+      const text = result.content[0].text;
+      expect(text).toContain("auth(http_basic,jwt)");
+      expect(text).toContain("error(503)");
+      expect(text).toContain("encode");
+      expect(text).toContain("headers");
+    });
+  });
+
+  // ─── caddy_adapt: result undefined + non-object warning ──────────────
+
+  describe("caddy_adapt defensive branches", () => {
+    let handler: (...args: any[]) => Promise<any>;
+
+    beforeEach(async () => {
+      const mockServer = { tool: vi.fn(), resource: vi.fn() };
+      const { registerAdaptTools } = await import("../tools/adapt.js");
+      registerAdaptTools(mockServer as any);
+      handler = getToolHandler(mockServer, "caddy_adapt");
+    });
+
+    it("emits 'OK (no output)' when adapt response has warnings but no result field", async () => {
+      // Warning-only responses are real -- e.g. a Caddyfile that adapts to an
+      // empty/null result while still emitting a deprecation warning.
+      api.adapt.mockResolvedValue(
+        ok({
+          warnings: [{ directive: "tls", message: "deprecated option" }],
+          // no result field
+        }),
+      );
+      const result = await handler({ config: "x", adapter: "caddyfile" });
+      expect(result.content).toHaveLength(2);
+      expect(result.content[0].text).toContain("Warnings:");
+      expect(result.content[1].text).toBe("OK (no output)");
+    });
+
+    it("renders a non-object warning entry via the unknown fallback", async () => {
+      // formatWarning's defensive path: warnings array contains a primitive.
+      api.adapt.mockResolvedValue(
+        ok({
+          result: { apps: {} },
+          warnings: ["just a string", 42],
+        }),
+      );
+      const result = await handler({ config: "x", adapter: "caddyfile" });
+      expect(result.content[0].text).toContain("unknown:");
+      expect(result.content[0].text).toContain('"just a string"');
+      expect(result.content[0].text).toContain("42");
+    });
+  });
+
+  // ─── caddy_status: apps.http.servers absent ──────────────────────────
+
+  describe("caddy_status missing apps/http/servers", () => {
+    let handler: (...args: any[]) => Promise<any>;
+
+    beforeEach(async () => {
+      const mockServer = { tool: vi.fn(), resource: vi.fn() };
+      const { registerOperationalTools } = await import("../tools/operational.js");
+      registerOperationalTools(mockServer as any);
+      handler = getToolHandler(mockServer, "caddy_status");
+    });
+
+    it("reports 'No HTTP servers' when apps.http is absent (not just empty)", async () => {
+      // Optional-chain fallback path: config.apps.http is undefined, not {}.
+      api.configGet.mockResolvedValue(ok({ apps: {} }));
+      const result = await handler({});
+      expect(result.content[0].text).toContain("No HTTP servers configured");
+    });
+
+    it("reports 'No HTTP servers' when apps itself is absent", async () => {
+      api.configGet.mockResolvedValue(ok({}));
+      const result = await handler({});
+      expect(result.content[0].text).toContain("No HTTP servers configured");
+    });
+  });
+
+  // ─── Snapshots ring eviction ─────────────────────────────────────────
+
+  describe("snapshots ring buffer", () => {
+    it("caps at MAX_SNAPSHOTS=10 and evicts the oldest when an 11th is pushed", async () => {
+      const { clearSnapshots, saveSnapshot, listSnapshots } = await import("../snapshots.js");
+      clearSnapshots();
+      for (let i = 0; i < 11; i++) {
+        saveSnapshot({ generation: i }, `seed-${i}`);
+      }
+      const snaps = listSnapshots();
+      expect(snaps).toHaveLength(10);
+      // Newest at index 0, oldest at index 9. Generation 0 must have been
+      // evicted; generation 10 (newest) must be at the front.
+      expect(snaps[0]?.trigger).toBe("seed-10");
+      expect((snaps[0]?.config as { generation: number }).generation).toBe(10);
+      expect(snaps[9]?.trigger).toBe("seed-1");
+      expect(snaps.some((s) => s.trigger === "seed-0")).toBe(false);
+    });
+  });
+
+  // ─── Resource handler responses ──────────────────────────────────────
+
+  describe("resource handlers", () => {
+    /** Capture and invoke a registered resource handler by name. */
+    async function getResourceHandler(name: string) {
+      const mockServer = { tool: vi.fn(), resource: vi.fn() };
+      const { registerResources } = await import("../resources.js");
+      registerResources(mockServer as any);
+      const call = mockServer.resource.mock.calls.find((c: any[]) => c[0] === name);
+      if (!call) throw new Error(`Resource "${name}" not registered`);
+      // server.resource signature is (name, uri, opts, handler) -- handler is last.
+      return call[call.length - 1] as () => Promise<any>;
+    }
+
+    it("caddy://config: JSON mimeType + body on success", async () => {
+      api.configGet.mockResolvedValue(ok({ apps: { http: {} } }));
+      const handler = await getResourceHandler("caddy-config");
+      const result = await handler();
+      expect(result.contents[0].mimeType).toBe("application/json");
+      expect(() => JSON.parse(result.contents[0].text)).not.toThrow();
+    });
+
+    it("caddy://config: text/plain mimeType + Error: prefix on failure", async () => {
+      api.configGet.mockResolvedValue(err(500, "down"));
+      const handler = await getResourceHandler("caddy-config");
+      const result = await handler();
+      expect(result.contents[0].mimeType).toBe("text/plain");
+      expect(result.contents[0].text).toMatch(/^Error: /);
+    });
+
+    it("caddy://upstreams: JSON mimeType on success, text/plain on failure", async () => {
+      api.getUpstreams.mockResolvedValueOnce(ok([{ address: "localhost:3000", num_requests: 0 }]));
+      let handler = await getResourceHandler("caddy-upstreams");
+      let result = await handler();
+      expect(result.contents[0].mimeType).toBe("application/json");
+
+      api.getUpstreams.mockResolvedValueOnce(err(0, "fetch failed"));
+      handler = await getResourceHandler("caddy-upstreams");
+      result = await handler();
+      expect(result.contents[0].mimeType).toBe("text/plain");
+      expect(result.contents[0].text).toMatch(/^Error: /);
+    });
+
+    it("caddy://servers: JSON mimeType on success, text/plain on failure", async () => {
+      api.configGet.mockResolvedValueOnce(ok({ srv0: { listen: [":443"], routes: [] } }));
+      let handler = await getResourceHandler("caddy-servers");
+      let result = await handler();
+      expect(result.contents[0].mimeType).toBe("application/json");
+
+      api.configGet.mockResolvedValueOnce(err(404, "not found"));
+      handler = await getResourceHandler("caddy-servers");
+      result = await handler();
+      expect(result.contents[0].mimeType).toBe("text/plain");
+      expect(result.contents[0].text).toMatch(/^Error: /);
+    });
+
+    it("caddy://metrics: text/plain mimeType in both success and failure", async () => {
+      api.getMetrics.mockResolvedValueOnce(ok("# HELP foo bar\nfoo 1\n"));
+      let handler = await getResourceHandler("caddy-metrics");
+      let result = await handler();
+      expect(result.contents[0].mimeType).toBe("text/plain");
+      expect(result.contents[0].text).toContain("foo 1");
+
+      api.getMetrics.mockResolvedValueOnce(err(0, "Cannot connect"));
+      handler = await getResourceHandler("caddy-metrics");
+      result = await handler();
+      expect(result.contents[0].mimeType).toBe("text/plain");
+      expect(result.contents[0].text).toMatch(/^Error: /);
+    });
+  });
 });

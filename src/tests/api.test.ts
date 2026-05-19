@@ -663,6 +663,117 @@ describe("api", () => {
       expect(calls[2]?.ifMatch).toBe(null);
     });
 
+    it("invalidates ancestor entries on a successful child write", async () => {
+      // GET parent caches its ETag. A subsequent child write invalidates the
+      // parent so the next write to the parent path doesn't send a stale
+      // If-Match and 412 spuriously.
+      const api = await import("../api.js");
+      const parent = "ancestor-parent";
+      const child = "ancestor-parent/child";
+      const calls: Array<{ method: string; path: string; ifMatch: string | null }> = [];
+      globalThis.fetch = vi.fn(async (url: any, opts: any) => {
+        const method = opts?.method ?? "GET";
+        const path = new URL(String(url)).pathname;
+        const ifMatch = opts?.headers?.["If-Match"] ?? null;
+        calls.push({ method, path, ifMatch });
+        if (method === "GET") {
+          return new Response("{}", { status: 200, headers: { ETag: "parent-etag-1" } });
+        }
+        return new Response("", { status: 200 });
+      }) as any;
+
+      await api.configGet(parent);
+      await api.configPatch(child, { foo: 1 });
+      await api.configPatch(parent, { foo: 2 });
+
+      expect(calls).toHaveLength(3);
+      expect(calls[2]?.method).toBe("PATCH");
+      expect(calls[2]?.path).toBe(`/config/${parent}`);
+      expect(calls[2]?.ifMatch).toBe(null);
+    });
+
+    it("invalidates descendant entries on a successful parent write", async () => {
+      // GET child caches its ETag. A subsequent parent write invalidates the
+      // child cache because the parent overwrote (or could have overwritten)
+      // the child sub-tree.
+      const api = await import("../api.js");
+      const parent = "descendant-parent";
+      const child = "descendant-parent/child";
+      const calls: Array<{ method: string; path: string; ifMatch: string | null }> = [];
+      globalThis.fetch = vi.fn(async (url: any, opts: any) => {
+        const method = opts?.method ?? "GET";
+        const path = new URL(String(url)).pathname;
+        const ifMatch = opts?.headers?.["If-Match"] ?? null;
+        calls.push({ method, path, ifMatch });
+        if (method === "GET") {
+          return new Response("{}", { status: 200, headers: { ETag: "child-etag-1" } });
+        }
+        return new Response("", { status: 200 });
+      }) as any;
+
+      await api.configGet(child);
+      await api.configPatch(parent, { foo: 1 });
+      await api.configPatch(child, { foo: 2 });
+
+      expect(calls).toHaveLength(3);
+      expect(calls[2]?.method).toBe("PATCH");
+      expect(calls[2]?.path).toBe(`/config/${child}`);
+      expect(calls[2]?.ifMatch).toBe(null);
+    });
+
+    it("invalidates /config/ entries on an /id/ write (cross-namespace)", async () => {
+      // GET a /config/ path caches its ETag. A subsequent /id/ write could
+      // affect any sub-tree of /config/, so all /config/ entries must drop.
+      const api = await import("../api.js");
+      const configPath = "cross-ns-config-path";
+      const calls: Array<{ method: string; path: string; ifMatch: string | null }> = [];
+      globalThis.fetch = vi.fn(async (url: any, opts: any) => {
+        const method = opts?.method ?? "GET";
+        const path = new URL(String(url)).pathname;
+        const ifMatch = opts?.headers?.["If-Match"] ?? null;
+        calls.push({ method, path, ifMatch });
+        if (method === "GET") {
+          return new Response("{}", { status: 200, headers: { ETag: "config-etag-1" } });
+        }
+        return new Response("", { status: 200 });
+      }) as any;
+
+      await api.configGet(configPath);
+      await api.configByIdSet("some-id", { handle: [] }, "PATCH");
+      await api.configPatch(configPath, { foo: 1 });
+
+      expect(calls).toHaveLength(3);
+      expect(calls[2]?.method).toBe("PATCH");
+      expect(calls[2]?.path).toBe(`/config/${configPath}`);
+      expect(calls[2]?.ifMatch).toBe(null);
+    });
+
+    it("invalidates /id/ entries on a /config/ write (cross-namespace)", async () => {
+      // GET /id/<id> caches its ETag. A subsequent /config/ write may have
+      // modified the @id-tagged resource indirectly, so drop the /id/ entry.
+      const api = await import("../api.js");
+      const calls: Array<{ method: string; path: string; ifMatch: string | null }> = [];
+      globalThis.fetch = vi.fn(async (url: any, opts: any) => {
+        const method = opts?.method ?? "GET";
+        const path = new URL(String(url)).pathname;
+        const ifMatch = opts?.headers?.["If-Match"] ?? null;
+        calls.push({ method, path, ifMatch });
+        if (method === "GET") {
+          return new Response("{}", { status: 200, headers: { ETag: "id-etag-1" } });
+        }
+        return new Response("", { status: 200 });
+      }) as any;
+
+      await api.configByIdGet("my-id");
+      await api.configPatch("apps/http/servers/srv0", { listen: [":443"] });
+      await api.configByIdSet("my-id", { handle: [] }, "PATCH");
+
+      expect(calls).toHaveLength(3);
+      expect(calls[2]?.method).toBe("PATCH");
+      expect(calls[2]?.path).toBe("/id/my-id");
+      expect(calls[2]?.ifMatch).toBe(null);
+    });
+
     it("invalidates cache when a successful write returns no ETag", async () => {
       const api = await import("../api.js");
       const target = "etag-no-header-target";
@@ -693,6 +804,113 @@ describe("api", () => {
       expect(calls[1]?.ifMatch).toBe("etag-only-on-get");
       expect(calls[2]?.method).toBe("PATCH");
       expect(calls[2]?.ifMatch).toBe(null);
+    });
+  });
+
+  describe("412 handling", () => {
+    it("returns the friendly Precondition Failed message on 412 and invalidates the cached ETag", async () => {
+      // A 412 should: (a) surface a user-actionable message that names the
+      // condition and tells the caller what to do, AND (b) clear the stale
+      // cached ETag so the next attempt isn't doomed to repeat the failure.
+      const api = await import("../api.js");
+      const target = "412-target-path";
+      const calls: Array<{ method: string; ifMatch: string | null }> = [];
+      let patchCount = 0;
+      globalThis.fetch = vi.fn(async (_url: any, opts: any) => {
+        const method = opts?.method ?? "GET";
+        const ifMatch = opts?.headers?.["If-Match"] ?? null;
+        calls.push({ method, ifMatch });
+        if (method === "GET") {
+          return new Response("{}", { status: 200, headers: { ETag: "stale-etag" } });
+        }
+        patchCount++;
+        if (patchCount === 1) return new Response("precondition failed", { status: 412 });
+        return new Response("", { status: 200 });
+      }) as any;
+
+      await api.configGet(target);
+      const first = await api.configPatch(target, { foo: 1 });
+      expect(first.ok).toBe(false);
+      expect(first.status).toBe(412);
+      expect(first.error).toContain("Config has been modified");
+      expect(first.error).toContain("HTTP 412");
+      expect(first.error).toContain("Re-read");
+
+      // Cache was cleared by the 412 path -- the retry should send no If-Match.
+      const second = await api.configPatch(target, { foo: 2 });
+      expect(second.ok).toBe(true);
+      expect(calls).toHaveLength(3);
+      expect(calls[2]?.method).toBe("PATCH");
+      expect(calls[2]?.ifMatch).toBe(null);
+    });
+  });
+
+  describe("loadConfig cache behavior", () => {
+    it("clears the full ETag cache on a successful /load", async () => {
+      // /load atomically replaces the full config, so every cached ETag (from
+      // any prior GET) is now potentially stale. loadConfig must wipe the cache
+      // wholesale, not just the entry for /load.
+      const api = await import("../api.js");
+      const target = "loadconfig-clears-cache-target";
+      const calls: Array<{ method: string; path: string; ifMatch: string | null }> = [];
+      globalThis.fetch = vi.fn(async (url: any, opts: any) => {
+        const method = opts?.method ?? "GET";
+        const path = new URL(String(url)).pathname;
+        const ifMatch = opts?.headers?.["If-Match"] ?? null;
+        calls.push({ method, path, ifMatch });
+        if (method === "GET") {
+          return new Response("{}", { status: 200, headers: { ETag: "pre-load-etag" } });
+        }
+        return new Response("", { status: 200 });
+      }) as any;
+
+      // Prime cache with a GET on an unrelated config path.
+      await api.configGet(target);
+      // Successful /load -- should clear everything.
+      const loadRes = await api.loadConfig({ apps: {} });
+      expect(loadRes.ok).toBe(true);
+      // Next write at the same path -- no If-Match because cache was wiped.
+      const patchRes = await api.configPatch(target, { foo: 1 });
+      expect(patchRes.ok).toBe(true);
+
+      expect(calls).toHaveLength(3);
+      expect(calls[2]?.method).toBe("PATCH");
+      expect(calls[2]?.path).toBe(`/config/${target}`);
+      expect(calls[2]?.ifMatch).toBe(null);
+    });
+  });
+
+  describe("non-JSON response body", () => {
+    it("returns the raw text as data when the response body is not JSON", async () => {
+      // /metrics returns Prometheus exposition (text/plain). The client must
+      // fall through to data:text when JSON.parse throws, not error out.
+      const api = await import("../api.js");
+      const promBody = "# HELP foo a counter\n# TYPE foo counter\nfoo 1\n";
+      globalThis.fetch = vi.fn(async () => new Response(promBody, { status: 200 })) as any;
+
+      const res = await api.getMetrics();
+      expect(res.ok).toBe(true);
+      expect(typeof res.data).toBe("string");
+      expect(res.data).toBe(promBody);
+    });
+  });
+
+  describe("retries POST to /stop (safe per policy)", () => {
+    it("retries POST to /stop on 5xx (second-call is a no-op against an already-stopped server)", async () => {
+      // /stop is documented in isRetryableMethod as benign to retry -- a
+      // second call against an already-stopped server is a no-op.
+      process.env.CADDY_MAX_RETRIES = "2";
+      const api = await import("../api.js");
+      let calls = 0;
+      globalThis.fetch = vi.fn(async () => {
+        calls++;
+        if (calls < 3) return new Response("upstream down", { status: 503 });
+        return new Response("", { status: 200 });
+      }) as any;
+
+      const res = await api.stop();
+      expect(res.ok).toBe(true);
+      expect(calls).toBe(3);
     });
   });
 
