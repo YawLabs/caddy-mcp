@@ -41,7 +41,7 @@ macOS / Linux / WSL:
   "mcpServers": {
     "caddy": {
       "command": "npx",
-      "args": ["-y", "@yawlabs/caddy-mcp"]
+      "args": ["-y", "@yawlabs/caddy-mcp@latest"]
     }
   }
 }
@@ -54,7 +54,7 @@ Windows:
   "mcpServers": {
     "caddy": {
       "command": "cmd",
-      "args": ["/c", "npx", "-y", "@yawlabs/caddy-mcp"]
+      "args": ["/c", "npx", "-y", "@yawlabs/caddy-mcp@latest"]
     }
   }
 }
