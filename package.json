@@ -15,7 +15,7 @@
   "main": "./dist/server.js",
   "types": "./dist/server.d.ts",
   "bin": {
-    "caddy-mcp": "./dist/index.js"
+    "caddy-mcp": "dist/index.js"
   },
   "files": [
     "dist",

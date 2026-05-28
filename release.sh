@@ -77,12 +77,16 @@ fi
 
 if [ "$IS_CI" != "true" ] && [ "$CURRENT_VERSION" != "$VERSION" ]; then
   echo -e "\n${YELLOW}About to release v${VERSION}.${NC}"
-  read -p "Continue? (y/N) " -n 1 -r
-  echo
-  [[ $REPLY =~ ^[Yy]$ ]] || { echo "Aborted."; exit 0; }
-fi
-
-step 1 "Test and lint"
+  if [ -t 0 ]; then
+    read -p "Continue? (y/N) " -n 1 -r
+    echo
+    [[ $REPLY =~ ^[Yy]$ ]] || { echo "Aborted."; exit 0; }
+  fi
+  
+  step 1 "Test and lint"
+  else
+    info "Non-interactive shell -- proceeding without confirmation"
+  fi
 npm run build || fail "Build failed"
 npm run lint || fail "Lint failed"
 npm run typecheck || fail "Type check failed"
