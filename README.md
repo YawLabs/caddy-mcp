@@ -8,9 +8,9 @@
 
 Built and maintained by [Yaw Labs](https://yaw.sh).
 
-[![Add to mcp.hosting](https://mcp.hosting/install-button.svg)](https://mcp.hosting/install?name=Caddy&command=npx&args=-y%2C%40yawlabs%2Fcaddy-mcp&description=Manage%20Caddy%20web%20servers%20-%20config%2C%20routes%2C%20TLS%2C%20PKI&source=https%3A%2F%2Fgithub.com%2FYawLabs%2Fcaddy-mcp)
+[![Add to Yaw MCP](https://yaw.sh/yaw-mcp-button.svg)](yaw://install?name=Caddy&command=npx&args=-y%2C%40yawlabs%2Fcaddy-mcp&description=Manage%20Caddy%20web%20servers%20-%20config%2C%20routes%2C%20TLS%2C%20PKI&source=https%3A%2F%2Fgithub.com%2FYawLabs%2Fcaddy-mcp)
 
-One click adds this to your [mcp.hosting](https://mcp.hosting) account so it syncs to every MCP client you use. Or install manually below.
+One click adds this to your local Yaw MCP config so it's available in every Yaw Terminal session. Or install manually below.
 
 ## Why this one?
 
