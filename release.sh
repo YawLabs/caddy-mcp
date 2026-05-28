@@ -94,14 +94,23 @@ if [ "$CURRENT_VERSION" = "$VERSION" ]; then
   info "Already at v${VERSION} -- skipping"
 else
   npm version "$VERSION" --no-git-tag-version
-  # server.json is published to the MCP Registry in step 7; bump its version
-  # alongside package.json so the bump commit fully reflects the release and
-  # server.json is never left dirty in the working tree after a publish.
-  if [ -f server.json ]; then
+  info "package.json updated"
+fi
+
+# server.json is published to the MCP Registry in step 7 and must match the
+# tag's version. This runs UNCONDITIONALLY (not inside the bump else above)
+# so a resume run where package.json was bumped in a prior invocation still
+# syncs server.json -- otherwise mcp-publisher tries to re-publish the
+# previous version and gets 400 "cannot publish duplicate version".
+# Idempotent: the inner if skips the write when server.json is already in
+# sync, so a clean re-run produces no working-tree dirt.
+if [ -f server.json ]; then
+  CURRENT_SERVER_VERSION=$(jq -r '.version' server.json 2>/dev/null || echo "")
+  if [ "$CURRENT_SERVER_VERSION" != "$VERSION" ]; then
     jq --arg v "$VERSION" '.version = $v | .packages[0].version = $v' server.json > server.tmp
     mv server.tmp server.json
+    info "server.json synced to $VERSION"
   fi
-  info "package.json updated"
 fi
 
 step 3 "Commit and tag"
