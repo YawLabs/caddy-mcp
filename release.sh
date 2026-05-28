@@ -26,7 +26,7 @@ info() { echo -e "${GREEN}  - $1${NC}"; }
 warn() { echo -e "${YELLOW}  ! $1${NC}"; }
 fail() { echo -e "${RED}  x $1${NC}"; exit 1; }
 
-TOTAL_STEPS=7
+TOTAL_STEPS=8
 
 VERSION="${1:-}"
 IS_CI="${CI:-false}"
@@ -94,6 +94,13 @@ if [ "$CURRENT_VERSION" = "$VERSION" ]; then
   info "Already at v${VERSION} -- skipping"
 else
   npm version "$VERSION" --no-git-tag-version
+  # server.json is published to the MCP Registry in step 7; bump its version
+  # alongside package.json so the bump commit fully reflects the release and
+  # server.json is never left dirty in the working tree after a publish.
+  if [ -f server.json ]; then
+    jq --arg v "$VERSION" '.version = $v | .packages[0].version = $v' server.json > server.tmp
+    mv server.tmp server.json
+  fi
   info "package.json updated"
 fi
 
@@ -101,8 +108,10 @@ step 3 "Commit and tag"
 if [ "$IS_CI" = "true" ]; then
   info "CI mode -- commit/tag already exist on the triggering ref, skipping"
 else
-  if [ -n "$(git status --porcelain package.json package-lock.json 2>/dev/null)" ]; then
-    git add package.json package-lock.json
+  BUMP_FILES="package.json package-lock.json"
+  [ -f server.json ] && BUMP_FILES="$BUMP_FILES server.json"
+  if [ -n "$(git status --porcelain $BUMP_FILES 2>/dev/null)" ]; then
+    git add $BUMP_FILES
     git commit -m "v${VERSION}"
     info "Committed version bump"
   else
@@ -252,7 +261,58 @@ else
   info "GitHub release created"
 fi
 
-step 7 "Verify"
+# =============================================================================
+# Step 7: Publish to the Official MCP Registry
+# =============================================================================
+# Downstream catalogs (Glama, PulseMCP, mcpservers.org) auto-source from the
+# Official MCP Registry; publishing here is what makes the new version visible
+# to them. server.json was already bumped in step 2 so the version matches the
+# tag.
+step 7 "Publish to MCP Registry"
+
+if [ ! -f server.json ]; then
+  info "No server.json -- not an MCP server, skipping registry publish"
+else
+  # mcp-publisher binary cached at ~/.local/bin. Pinned to "latest" upstream;
+  # if the registry's CLI introduces a breaking change, the next release will
+  # surface it. The OS/arch detection handles Linux, macOS, and Git Bash on
+  # Windows (MINGW/MSYS uname -s starts with "mingw" / "msys").
+  MP="${MCP_PUBLISHER:-$HOME/.local/bin/mcp-publisher}"
+  if ! [ -x "$MP" ]; then
+    info "mcp-publisher not found at $MP -- downloading"
+    mkdir -p "$(dirname "$MP")"
+    OS_RAW=$(uname -s | tr '[:upper:]' '[:lower:]')
+    case "$OS_RAW" in mingw*|msys*|cygwin*) OS=windows ;; *) OS="$OS_RAW" ;; esac
+    ARCH=$(uname -m | sed 's/x86_64/amd64/;s/aarch64/arm64/')
+    TMP=$(mktemp -d)
+    curl -sL -o "$TMP/mp.tar.gz" \
+      "https://github.com/modelcontextprotocol/registry/releases/latest/download/mcp-publisher_${OS}_${ARCH}.tar.gz" \
+      || fail "Failed to download mcp-publisher (${OS}/${ARCH})"
+    tar xzf "$TMP/mp.tar.gz" -C "$TMP" || fail "Failed to extract mcp-publisher tarball"
+    if [ -f "$TMP/mcp-publisher.exe" ]; then
+      mv "$TMP/mcp-publisher.exe" "$MP"
+    else
+      mv "$TMP/mcp-publisher" "$MP"
+    fi
+    rm -rf "$TMP"
+    chmod +x "$MP" 2>/dev/null || true
+  fi
+
+  # OIDC auth (used by the old release.yml) only works inside Actions; locally
+  # we use a GitHub PAT via `login github -token <PAT>`. The PAT needs read:org
+  # for YawLabs so the registry can verify org membership for the
+  # io.github.YawLabs/* namespace.
+  if [ -z "${MCP_REGISTRY_TOKEN:-}" ]; then
+    fail "MCP_REGISTRY_TOKEN unset -- set it to a GitHub PAT with read:org for YawLabs (or run '$MP login github' once interactively to cache the session)."
+  fi
+  "$MP" login github -token "$MCP_REGISTRY_TOKEN" >/dev/null 2>&1 \
+    || fail "mcp-publisher login failed -- check MCP_REGISTRY_TOKEN scopes (needs read:org for YawLabs)"
+  "$MP" publish \
+    || fail "mcp-publisher publish failed -- npm + GitHub release succeeded, but the MCP Registry did not. Retry the step (re-run the script) once the cause is identified."
+  info "Published to MCP Registry"
+fi
+
+step 8 "Verify"
 # A successful `npm publish` doesn't guarantee instant registry visibility.
 # Poll up to 5 times with 5s spacing, matching the CI smoke-test cadence.
 LIVE_VERSION=""
