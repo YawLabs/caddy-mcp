@@ -1084,7 +1084,9 @@ describe("tool handler behavior", () => {
 
       // 4 kept lines + 1 truncation comment.
       expect(lines).toHaveLength(5);
-      expect(lines[lines.length - 1]).toBe("# [truncated, 6 lines omitted; max_lines=4 -- use filter or raise max_lines]");
+      expect(lines[lines.length - 1]).toBe(
+        "# [truncated, 6 lines omitted; max_lines=4 -- use filter or raise max_lines]",
+      );
       // First four lines should be the first four of the input.
       expect(lines.slice(0, 4)).toEqual(sampleMetrics.split("\n").slice(0, 4));
     });

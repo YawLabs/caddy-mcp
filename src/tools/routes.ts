@@ -554,9 +554,7 @@ export function registerRouteTools(server: McpServer) {
       if (!Array.isArray(routes)) {
         return {
           isError: true,
-          content: [
-            { type: "text" as const, text: `Error: server "${srv}" routes value is malformed (not an array)` },
-          ],
+          content: [{ type: "text" as const, text: `Error: server "${srv}" routes value is malformed (not an array)` }],
         };
       }
       if (index >= routes.length) {
