@@ -197,7 +197,7 @@ export function registerConfigTools(server: McpServer) {
 
   server.tool(
     "caddy_config_by_id",
-    "Access config by @id tag. Any config object with an '@id' field can be read, updated, or deleted by its ID instead of needing its full path. This is the recommended way to manage individual routes and config objects.",
+    "Access config by @id tag. Any config object with an '@id' field can be read, updated, or deleted by its ID instead of needing its full path. This is the recommended way to manage individual routes and config objects. The 'delete' action requires confirm=true.",
     {
       id: z
         .string()
@@ -213,9 +213,14 @@ export function registerConfigTools(server: McpServer) {
         .describe(
           "For 'set' action: 'overwrite' = PATCH (replace existing, default), 'append' = POST (add to arrays, create on objects), 'insert' = PUT (insert at array index)",
         ),
+      confirm: z
+        .boolean()
+        .optional()
+        .default(false)
+        .describe("Must be true to actually delete (only enforced for action='delete')"),
     },
     { readOnlyHint: false, destructiveHint: false, idempotentHint: false, openWorldHint: false },
-    async ({ id, action, value, subpath, mode }) => {
+    async ({ id, action, value, subpath, mode, confirm }) => {
       if (action === "get") {
         return formatResult(await api.configByIdGet(id, subpath));
       }
@@ -230,6 +235,18 @@ export function registerConfigTools(server: McpServer) {
         return formatResult(await api.configByIdSet(id, value, method, subpath));
       }
       if (action === "delete") {
+        if (!confirm) {
+          const target = subpath ? `@id="${id}" subpath "${subpath}"` : `@id="${id}"`;
+          return {
+            isError: true,
+            content: [
+              {
+                type: "text" as const,
+                text: `Refusing to delete ${target} without confirm=true. Re-run with confirm:true to proceed.`,
+              },
+            ],
+          };
+        }
         return formatResult(await api.configByIdDelete(id, subpath));
       }
       return { isError: true, content: [{ type: "text" as const, text: `Unknown action: ${action}` }] };

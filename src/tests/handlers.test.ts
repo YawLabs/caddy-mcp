@@ -567,12 +567,20 @@ describe("tool handler behavior", () => {
       expect(api.configByIdSet).toHaveBeenCalledWith("my-route", { handle: [] }, "PUT", "");
     });
 
-    it("calls configByIdDelete for delete action", async () => {
+    it("calls configByIdDelete for delete action when confirmed", async () => {
       api.configByIdDelete.mockResolvedValue(ok());
 
-      await handler({ id: "my-route", action: "delete", subpath: "" });
+      await handler({ id: "my-route", action: "delete", subpath: "", confirm: true });
 
       expect(api.configByIdDelete).toHaveBeenCalledWith("my-route", "");
+    });
+
+    it("refuses delete action without confirm=true", async () => {
+      const result = await handler({ id: "my-route", action: "delete", subpath: "" });
+
+      expect(result.isError).toBe(true);
+      expect(result.content[0].text).toContain("confirm");
+      expect(api.configByIdDelete).not.toHaveBeenCalled();
     });
 
     it("returns error when set action has no value", async () => {
