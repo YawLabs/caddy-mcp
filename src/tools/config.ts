@@ -50,10 +50,30 @@ export function registerConfigTools(server: McpServer) {
 
   server.tool(
     "caddy_config_delete",
-    "Delete config at a JSON path. Removes the config node at the specified path.",
-    { path: z.string().describe("Config path to delete (e.g., 'apps/http/servers/srv0/routes/0')") },
+    "Delete config at a JSON path. Removes the config node at the specified path. Deleting a parent node also deletes every descendant -- e.g. deleting 'apps/http/servers/srv0' removes that server and all of its routes. Requires confirm=true.",
+    {
+      path: z.string().describe("Config path to delete (e.g., 'apps/http/servers/srv0/routes/0')"),
+      confirm: z
+        .boolean()
+        .optional()
+        .default(false)
+        .describe("Must be true to actually delete the config node (safety)"),
+    },
     { readOnlyHint: false, destructiveHint: true, idempotentHint: true, openWorldHint: false },
-    async ({ path }) => formatResult(await api.configDelete(path)),
+    async ({ path, confirm }) => {
+      if (!confirm) {
+        return {
+          isError: true,
+          content: [
+            {
+              type: "text" as const,
+              text: `Refusing to delete "${path}" without confirm=true. Deleting a parent path also removes all descendants. Re-run with confirm:true to proceed.`,
+            },
+          ],
+        };
+      }
+      return formatResult(await api.configDelete(path));
+    },
   );
 
   server.tool(

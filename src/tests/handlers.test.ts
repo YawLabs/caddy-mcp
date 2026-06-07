@@ -495,6 +495,33 @@ describe("tool handler behavior", () => {
     });
   });
 
+  // ─── caddy_config_delete ──────────────────────────────────────────────
+
+  describe("caddy_config_delete", () => {
+    let handler: (...args: any[]) => Promise<any>;
+
+    beforeEach(async () => {
+      const mockServer = { tool: vi.fn(), resource: vi.fn() };
+      const { registerConfigTools } = await import("../tools/config.js");
+      registerConfigTools(mockServer as any);
+      handler = getToolHandler(mockServer, "caddy_config_delete");
+    });
+
+    it("refuses to delete without confirm=true", async () => {
+      const result = await handler({ path: "apps/http/servers/srv0" });
+      expect(result.isError).toBe(true);
+      expect(result.content[0].text).toContain("confirm");
+      expect(api.configDelete).not.toHaveBeenCalled();
+    });
+
+    it("deletes when confirm is true", async () => {
+      api.configDelete.mockResolvedValue(ok({}));
+      const result = await handler({ path: "apps/http/servers/srv0/routes/0", confirm: true });
+      expect(api.configDelete).toHaveBeenCalledWith("apps/http/servers/srv0/routes/0");
+      expect(result.isError).toBeFalsy();
+    });
+  });
+
   // ─── caddy_config_by_id ───────────────────────────────────────────────
 
   describe("caddy_config_by_id", () => {
