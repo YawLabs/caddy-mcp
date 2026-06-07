@@ -81,6 +81,7 @@ That's it. Now ask your AI assistant:
 | `CADDY_ADMIN_URL` | `http://localhost:2019` | Caddy admin API URL. Set to `http://caddy:2019` inside Docker, or an https URL for remote admin. |
 | `CADDY_API_TOKEN` | (none) | Optional Bearer token for authenticated admin endpoints. Only needed if you've configured Caddy with auth. |
 | `CADDY_MAX_RETRIES` | `2` | Number of retries on transient failures (5xx, network errors). 4xx and 412 never retry. POSTs to `/config/*` and `/id/*` also skip retry (non-idempotent appends/creates -- retrying could duplicate routes or 409 a half-applied create). POSTs to `/load`, `/adapt`, `/stop` still retry. Hard-capped at 5; values above the cap log a one-time stderr notice so the clamp is visible. Set to `0` to disable. |
+| `CADDY_TIMEOUT` | `10000` | Timeout in ms for all admin API requests except `/load` (which uses `CADDY_LOAD_TIMEOUT`). Non-numeric, `<= 0`, or fractional values below 1ms fall back to the default. |
 | `CADDY_LOAD_TIMEOUT` | `60000` | Timeout in ms for the `/load` endpoint; raise for ACME-heavy bring-ups where provisioning many certificates can exceed the default. Non-numeric, `<= 0`, or fractional values below 1ms fall back to the default. |
 
 **Alternate MCP clients:**
@@ -101,8 +102,8 @@ Use the same JSON block shown above in any of these.
 
 - **caddy_config_get** — Read config at any JSON path (or the full config).
 - **caddy_config_set** — Write config at a path. Modes: `overwrite` (PATCH, default, idempotent), `append` (POST), `insert` (PUT, for array positions).
-- **caddy_config_delete** — Delete config at a path.
-- **caddy_config_by_id** — Get/set/delete config by `@id` tag — much easier than navigating deep paths.
+- **caddy_config_delete** — Delete config at a path. Requires `confirm=true` (deleting a parent path also removes every descendant).
+- **caddy_config_by_id** — Get/set/delete config by `@id` tag — much easier than navigating deep paths. The `delete` action requires `confirm=true`.
 - **caddy_load** — Replace the entire config atomically. 60-second timeout for cert provisioning. Auto-snapshots the prior config.
 - **caddy_revert** — Manage config snapshots for rollback. Actions: `list`, `save`, `apply` (confirm-gated). In-memory, last 10.
 
@@ -234,7 +235,7 @@ npm install
 npm run lint       # Biome check
 npm run lint:fix   # Auto-fix
 npm run build      # tsup bundle
-npm test           # Vitest (188 unit tests; +8 live-Caddy integration tests gated by CADDY_MCP_INTEGRATION=1)
+npm test           # Vitest (230 unit tests; +8 live-Caddy integration tests gated by CADDY_MCP_INTEGRATION=1)
 npm run typecheck  # tsc --noEmit
 ```
 
