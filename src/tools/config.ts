@@ -50,10 +50,30 @@ export function registerConfigTools(server: McpServer) {
 
   server.tool(
     "caddy_config_delete",
-    "Delete config at a JSON path. Removes the config node at the specified path.",
-    { path: z.string().describe("Config path to delete (e.g., 'apps/http/servers/srv0/routes/0')") },
+    "Delete config at a JSON path. Removes the config node at the specified path. Deleting a parent node also deletes every descendant -- e.g. deleting 'apps/http/servers/srv0' removes that server and all of its routes. Requires confirm=true.",
+    {
+      path: z.string().describe("Config path to delete (e.g., 'apps/http/servers/srv0/routes/0')"),
+      confirm: z
+        .boolean()
+        .optional()
+        .default(false)
+        .describe("Must be true to actually delete the config node (safety)"),
+    },
     { readOnlyHint: false, destructiveHint: true, idempotentHint: true, openWorldHint: false },
-    async ({ path }) => formatResult(await api.configDelete(path)),
+    async ({ path, confirm }) => {
+      if (!confirm) {
+        return {
+          isError: true,
+          content: [
+            {
+              type: "text" as const,
+              text: `Refusing to delete "${path}" without confirm=true. Deleting a parent path also removes all descendants. Re-run with confirm:true to proceed.`,
+            },
+          ],
+        };
+      }
+      return formatResult(await api.configDelete(path));
+    },
   );
 
   server.tool(
@@ -177,7 +197,7 @@ export function registerConfigTools(server: McpServer) {
 
   server.tool(
     "caddy_config_by_id",
-    "Access config by @id tag. Any config object with an '@id' field can be read, updated, or deleted by its ID instead of needing its full path. This is the recommended way to manage individual routes and config objects.",
+    "Access config by @id tag. Any config object with an '@id' field can be read, updated, or deleted by its ID instead of needing its full path. This is the recommended way to manage individual routes and config objects. The 'delete' action requires confirm=true.",
     {
       id: z
         .string()
@@ -193,9 +213,14 @@ export function registerConfigTools(server: McpServer) {
         .describe(
           "For 'set' action: 'overwrite' = PATCH (replace existing, default), 'append' = POST (add to arrays, create on objects), 'insert' = PUT (insert at array index)",
         ),
+      confirm: z
+        .boolean()
+        .optional()
+        .default(false)
+        .describe("Must be true to actually delete (only enforced for action='delete')"),
     },
     { readOnlyHint: false, destructiveHint: false, idempotentHint: false, openWorldHint: false },
-    async ({ id, action, value, subpath, mode }) => {
+    async ({ id, action, value, subpath, mode, confirm }) => {
       if (action === "get") {
         return formatResult(await api.configByIdGet(id, subpath));
       }
@@ -210,6 +235,18 @@ export function registerConfigTools(server: McpServer) {
         return formatResult(await api.configByIdSet(id, value, method, subpath));
       }
       if (action === "delete") {
+        if (!confirm) {
+          const target = subpath ? `@id="${id}" subpath "${subpath}"` : `@id="${id}"`;
+          return {
+            isError: true,
+            content: [
+              {
+                type: "text" as const,
+                text: `Refusing to delete ${target} without confirm=true. Re-run with confirm:true to proceed.`,
+              },
+            ],
+          };
+        }
         return formatResult(await api.configByIdDelete(id, subpath));
       }
       return { isError: true, content: [{ type: "text" as const, text: `Unknown action: ${action}` }] };

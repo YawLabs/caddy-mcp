@@ -109,7 +109,7 @@ export function applyMetricsControls(raw: string, filter: string | undefined, ma
 
   const dropped = filtered.length - maxLines;
   const kept = filtered.slice(0, maxLines);
-  kept.push(`# [truncated, ${dropped} lines omitted -- use filter to narrow]`);
+  kept.push(`# [truncated, ${dropped} lines omitted; max_lines=${maxLines} -- use filter or raise max_lines]`);
   // If the input had a `# EOF` marker and it landed in the dropped tail, re-emit it so the
   // output remains a well-formed Prometheus exposition. The filter path above already keeps
   // EOF unconditionally; only the unfiltered/truncated case can lose it.

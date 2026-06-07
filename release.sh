@@ -28,8 +28,11 @@ fail() { echo -e "${RED}  x $1${NC}"; exit 1; }
 
 # SKIP_LINT=1 escape hatch -- wraps `npm`/`pnpm` so lint-related runs are
 # no-ops. Workaround for the MINGW64-ARM64 npm-run-script wrapper that
-# segfaults on exit-cleanup (platform-windows.md). Apply only when the
-# lint runner is broken on the host; CI catches lint regressions anyway.
+# segfaults on exit-cleanup (platform-windows.md). NOTE: there is no PR/push
+# CI -- this release flow's `npm run lint` (step 1) is the ONLY lint gate, so
+# SKIP_LINT disables it entirely. Before using it, verify formatting another
+# way (`npx biome check src/` direct -- it can succeed even when the `npm run`
+# wrapper segfaults) and apply any fixes, or the release ships unformatted.
 if [ "${SKIP_LINT:-}" = "1" ]; then
   npm() {
     if [ "$1" = "run" ] && [[ "$2" == lint* ]]; then

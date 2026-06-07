@@ -175,7 +175,7 @@ async function attemptRequest<T = any>(
   timeout?: number,
 ): Promise<ApiResponse<T>> {
   const url = `${getBaseUrl()}${path}`;
-  const effectiveTimeout = timeout ?? TIMEOUT;
+  const effectiveTimeout = timeout ?? getRequestTimeout();
   try {
     const hasBody = body !== undefined;
     const headers = getHeaders(hasBody ? contentType || "application/json" : undefined);
@@ -230,7 +230,13 @@ async function attemptRequest<T = any>(
             "Re-read the config and retry your change.",
         };
       }
-      return { ok: false, status: res.status, error: text || `HTTP ${res.status}` };
+      if (!text) {
+        // Some Caddy errors (notably 401/403 behind an auth proxy) come back
+        // with an empty body; point at the likely cause instead of a bare code.
+        const hint = res.status === 401 || res.status === 403 ? " -- check CADDY_API_TOKEN" : "";
+        return { ok: false, status: res.status, error: `HTTP ${res.status}${hint}` };
+      }
+      return { ok: false, status: res.status, error: text };
     }
     if (!text) return { ok: true, status: res.status, etag };
     try {
@@ -294,6 +300,18 @@ export function configDelete<T = any>(path: string): Promise<ApiResponse<T>> {
   const bad = rejectTraversal(normalized);
   if (bad) return Promise.resolve(bad);
   return caddyRequest("DELETE", `/config/${normalized}`);
+}
+
+function getRequestTimeout(): number {
+  const raw = process.env.CADDY_TIMEOUT;
+  if (raw === undefined) return TIMEOUT;
+  const n = Number(raw);
+  // Floor first, then bounds-check -- mirrors getLoadTimeout: "0.5" floors to 0
+  // and would produce an immediate-abort timeout.
+  if (!Number.isFinite(n)) return TIMEOUT;
+  const floored = Math.floor(n);
+  if (floored < 1) return TIMEOUT;
+  return floored;
 }
 
 function getLoadTimeout(): number {

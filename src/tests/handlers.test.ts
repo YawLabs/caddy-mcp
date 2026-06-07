@@ -468,24 +468,57 @@ describe("tool handler behavior", () => {
 
     it("uses POST for append mode", async () => {
       api.configPost.mockResolvedValue(ok());
-      await handler({ path: "apps/http", value: {}, mode: "append" });
+      const result = await handler({ path: "apps/http", value: {}, mode: "append" });
       expect(api.configPost).toHaveBeenCalled();
       expect(api.configPatch).not.toHaveBeenCalled();
       expect(api.configPut).not.toHaveBeenCalled();
+      expect(result.isError).toBeFalsy();
+      expect(result.content[0].text).toBeDefined();
     });
 
     it("uses PATCH for overwrite mode", async () => {
       api.configPatch.mockResolvedValue(ok());
-      await handler({ path: "apps/http", value: {}, mode: "overwrite" });
+      const result = await handler({ path: "apps/http", value: {}, mode: "overwrite" });
       expect(api.configPatch).toHaveBeenCalled();
       expect(api.configPost).not.toHaveBeenCalled();
+      expect(result.isError).toBeFalsy();
+      expect(result.content[0].text).toBeDefined();
     });
 
     it("uses PUT for insert mode", async () => {
       api.configPut.mockResolvedValue(ok());
-      await handler({ path: "apps/http/servers/srv0/routes/0", value: {}, mode: "insert" });
+      const result = await handler({ path: "apps/http/servers/srv0/routes/0", value: {}, mode: "insert" });
       expect(api.configPut).toHaveBeenCalled();
       expect(api.configPost).not.toHaveBeenCalled();
+      expect(result.isError).toBeFalsy();
+      expect(result.content[0].text).toBeDefined();
+    });
+  });
+
+  // ─── caddy_config_delete ──────────────────────────────────────────────
+
+  describe("caddy_config_delete", () => {
+    let handler: (...args: any[]) => Promise<any>;
+
+    beforeEach(async () => {
+      const mockServer = { tool: vi.fn(), resource: vi.fn() };
+      const { registerConfigTools } = await import("../tools/config.js");
+      registerConfigTools(mockServer as any);
+      handler = getToolHandler(mockServer, "caddy_config_delete");
+    });
+
+    it("refuses to delete without confirm=true", async () => {
+      const result = await handler({ path: "apps/http/servers/srv0" });
+      expect(result.isError).toBe(true);
+      expect(result.content[0].text).toContain("confirm");
+      expect(api.configDelete).not.toHaveBeenCalled();
+    });
+
+    it("deletes when confirm is true", async () => {
+      api.configDelete.mockResolvedValue(ok({}));
+      const result = await handler({ path: "apps/http/servers/srv0/routes/0", confirm: true });
+      expect(api.configDelete).toHaveBeenCalledWith("apps/http/servers/srv0/routes/0");
+      expect(result.isError).toBeFalsy();
     });
   });
 
@@ -534,12 +567,20 @@ describe("tool handler behavior", () => {
       expect(api.configByIdSet).toHaveBeenCalledWith("my-route", { handle: [] }, "PUT", "");
     });
 
-    it("calls configByIdDelete for delete action", async () => {
+    it("calls configByIdDelete for delete action when confirmed", async () => {
       api.configByIdDelete.mockResolvedValue(ok());
 
-      await handler({ id: "my-route", action: "delete", subpath: "" });
+      await handler({ id: "my-route", action: "delete", subpath: "", confirm: true });
 
       expect(api.configByIdDelete).toHaveBeenCalledWith("my-route", "");
+    });
+
+    it("refuses delete action without confirm=true", async () => {
+      const result = await handler({ id: "my-route", action: "delete", subpath: "" });
+
+      expect(result.isError).toBe(true);
+      expect(result.content[0].text).toContain("confirm");
+      expect(api.configByIdDelete).not.toHaveBeenCalled();
     });
 
     it("returns error when set action has no value", async () => {
@@ -1078,7 +1119,9 @@ describe("tool handler behavior", () => {
 
       // 4 kept lines + 1 truncation comment.
       expect(lines).toHaveLength(5);
-      expect(lines[lines.length - 1]).toBe("# [truncated, 6 lines omitted -- use filter to narrow]");
+      expect(lines[lines.length - 1]).toBe(
+        "# [truncated, 6 lines omitted; max_lines=4 -- use filter or raise max_lines]",
+      );
       // First four lines should be the first four of the input.
       expect(lines.slice(0, 4)).toEqual(sampleMetrics.split("\n").slice(0, 4));
     });
@@ -1112,7 +1155,7 @@ describe("tool handler behavior", () => {
       const lines = text.split("\n");
 
       expect(lines).toHaveLength(3); // 2 kept + 1 truncation comment
-      expect(lines[2]).toBe("# [truncated, 2 lines omitted -- use filter to narrow]");
+      expect(lines[2]).toBe("# [truncated, 2 lines omitted; max_lines=2 -- use filter or raise max_lines]");
     });
 
     it("preserves the `# EOF` end-of-file marker when a filter is applied", async () => {
@@ -1160,7 +1203,7 @@ describe("tool handler behavior", () => {
 
       expect(lines).toHaveLength(5);
       expect(lines.slice(0, 3)).toEqual(["# HELP a counter a", "# TYPE a counter", "a 1"]);
-      expect(lines[3]).toBe("# [truncated, 4 lines omitted -- use filter to narrow]");
+      expect(lines[3]).toBe("# [truncated, 4 lines omitted; max_lines=3 -- use filter or raise max_lines]");
       expect(lines[4]).toBe("# EOF");
     });
 
@@ -1208,12 +1251,23 @@ describe("tool handler behavior", () => {
       expect(api.stop).not.toHaveBeenCalled();
     });
 
-    it("calls stop when confirm is true", async () => {
+    it("calls stop and returns OK when confirm is true", async () => {
       api.stop.mockResolvedValue(ok());
 
-      await handler({ confirm: true });
+      const result = await handler({ confirm: true });
 
       expect(api.stop).toHaveBeenCalled();
+      expect(result.isError).toBeFalsy();
+      expect(result.content[0].text).toBe("OK");
+    });
+
+    it("surfaces the error when stop fails", async () => {
+      api.stop.mockResolvedValue(err(500, "shutdown failed"));
+
+      const result = await handler({ confirm: true });
+
+      expect(result.isError).toBe(true);
+      expect(result.content[0].text).toContain("shutdown failed");
     });
   });
 
@@ -1247,6 +1301,16 @@ describe("tool handler behavior", () => {
       await handler({ config: "example.com { }", format: "caddyfile" });
 
       expect(api.loadConfig).toHaveBeenCalledWith("example.com { }", "text/caddyfile");
+    });
+
+    it("returns a non-error result on a successful load", async () => {
+      api.configGet.mockResolvedValue(ok({ apps: { http: {} } }));
+      api.loadConfig.mockResolvedValue(ok());
+
+      const result = await handler({ config: { apps: {} }, format: "json" });
+
+      expect(result.isError).toBeFalsy();
+      expect(result.content[0].text).toBeDefined();
     });
 
     it("snapshots the current config after a successful load", async () => {
@@ -1615,12 +1679,22 @@ describe("tool handler behavior", () => {
     });
 
     it("errors when index path reads back a non-array routes value", async () => {
-      // Defensive: a malformed server config (routes is an object / null /
-      // string) must produce a clear error, not a crash.
+      // Defensive: a malformed server config (routes is an object or string)
+      // must produce a clear error, not a crash.
       api.configGet.mockResolvedValue(ok({ not: "an array" }));
       const result = await handler({ index: 0, server: "srv0", confirm: true });
       expect(result.isError).toBe(true);
-      expect(result.content[0].text).toContain("no routes array");
+      expect(result.content[0].text).toContain("malformed");
+      expect(api.configDelete).not.toHaveBeenCalled();
+    });
+
+    it("reports no routes configured when the routes key is absent", async () => {
+      // A missing routes key (empty 200 body -> data undefined) mirrors
+      // caddy_list_routes, which treats it as zero routes rather than malformed.
+      api.configGet.mockResolvedValue(ok(undefined));
+      const result = await handler({ index: 0, server: "srv0", confirm: true });
+      expect(result.isError).toBe(true);
+      expect(result.content[0].text).toContain("no routes configured");
       expect(api.configDelete).not.toHaveBeenCalled();
     });
 
