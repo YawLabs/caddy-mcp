@@ -10,7 +10,7 @@ export function registerResources(server: McpServer) {
         {
           uri: "caddy://config",
           mimeType: res.ok ? "application/json" : "text/plain",
-          text: res.ok ? JSON.stringify(res.data, null, 2) : `Error: ${res.error}`,
+          text: res.ok ? JSON.stringify(res.data ?? {}, null, 2) : `Error: ${res.error}`,
         },
       ],
     };
@@ -27,7 +27,7 @@ export function registerResources(server: McpServer) {
           {
             uri: "caddy://upstreams",
             mimeType: res.ok ? "application/json" : "text/plain",
-            text: res.ok ? JSON.stringify(res.data, null, 2) : `Error: ${res.error}`,
+            text: res.ok ? JSON.stringify(res.data ?? {}, null, 2) : `Error: ${res.error}`,
           },
         ],
       };

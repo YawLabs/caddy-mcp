@@ -160,14 +160,14 @@ function isRouteShape(obj: unknown): boolean {
   return Array.isArray((obj as { handle?: unknown }).handle);
 }
 
-/** Build an error result for when a server doesn't exist */
-function serverNotFoundError(srv: string) {
+/** Build an error result for when a server doesn't exist. `op` names the calling tool so the caller can tell which operation hit the missing server. */
+function serverNotFoundError(srv: string, op = "operation") {
   return {
     isError: true,
     content: [
       {
         type: "text" as const,
-        text: `Error: Server "${srv}" does not exist. Use caddy_list_servers to see available servers, or create one with caddy_load or caddy_config_set at path 'apps/http/servers/${srv}' with at minimum: { "listen": [":443"] }`,
+        text: `Error: Server "${srv}" does not exist (${op}). Use caddy_list_servers to see available servers, or create one with caddy_load or caddy_config_set at path 'apps/http/servers/${srv}' with at minimum: { "listen": [":443"] }`,
       },
     ],
   };
@@ -282,7 +282,7 @@ export function registerRouteTools(server: McpServer) {
         // POST failed -- parent-missing now genuinely means the server doesn't
         // exist (the @id is confirmed-absent by the GET above).
         if (isParentMissing(postRes)) {
-          return serverNotFoundError(srv);
+          return serverNotFoundError(srv, "caddy_reverse_proxy");
         }
         return formatResult(postRes);
       }
@@ -291,7 +291,7 @@ export function registerRouteTools(server: McpServer) {
         return { content: [{ type: "text" as const, text: `Route added: ${from} → ${cleanedTo.join(", ")}` }] };
       }
       if (isParentMissing(res)) {
-        return serverNotFoundError(srv);
+        return serverNotFoundError(srv, "caddy_reverse_proxy");
       }
       return formatResult(res);
     },
@@ -320,7 +320,7 @@ export function registerRouteTools(server: McpServer) {
       const route = { match, handle, terminal };
       const res = await api.configPost(`apps/http/servers/${srv}/routes`, route);
       if (isParentMissing(res)) {
-        return serverNotFoundError(srv);
+        return serverNotFoundError(srv, "caddy_add_route");
       }
       return formatResult(res);
     },
@@ -530,17 +530,36 @@ export function registerRouteTools(server: McpServer) {
         if (res.ok) return { content: [{ type: "text" as const, text: `Route @id="${id}" removed.` }] };
         return formatResult(res);
       }
+      // The id branch always returns, and the top guard rejected the
+      // both-absent case -- so an index is guaranteed here. Narrow it for the
+      // type-checker (this branch is unreachable in practice).
+      if (index === undefined) {
+        return {
+          isError: true,
+          content: [{ type: "text" as const, text: "Error: must provide either id or index" }],
+        };
+      }
       // Read first to bounds-check the index and give a clear error if out of range.
       const readRes = await api.configGet(`apps/http/servers/${srv}/routes`);
       if (!readRes.ok) return formatResult(readRes);
       const routes = readRes.data;
+      if (routes === undefined || routes === null) {
+        // routes key absent -- mirror caddy_list_routes, which treats a missing
+        // routes array as zero routes rather than a malformed-config error.
+        return {
+          isError: true,
+          content: [{ type: "text" as const, text: `Error: server "${srv}" has no routes configured` }],
+        };
+      }
       if (!Array.isArray(routes)) {
         return {
           isError: true,
-          content: [{ type: "text" as const, text: `Error: server "${srv}" has no routes array (or it is malformed)` }],
+          content: [
+            { type: "text" as const, text: `Error: server "${srv}" routes value is malformed (not an array)` },
+          ],
         };
       }
-      if ((index as number) >= routes.length) {
+      if (index >= routes.length) {
         return {
           isError: true,
           content: [
