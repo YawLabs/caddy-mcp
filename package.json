@@ -50,7 +50,7 @@
   },
   "devDependencies": {
     "@biomejs/biome": "^2.4.11",
-    "@types/node": "^25.6.0",
+    "@types/node": "^26.0.0",
     "postject": "^1.0.0-alpha.6",
     "tsup": "^8.4.0",
     "typescript": "^6.0.2",
