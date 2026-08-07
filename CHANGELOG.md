@@ -60,6 +60,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **Optional [oam](https://oamjs.org) toolchain support.** `npm run typecheck`
+  uses `oam check` (tsgo, TypeScript 7 native) when oam is available and falls
+  back to `tsc --noEmit` otherwise — 832 ms vs 8449 ms on windows-arm64, same
+  `tsconfig.json`, same files. `node scripts/build-binary.mjs` can build an
+  oam-carrier binary with `CADDY_MCP_RUNTIME=oam` (57.53 MB / 529 ms startup,
+  against the Node SEA carrier's 75.22 MB / 808 ms), embedding the identical
+  esbuild bundle.
+
+  The binary's **default carrier remains Node SEA** so a given git tag produces
+  the same artifact on every build host; oam there is opt-in, and requesting it
+  without a working oam is an error rather than a silent downgrade. oam is not
+  an npm dependency — a Node-only checkout builds, type-checks, and tests
+  exactly as before. The published npm package and its `bin` entry still run on
+  Node; `oam run` on loose source is slower than Node and is not used.
 - `caddy_list_routes` output is now bounded: the summary caps at 500 routes and
   the raw JSON block at 20000 characters, truncated on whole-route boundaries
   so the block always parses. Both report how many routes were omitted.

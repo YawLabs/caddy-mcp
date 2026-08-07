@@ -26,6 +26,7 @@ import { dirname, join, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import esbuild from 'esbuild';
 import { inject } from 'postject';
+import { describeRuntime, findOam } from './runtime.mjs';
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
 const repoRoot = resolve(__dirname, '..');
@@ -87,6 +88,62 @@ await esbuild.build({
   outfile: bundlePath,
 });
 console.log(`bundle: ${fmtSize(bundlePath)}`);
+
+// 1b. Carrier selection. Node SEA is the DEFAULT; oam is OPT-IN.
+//
+// This is a RELEASE ARTIFACT, so the carrier must not depend on what happens to
+// be installed on the build host. Auto-detecting oam would mean the same git tag
+// produces a 57 MB oam binary on a machine that has it and a 75 MB SEA binary
+// on one that does not -- silently, with no signal in the tag. Reproducibility
+// beats the startup win here, so oam is requested explicitly with
+// CADDY_MCP_RUNTIME=oam and a missing oam is a hard ERROR rather than a quiet
+// downgrade to a different artifact.
+//
+// (`npm run typecheck` DOES auto-detect -- it produces no artifact, and a type
+// error is a type error under either checker.)
+//
+// Both carriers embed the SAME esbuild bundle above, so the shipped JavaScript
+// is identical; only the runtime around it differs. Measured on windows-arm64
+// against this bundle (7-run averages, `--version` to isolate startup):
+//
+//     node dist/index.js    730 ms   (needs node + node_modules)
+//     Node SEA binary       808 ms   75.22 MB
+//     oam compiled binary   529 ms   57.53 MB
+//
+// oam precompiles the bundle to bytecode at compile time, which is where the
+// startup win comes from; `oam run` on loose source is SLOWER than node (853
+// vs 701 ms) and is deliberately not used anywhere in this repo.
+const wantOam = process.env.CADDY_MCP_RUNTIME === 'oam';
+const oam = wantOam ? findOam({ require: true }) : null;
+console.log(
+  wantOam
+    ? describeRuntime(oam)
+    : `carrier: node ${process.version} SEA (default) -- set CADDY_MCP_RUNTIME=oam to build the oam carrier`,
+);
+
+if (oam) {
+  rmSync(outExe, { force: true });
+  run(oam.cmd, ['compile', bundlePath, '-o', outExe]);
+  if (!isWin) chmodSync(outExe, 0o755);
+
+  // macOS: same ad-hoc signature the SEA path needs. Apple Silicon SIGKILLs a
+  // Mach-O with no/invalid signature at exec, and oam's compile step embeds a
+  // payload the same way postject does. Untested on darwin at authoring time
+  // (built on windows-arm64) -- kept best-effort so a failure here is visible
+  // rather than silent.
+  if (process.platform === 'darwin') {
+    run('codesign', ['--sign', '-', '--force', '--timestamp=none', outExe]);
+    run(outExe, ['--version']);
+  }
+
+  console.log('');
+  console.log(`OK  ${outExe}`);
+  console.log(`    ${fmtSize(outExe)}`);
+  console.log('');
+  console.log('Verify with:');
+  console.log(`    "${outExe}" --version`);
+  process.exit(0);
+}
 
 // 2. Generate the SEA blob from sea-config.json.
 run(process.execPath, ['--experimental-sea-config', 'sea-config.json']);

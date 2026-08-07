@@ -16,6 +16,50 @@ MCP server for managing Caddy web servers via the admin API. 18 tools across con
 - `src/tools/operational.ts` — Status, list_servers, upstreams, PKI, metrics, stop.
 - `src/resources.ts` — MCP resources: caddy://config, caddy://upstreams, caddy://metrics, caddy://servers.
 
+## Runtime: oam for the dev loop, Node for artifacts
+
+[oam](https://oamjs.org) is **not** an npm dependency and is never assumed present.
+Discovery lives in `scripts/runtime.mjs`: `$OAM_BIN`, then `oam` on PATH, then Node.
+
+The split is deliberate — **auto-detect for tools, explicit for artifacts**:
+
+| Task | Default | Alternate |
+|---|---|---|
+| `npm run typecheck` | `oam check .` if available, else `tsc --noEmit` | `CADDY_MCP_RUNTIME=node` forces tsc; `typecheck:tsc` pins it |
+| `node scripts/build-binary.mjs` | **Node SEA + postject** | `CADDY_MCP_RUNTIME=oam` builds the oam carrier |
+| `npm test` | vitest (Node) | — |
+| `npm start` / `bin` entry | Node | — |
+
+**Why the binary does NOT auto-detect.** It is a release artifact. If the carrier were
+chosen by what happens to be installed, the same git tag would produce a 57 MB oam binary
+on one machine and a 75 MB SEA binary on another, silently. So oam is opt-in there, and
+`CADDY_MCP_RUNTIME=oam` with no working oam is a hard **error** rather than a quiet
+downgrade to a different artifact. Type-checking auto-detects because it emits nothing —
+a type error is a type error under either checker.
+
+**oam is currently a local dev build**, not a published release. Anyone without it gets
+the Node path everywhere, which is the default for the shipped binary anyway.
+
+Measured on windows-arm64, 7-run averages:
+
+| | startup | size |
+|---|---|---|
+| `node dist/index.js` | 730 ms | needs node + node_modules |
+| Node SEA binary | 808 ms | 75.22 MB |
+| **oam compiled binary** | **529 ms** | **57.53 MB** |
+| `tsc --noEmit` | 8449 ms | — |
+| **`oam check .`** | **832 ms** | — |
+
+Two deliberate non-changes:
+
+- **`oam run` is not used anywhere.** On loose source it is *slower* than Node
+  (853 ms vs 701 ms) — the compiled binary's win comes from bytecode produced at
+  compile time, not from the runtime itself. Making oam the launcher for
+  `dist/index.js` would be a startup regression.
+- **Tests stay on vitest.** oam ships its own runner (`import 'oam:test'`), but the
+  suite leans on `vi.mock` for module-level api mocking; porting it would trade a
+  working 310-test suite for a rewrite and would break the Node-only path.
+
 ## Environment variables
 
 Read by `src/api.ts`. All optional.
