@@ -132,23 +132,22 @@ console.log(`bundle: ${fmtSize(bundlePath)}`);
 //
 // CORRECTION -- `oam run` is NOT slower than node here. An earlier revision of
 // this comment recorded 853 vs 701 ms and concluded `oam run` was deliberately
-// unused. That measurement timed the oam binary at
-// target/release/oam.exe, and the on-access virus scanner rescans a binary in a
-// build output directory on EVERY exec while node.exe is installed and long
-// since cached. `findOam()` still resolves that path, so anyone re-measuring
-// naively reproduces the artifact.
+// unused. That measurement timed the oam binary inside target/release, which a
+// concurrent `cargo build` was replacing underneath the run.
 //
-// Re-measured on windows-arm64, n=8 medians, `--version` against this repo's
-// dist/index.js, with the identical oam bytes copied out of target/ and exec'd
-// once to absorb the scan:
+// Re-measured against an INSTALLED oam (~/.oam/bin), interleaved so drift
+// cancels, n=12 medians, `--version` against this repo's dist/index.js:
 //
-//     node dist/index.js                        386 ms
-//     oam run, binary from target/release       432 ms   1.12x  <- the artifact
-//     oam run, binary warmed elsewhere          367 ms   0.95x  <- the truth
+//     node dist/index.js    213 ms
+//     oam run dist/index.js 184 ms   0.86x
 //
-// The sign flips. The scanner alone accounts for 1.18x on oam and nothing on
-// node. Near parity, slightly ahead -- and dogfooding our own runtime is how it
-// gets faster, so `oam run` IS used: bin/caddy-mcp.mjs prefers it at launch.
+// oam is ahead even here, where dist/ resolves @modelcontextprotocol/sdk and
+// zod from node_modules. On a zero-dependency bundle the gap is wider still
+// (npmjs-mcp: 167 -> 112 ms, 0.67x). Dogfooding the runtime is how it gets
+// faster, so `oam run` IS used: bin/caddy-mcp.mjs prefers it at launch.
+//
+// Do not re-measure from target/. findOam() now prefers an installed oam and
+// flags a build-tree one; see scripts/runtime.mjs for why.
 const wantOam = process.env.CADDY_MCP_RUNTIME === 'oam';
 const oam = wantOam ? findOam({ require: true }) : null;
 console.log(

@@ -13,22 +13,27 @@
 //   4. null                       -- caller falls back to Node
 //
 // WHY INSTALLED LOCATIONS OUTRANK PATH
-// A developer working on oam itself usually has `oam/target/release` on PATH.
-// A binary living in a build output directory is treated as perpetually-changed
-// by an on-access virus scanner and gets rescanned on EVERY exec, while an
-// installed `node.exe` is signed and long since cached. Any timing that
-// compares the two then measures the scanner and blames the runtime.
+// A developer working on oam itself usually has `oam/target/release` on PATH,
+// and a build directory's contents change underneath you: a concurrent
+// `cargo build` replaces the binary mid-run, and freshly-written bytes are
+// unscanned, uncached and cold. A timing taken against a moving target is not
+// a measurement of anything.
 //
 // That is not hypothetical -- it produced a wrong conclusion in this repo. A
 // benchmark in build-binary.mjs recorded `oam run` at 853 ms against node's
-// 701 ms and concluded oam should not be used at launch. Re-measured with the
-// identical bytes outside `target/`: node 386 ms, oam-from-target 432 ms
-// (1.12x), oam-warmed-elsewhere 367 ms (0.95x). The sign flips; the scanner
-// alone accounts for 1.18x on oam and nothing on node.
+// 701 ms and concluded oam should not be used at launch. It is not slower.
+// Measured against an INSTALLED oam, interleaved, n=12 medians:
 //
-// Warming does not rescue it: a binary under `target/` stays slow across runs
-// with no warm-up curve, because each exec is rescanned. Preferring an
-// installed copy is the fix, and saying so loudly is the backstop.
+//     caddy-mcp (deps from node_modules)   node 213 ms   oam 184 ms   0.86x
+//     npmjs-mcp (zero-dep bundle)          node 167 ms   oam 112 ms   0.67x
+//
+// A caution about the numbers, recorded because it cost real time: an earlier
+// revision here reported a 5.0x penalty for running out of `target/`. That was
+// measured while a concurrent session was rebuilding oam, so every exec hit
+// different bytes. It does NOT reproduce -- the same comparison on a settled
+// tree gives 1.03x. The rule (do not benchmark out of `target/`) is sound; the
+// mechanism was misdiagnosed as permanent per-exec rescanning when it was a
+// moving file. Prefer an installed copy so the binary is stable for the run.
 //
 // Escape hatch: CADDY_MCP_RUNTIME=node forces the Node path even when oam is
 // installed, so a regression can be bisected against the Node toolchain
@@ -138,8 +143,9 @@ export function describeRuntime(oam) {
   if (!oam) return `runtime: node ${process.version} (oam not found -- using the Node fallback)`;
   const warning = oam.fromBuildTree
     ? '\n  WARNING: this oam lives in a cargo target/ directory. Builds are fine, but do NOT' +
-      '\n  take timings from it -- an on-access scanner rescans build outputs on every exec' +
-      '\n  and will make oam look ~1.2x slower than it is. Copy it elsewhere first.'
+      '\n  take timings from it -- a concurrent cargo build replaces the binary mid-run and' +
+      '\n  fresh bytes are cold, so the number measures the build, not the runtime.' +
+      '\n  Use an installed oam (~/.oam/bin) for anything timing-sensitive.'
     : '';
   return `runtime: ${oam.version} (${oam.cmd}) -- set CADDY_MCP_RUNTIME=node to force the Node path${warning}`;
 }

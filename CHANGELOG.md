@@ -20,7 +20,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - `scripts/build-binary.mjs` pins the CLI source entry instead of deriving it from `bin`'s value. The old derivation would have produced `bin/caddy-mcp.ts` the moment `bin` moved to the launcher — the exact breakage postgres-mcp shipped in 0.9.0. Deriving from `main` is not the fix either, since `main` is the library export (`./dist/server.js`) while the binary needs the CLI entry.
 
 ### Fixed
-- Corrected the benchmark note claiming `oam run` is slower than Node (853 vs 701 ms) and "deliberately not used". That measurement timed the oam binary at `target/release/oam.exe`, which the on-access virus scanner rescans on **every** exec, while `node.exe` is installed and long since cached. Re-measured with identical bytes warmed elsewhere: node 386 ms, oam-from-`target/` 432 ms (1.12x), oam-warmed 367 ms (**0.95x**). The sign flips — the scanner alone accounts for 1.18x on oam and nothing on node. `findOam()` still resolves that path, so anyone re-measuring naively reproduces the artifact.
+- Corrected the benchmark note claiming `oam run` is slower than Node (853 vs 701 ms) and "deliberately not used". That measurement timed an oam binary inside `target/release` while a concurrent `cargo build` was replacing it. Re-measured against an installed oam, interleaved, n=12 medians: node 213 ms, oam 184 ms — **0.86x**. oam is ahead even here, where `dist/` resolves its dependencies from `node_modules`; on a zero-dependency bundle the gap is wider (npmjs-mcp: 167 → 112 ms, 0.67x).
+- `findOam()` prefers an installed oam (`~/.oam/bin`, `%LOCALAPPDATA%\oam\bin`) over a `target/` binary on PATH, resolves PATH hits to absolute paths, and flags `fromBuildTree` so timing-sensitive callers can warn. `$OAM_BIN` still wins outright — it is an instruction, not a hint.
 
 ## [2.0.0] — 2026-08-07
 
