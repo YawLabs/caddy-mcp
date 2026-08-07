@@ -125,9 +125,11 @@ describe.skipIf(!RUN)("integration: live Caddy admin API", () => {
 
     // Mutate via a direct fetch, bypassing the api client's ETag tracking.
     const baseUrl = process.env.CADDY_ADMIN_URL || "http://localhost:2019";
+    // Origin is required: Node's fetch sends Sec-Fetch-Mode: cors, which makes
+    // Caddy enforce its admin origin allowlist. Without it this 403s.
     const directRes = await fetch(`${baseUrl}/config/apps/http/servers/srv0`, {
       method: "PATCH",
-      headers: { "Content-Type": "application/json" },
+      headers: { "Content-Type": "application/json", Origin: new URL(baseUrl).origin },
       body: JSON.stringify({ listen: [":18888"] }),
     });
     expect(directRes.ok).toBe(true);
@@ -144,11 +146,16 @@ describe.skipIf(!RUN)("integration: live Caddy admin API", () => {
   //      and is resolvable via /id/<id>.
   //   2. GET /id/<unknown> returns a non-OK response (the tool treats this as
   //      "first-create" and falls through to POST).
-  //   3. PUT /id/<known> with a new body replaces in place; a follow-up GET
+  //   3. PATCH /id/<known> with a new body replaces in place; a follow-up GET
   //      via the original config path returns the new content.
+  // NOTE: this test previously asserted PUT for step 3 and had never been run
+  // against a live Caddy. It does not hold -- /id/<id> resolves to a position
+  // in the routes array and PUT INSERTS there, producing a second route with
+  // the same @id, which Caddy rejects with "indexing config: duplicate ID".
+  // PATCH is the verb that replaces. See the PUT-inserts test below.
   // If a future Caddy version regresses any of these contracts the tool's
   // "supply id for idempotent writes" promise breaks; this test catches it.
-  it("@id round-trip: POST registers, GET resolves, PUT replaces in place", async () => {
+  it("@id round-trip: POST registers, GET resolves, PATCH replaces in place", async () => {
     const loadRes = await api.loadConfig({
       apps: { http: { servers: { srv0: { listen: [":18891"], routes: [], ...noAutoHttps } } } },
     });
@@ -173,24 +180,76 @@ describe.skipIf(!RUN)("integration: live Caddy admin API", () => {
     assertOk(afterPost, "configByIdGet after POST");
     expect(afterPost.data?.handle?.[0]?.status_code).toBe(201);
 
-    // 4. PUT /id/<rp-route> with a new body replaces in place.
+    // 4. PATCH /id/<rp-route> with a new body replaces in place.
     const replacement = {
       "@id": "rp-route",
       match: [{ host: ["v2.test"] }],
       handle: [{ handler: "static_response", status_code: 202 }],
       terminal: true,
     };
+    const patchRes = await api.configByIdSet("rp-route", replacement, "PATCH");
+    assertOk(patchRes, "configByIdSet PATCH replace");
+
+    // 4b. PUT at the same @id must NOT be used -- it inserts a duplicate and
+    //     Caddy rejects the resulting config. Pinned so nobody "simplifies"
+    //     the tool back to PUT.
     const putRes = await api.configByIdSet("rp-route", replacement, "PUT");
-    assertOk(putRes, "configByIdSet PUT replace");
+    expect(putRes.ok).toBe(false);
+    expect(putRes.error).toContain("duplicate ID");
 
     // 5. The route at the original config path reflects the replacement, AND
     //    we still have exactly one route (no duplicate appended).
     const routes = await api.configGet<Array<{ handle?: Array<{ status_code?: unknown }> }>>(
       "apps/http/servers/srv0/routes",
     );
-    assertOk(routes, "configGet routes after PUT");
+    assertOk(routes, "configGet routes after PATCH");
     expect(routes.data).toHaveLength(1);
     expect(routes.data?.[0]?.handle?.[0]?.status_code).toBe(202);
+  });
+
+  // Pins the Caddy semantics that api.ts's retry carve-out rests on: PUT at a
+  // position in an array INSERTS, it does not replace. That is why
+  // isRetryableMethod refuses to replay a PUT whose path ends in an array index
+  // -- a replay after a success-but-lost-response would add a second element.
+  // If a future Caddy version changes PUT-at-index to a replace, this test
+  // fails and the carve-out can be relaxed. If it starts failing the other way
+  // (length 1), the carve-out was never needed.
+  it("PUT at an array index inserts rather than replaces", async () => {
+    const loadRes = await api.loadConfig({
+      apps: {
+        http: {
+          servers: {
+            srv0: {
+              listen: [":18892"],
+              routes: [
+                {
+                  match: [{ host: ["first.test"] }],
+                  handle: [{ handler: "static_response", status_code: 201 }],
+                },
+              ],
+              ...noAutoHttps,
+            },
+          },
+        },
+      },
+    });
+    assertOk(loadRes, "loadConfig one route");
+
+    const putRes = await api.configPut("apps/http/servers/srv0/routes/0", {
+      match: [{ host: ["second.test"] }],
+      handle: [{ handler: "static_response", status_code: 202 }],
+    });
+    assertOk(putRes, "configPut at array index");
+
+    const routes = await api.configGet<Array<{ handle?: Array<{ status_code?: unknown }> }>>(
+      "apps/http/servers/srv0/routes",
+    );
+    assertOk(routes, "configGet routes after PUT");
+    // Two routes, not one: the PUT inserted at position 0 and pushed the
+    // original down. A replace would leave length 1.
+    expect(routes.data).toHaveLength(2);
+    expect(routes.data?.[0]?.handle?.[0]?.status_code).toBe(202);
+    expect(routes.data?.[1]?.handle?.[0]?.status_code).toBe(201);
   });
 
   it("configByIdGet + Delete works end-to-end", async () => {

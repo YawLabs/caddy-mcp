@@ -394,7 +394,7 @@ describe("api", () => {
       expect(calls).toBe(3);
     });
 
-    it("still retries PUT on 5xx (idempotent method)", async () => {
+    it("still retries PUT to a non-array path on 5xx (idempotent there)", async () => {
       process.env.CADDY_MAX_RETRIES = "2";
       const api = await import("../api.js");
       let calls = 0;
@@ -404,7 +404,72 @@ describe("api", () => {
         return new Response("", { status: 200 });
       }) as any;
 
+      const res = await api.configPut("apps/http/servers/srv0", {});
+      expect(res.ok).toBe(true);
+      expect(calls).toBe(3);
+    });
+
+    // Caddy PUT INSERTS when the destination is a position in an array. A
+    // replay after a success-but-lost-response would add a second element --
+    // the same silent-duplicate hazard that excludes POST to /config/.
+    it("does NOT retry PUT at an array-index path on 5xx", async () => {
+      process.env.CADDY_MAX_RETRIES = "3";
+      const api = await import("../api.js");
+      let calls = 0;
+      globalThis.fetch = vi.fn(async () => {
+        calls++;
+        return new Response("upstream down", { status: 503 });
+      }) as any;
+
       const res = await api.configPut("apps/http/servers/srv0/routes/0", {});
+      expect(res.ok).toBe(false);
+      expect(res.status).toBe(503);
+      expect(calls).toBe(1);
+    });
+
+    it("does NOT retry PUT at an array-index path on a network error (status 0)", async () => {
+      process.env.CADDY_MAX_RETRIES = "3";
+      const api = await import("../api.js");
+      let calls = 0;
+      globalThis.fetch = vi.fn(async () => {
+        calls++;
+        throw new TypeError("fetch failed");
+      }) as any;
+
+      const res = await api.configPut("apps/http/servers/srv0/routes/2", {});
+      expect(res.ok).toBe(false);
+      expect(res.status).toBe(0);
+      expect(calls).toBe(1);
+    });
+
+    it("does NOT retry PUT at an /id/ subpath array index", async () => {
+      process.env.CADDY_MAX_RETRIES = "3";
+      const api = await import("../api.js");
+      let calls = 0;
+      globalThis.fetch = vi.fn(async () => {
+        calls++;
+        return new Response("upstream down", { status: 503 });
+      }) as any;
+
+      const res = await api.configByIdSet("my-route", {}, "PUT", "handle/0");
+      expect(res.ok).toBe(false);
+      expect(calls).toBe(1);
+    });
+
+    // No array-index tail, so the carve-out doesn't apply and the retry loop
+    // runs. (Separately: the TOOLS use PATCH for @id replaces -- PUT at /id/
+    // inserts a duplicate. This test is about the retry policy, not the verb.)
+    it("still retries PUT to /id/<id> with no subpath", async () => {
+      process.env.CADDY_MAX_RETRIES = "2";
+      const api = await import("../api.js");
+      let calls = 0;
+      globalThis.fetch = vi.fn(async () => {
+        calls++;
+        if (calls < 3) return new Response("upstream down", { status: 503 });
+        return new Response("", { status: 200 });
+      }) as any;
+
+      const res = await api.configByIdSet("my-route", { handle: [] }, "PUT");
       expect(res.ok).toBe(true);
       expect(calls).toBe(3);
     });
@@ -800,6 +865,60 @@ describe("api", () => {
       expect(calls[2]?.ifMatch).toBe(null);
     });
 
+    it("invalidates the root /config/ entry on a descendant write", async () => {
+      // configGet("") caches under the key "/config/", which already ends in a
+      // slash. The ancestor test must not build "/config//" -- otherwise the
+      // root entry survives every child write and a later write to the root
+      // path ships a stale If-Match and 412s spuriously.
+      const api = await import("../api.js");
+      const calls: Array<{ method: string; path: string; ifMatch: string | null }> = [];
+      globalThis.fetch = vi.fn(async (url: any, opts: any) => {
+        const method = opts?.method ?? "GET";
+        const path = new URL(String(url)).pathname;
+        const ifMatch = opts?.headers?.["If-Match"] ?? null;
+        calls.push({ method, path, ifMatch });
+        if (method === "GET") {
+          return new Response("{}", { status: 200, headers: { ETag: "root-etag-1" } });
+        }
+        return new Response("", { status: 200 });
+      }) as any;
+
+      // Prime the cache with a full-config read.
+      await api.configGet();
+      // A descendant write must drop the cached root entry.
+      await api.configPatch("apps/http/servers/srv0", { listen: [":443"] });
+      // Writing the root now must NOT carry the pre-child-write ETag.
+      await api.configPatch("", { apps: {} });
+
+      expect(calls).toHaveLength(3);
+      expect(calls[0]?.path).toBe("/config/");
+      expect(calls[2]?.method).toBe("PATCH");
+      expect(calls[2]?.path).toBe("/config/");
+      expect(calls[2]?.ifMatch).toBe(null);
+    });
+
+    it("does not invalidate a sibling whose path shares a prefix", async () => {
+      // "/config/.../srv0" must not be dropped by a write to ".../srv01".
+      const api = await import("../api.js");
+      const calls: Array<{ method: string; path: string; ifMatch: string | null }> = [];
+      globalThis.fetch = vi.fn(async (url: any, opts: any) => {
+        const method = opts?.method ?? "GET";
+        const path = new URL(String(url)).pathname;
+        const ifMatch = opts?.headers?.["If-Match"] ?? null;
+        calls.push({ method, path, ifMatch });
+        if (method === "GET") {
+          return new Response("{}", { status: 200, headers: { ETag: "sibling-etag-1" } });
+        }
+        return new Response("", { status: 200 });
+      }) as any;
+
+      await api.configGet("prefix-siblings/srv0");
+      await api.configPatch("prefix-siblings/srv01", { listen: [":80"] });
+      await api.configPatch("prefix-siblings/srv0", { listen: [":443"] });
+
+      expect(calls[2]?.ifMatch).toBe("sibling-etag-1");
+    });
+
     it("invalidates cache when a successful write returns no ETag", async () => {
       const api = await import("../api.js");
       const target = "etag-no-header-target";
@@ -1022,6 +1141,257 @@ describe("api", () => {
       await api.loadConfig({});
       expect(timeoutSpy).toHaveBeenCalledWith(60000);
       timeoutSpy.mockRestore();
+    });
+  });
+
+  // The CADDY_TIMEOUT / CADDY_LOAD_TIMEOUT tests above assert only the value
+  // handed to AbortSignal.timeout. These drive the abort itself, so the mapping
+  // from a fired timeout to a legible message is pinned too.
+  describe("error classification in the catch block", () => {
+    it("maps a fired timeout to the friendly message carrying the effective ms", async () => {
+      process.env.CADDY_TIMEOUT = "1234";
+      const api = await import("../api.js");
+      globalThis.fetch = vi.fn(async () => {
+        throw new DOMException("The operation was aborted due to timeout", "TimeoutError");
+      }) as any;
+
+      const res = await api.configGet();
+      expect(res.ok).toBe(false);
+      expect(res.status).toBe(0);
+      expect(res.error).toBe("Request timed out after 1234ms");
+    });
+
+    it("reports the /load timeout budget, not the per-request one, when /load aborts", async () => {
+      process.env.CADDY_TIMEOUT = "1000";
+      process.env.CADDY_LOAD_TIMEOUT = "45000";
+      const api = await import("../api.js");
+      globalThis.fetch = vi.fn(async () => {
+        throw new DOMException("The operation was aborted due to timeout", "TimeoutError");
+      }) as any;
+
+      const res = await api.loadConfig({ apps: {} });
+      expect(res.error).toBe("Request timed out after 45000ms");
+    });
+
+    it("surfaces an unrecognized transport error verbatim", async () => {
+      // Neither connection-refused nor abort -- the catch-all branch decides
+      // whether an unexpected failure is legible or swallowed.
+      const api = await import("../api.js");
+      globalThis.fetch = vi.fn(async () => {
+        throw new Error("socket hang up");
+      }) as any;
+
+      const res = await api.configGet();
+      expect(res.ok).toBe(false);
+      expect(res.status).toBe(0);
+      expect(res.error).toBe("socket hang up");
+    });
+
+    it("stringifies a non-Error throw", async () => {
+      const api = await import("../api.js");
+      globalThis.fetch = vi.fn(async () => {
+        throw "bare string failure";
+      }) as any;
+
+      const res = await api.configGet();
+      expect(res.error).toBe("bare string failure");
+    });
+
+    it("falls back to the raw admin URL when it cannot be parsed", async () => {
+      // The origin-stripping path is tested elsewhere; this is the branch that
+      // runs when CADDY_ADMIN_URL is malformed -- exactly when the user most
+      // needs the value echoed back to spot the typo.
+      process.env.CADDY_ADMIN_URL = "not a url";
+      const api = await import("../api.js");
+      globalThis.fetch = vi.fn(async () => {
+        throw new TypeError("fetch failed");
+      }) as any;
+
+      const res = await api.configGet();
+      expect(res.ok).toBe(false);
+      expect(res.error).toContain("not a url");
+      expect(res.error).toContain("is Caddy running?");
+    });
+  });
+
+  describe("base URL normalization", () => {
+    it.each([
+      "http://caddy.local:2019/",
+      "http://caddy.local:2019///",
+    ])("strips trailing slashes from CADDY_ADMIN_URL=%p", async (url) => {
+      // A trailing slash in the env var would otherwise produce "//config/".
+      process.env.CADDY_ADMIN_URL = url;
+      const api = await import("../api.js");
+      let calledUrl = "";
+      globalThis.fetch = vi.fn(async (u: any) => {
+        calledUrl = u.toString();
+        return new Response("{}", { status: 200 });
+      }) as any;
+
+      await api.configGet();
+      expect(calledUrl).toBe("http://caddy.local:2019/config/");
+    });
+  });
+
+  describe("ETag cache bounds", () => {
+    it("evicts the oldest entry once the cache exceeds 256 paths", async () => {
+      // An agent walking a large config issues hundreds of distinct GETs in one
+      // session, so the FIFO drop fires in practice. A bug here either evicts a
+      // live entry (spurious 412) or keeps a stale one (lost If-Match).
+      const api = await import("../api.js");
+      const calls: Array<{ path: string; ifMatch: string | null }> = [];
+      globalThis.fetch = vi.fn(async (url: any, opts: any) => {
+        const method = opts?.method ?? "GET";
+        const path = new URL(String(url)).pathname;
+        calls.push({ path, ifMatch: opts?.headers?.["If-Match"] ?? null });
+        if (method === "GET") {
+          return new Response("{}", { status: 200, headers: { ETag: `etag${path}` } });
+        }
+        return new Response("", { status: 200 });
+      }) as any;
+
+      // 257 distinct sibling paths -- one more than MAX_ETAG_CACHE. Siblings so
+      // no ancestor/descendant invalidation fires between them.
+      for (let i = 0; i < 257; i++) {
+        await api.configGet(`evict-probe/p${i}`);
+      }
+      calls.length = 0;
+
+      await api.configPatch("evict-probe/p0", { x: 1 });
+      await api.configPatch("evict-probe/p256", { x: 1 });
+
+      // Oldest was dropped; newest survived.
+      expect(calls[0]?.ifMatch).toBe(null);
+      expect(calls[1]?.ifMatch).toBe("etag/config/evict-probe/p256");
+    });
+  });
+
+  describe("loadConfig failure does not touch the cache", () => {
+    it("keeps cached ETags when /load fails", async () => {
+      // loadConfig clears the whole cache on success. If that guard were ever
+      // dropped, a FAILED load would silently wipe optimistic-concurrency
+      // protection and the next write would go out with no If-Match -- a lost
+      // update with no error surfaced anywhere.
+      const api = await import("../api.js");
+      const target = "load-failure-keeps-cache";
+      const calls: Array<{ method: string; ifMatch: string | null }> = [];
+      globalThis.fetch = vi.fn(async (url: any, opts: any) => {
+        const method = opts?.method ?? "GET";
+        calls.push({ method, ifMatch: opts?.headers?.["If-Match"] ?? null });
+        if (method === "GET") {
+          return new Response("{}", { status: 200, headers: { ETag: "survives-failed-load" } });
+        }
+        if (String(url).endsWith("/load")) {
+          return new Response("config invalid", { status: 400 });
+        }
+        return new Response("", { status: 200 });
+      }) as any;
+
+      await api.configGet(target);
+      const loadRes = await api.loadConfig({ apps: {} });
+      expect(loadRes.ok).toBe(false);
+
+      await api.configPatch(target, { foo: 1 });
+      expect(calls[2]?.method).toBe("PATCH");
+      expect(calls[2]?.ifMatch).toBe("survives-failed-load");
+    });
+  });
+
+  // The URL path IS the entire behavior of these thin wrappers. Handler tests
+  // mock the api module wholesale and the traversal tests return before
+  // fetching, so without these a typo'd endpoint passes the whole suite.
+  describe("endpoint URL composition", () => {
+    async function capture(call: (api: typeof import("../api.js")) => Promise<unknown>) {
+      const api = await import("../api.js");
+      let pathname = "";
+      let method = "";
+      let contentType: string | undefined;
+      globalThis.fetch = vi.fn(async (url: any, opts: any) => {
+        pathname = new URL(String(url)).pathname;
+        method = opts?.method ?? "GET";
+        contentType = opts?.headers?.["Content-Type"];
+        return new Response("{}", { status: 200 });
+      }) as any;
+      await call(api);
+      return { pathname, method, contentType };
+    }
+
+    it("getUpstreams reads /reverse_proxy/upstreams", async () => {
+      const { pathname, method } = await capture((a) => a.getUpstreams());
+      expect(pathname).toBe("/reverse_proxy/upstreams");
+      expect(method).toBe("GET");
+    });
+
+    it("getMetrics reads /metrics", async () => {
+      expect((await capture((a) => a.getMetrics())).pathname).toBe("/metrics");
+    });
+
+    it("stop POSTs /stop", async () => {
+      const { pathname, method } = await capture((a) => a.stop());
+      expect(pathname).toBe("/stop");
+      expect(method).toBe("POST");
+    });
+
+    it("getPki reads /pki/ca/<ca>, defaulting the CA to 'local'", async () => {
+      expect((await capture((a) => a.getPki())).pathname).toBe("/pki/ca/local");
+      expect((await capture((a) => a.getPki("internal"))).pathname).toBe("/pki/ca/internal");
+    });
+
+    it("getPkiCertificates appends /certificates to the CA path", async () => {
+      // Segment order matters -- swapping it still returns 200 against a mock.
+      expect((await capture((a) => a.getPkiCertificates())).pathname).toBe("/pki/ca/local/certificates");
+      expect((await capture((a) => a.getPkiCertificates("internal"))).pathname).toBe(
+        "/pki/ca/internal/certificates",
+      );
+    });
+
+    it("adapt POSTs /adapt with a text/<adapter> content type", async () => {
+      const { pathname, method, contentType } = await capture((a) => a.adapt("example.com { }", "nginx"));
+      expect(pathname).toBe("/adapt");
+      expect(method).toBe("POST");
+      expect(contentType).toBe("text/nginx");
+    });
+
+    it("adapt defaults the adapter to caddyfile", async () => {
+      expect((await capture((a) => a.adapt("example.com { }"))).contentType).toBe("text/caddyfile");
+    });
+
+    it("loadConfig POSTs /load", async () => {
+      const { pathname, method } = await capture((a) => a.loadConfig({ apps: {} }));
+      expect(pathname).toBe("/load");
+      expect(method).toBe("POST");
+    });
+
+    it("configById* compose /id/<id> and /id/<id>/<subpath>", async () => {
+      expect((await capture((a) => a.configByIdGet("my-route"))).pathname).toBe("/id/my-route");
+      expect((await capture((a) => a.configByIdGet("my-route", "handle"))).pathname).toBe("/id/my-route/handle");
+      const set = await capture((a) => a.configByIdSet("my-route", {}, "PUT", "terminal"));
+      expect(set.pathname).toBe("/id/my-route/terminal");
+      expect(set.method).toBe("PUT");
+      const del = await capture((a) => a.configByIdDelete("my-route", "handle"));
+      expect(del.pathname).toBe("/id/my-route/handle");
+      expect(del.method).toBe("DELETE");
+    });
+  });
+
+  describe("traversal rejection on the write-side subpaths", () => {
+    it.each([
+      ["configByIdSet", (a: typeof import("../api.js")) => a.configByIdSet("my-route", {}, "PATCH", "../../load")],
+      ["configByIdDelete", (a: typeof import("../api.js")) => a.configByIdDelete("my-route", "../../stop")],
+    ])("rejects .. in the %s subpath without hitting fetch", async (_name, call) => {
+      // configByIdGet's subpath is already covered; these are the write and
+      // delete paths, where an escape matters more than on a read.
+      const api = await import("../api.js");
+      let called = 0;
+      globalThis.fetch = vi.fn(async () => {
+        called++;
+        return new Response("{}", { status: 200 });
+      }) as any;
+
+      const res = await call(api);
+      expect(res.ok).toBe(false);
+      expect(res.error).toContain("'..'");
+      expect(called).toBe(0);
     });
   });
 });

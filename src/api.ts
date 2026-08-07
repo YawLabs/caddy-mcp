@@ -44,11 +44,20 @@ function setEtag(path: string, etag: string): void {
  *      a write to `/config/...` invalidates any `/id/...` cached for paths that
  *      may resolve into that subtree.
  */
+function isAncestorOf(ancestor: string, descendant: string): boolean {
+  // Strip a trailing slash before building the prefix. The root config key is
+  // "/config/", which already ends in "/" -- naively appending another would
+  // test against "/config//" and match nothing, leaving the root entry cached
+  // (and thus stale) after every descendant write.
+  const base = ancestor.endsWith("/") ? ancestor.slice(0, -1) : ancestor;
+  return descendant.startsWith(`${base}/`);
+}
+
 function invalidateRelated(path: string): void {
   etagCache.delete(path);
   for (const key of Array.from(etagCache.keys())) {
     if (key === path) continue;
-    if (path.startsWith(`${key}/`) || key.startsWith(`${path}/`)) {
+    if (isAncestorOf(key, path) || isAncestorOf(path, key)) {
       etagCache.delete(key);
     }
   }
@@ -83,11 +92,31 @@ function getMaxRetries(): number {
   return Math.min(floored, RETRY_HARD_CAP);
 }
 
+/** The admin URL's origin (scheme://host:port), or undefined if it won't parse. */
+function getAdminOrigin(): string | undefined {
+  try {
+    return new URL(getBaseUrl()).origin;
+  } catch {
+    return undefined;
+  }
+}
+
 function getHeaders(contentType?: string): Record<string, string> {
   const headers: Record<string, string> = {};
   if (contentType) headers["Content-Type"] = contentType;
   const token = process.env.CADDY_API_TOKEN;
   if (token) headers.Authorization = `Bearer ${token}`;
+  // Node's global fetch ALWAYS sends `Sec-Fetch-Mode: cors`. Caddy's admin API
+  // reads that as a browser-initiated cross-origin request and enforces its
+  // Origin allowlist; with no Origin header the computed origin is "", which is
+  // never allowed -- so every request 403s against a stock Caddy with
+  // {"error":"client is not allowed to access from origin ''"}. curl and
+  // node:http send no Sec-Fetch-Mode and are allowed, which is why manual
+  // testing with curl never surfaces this. Sending an Origin that matches the
+  // admin URL puts us back inside Caddy's default allowlist (which is derived
+  // from the admin listen address).
+  const origin = getAdminOrigin();
+  if (origin) headers.Origin = origin;
   return headers;
 }
 
@@ -120,12 +149,25 @@ function isTransientFailure(res: ApiResponse): boolean {
   return false;
 }
 
+/** Matches a trailing array index, e.g. ".../routes/0" -- the shape Caddy PUT inserts at. */
+const ARRAY_INDEX_TAIL_RE = /\/\d+$/;
+
 /**
  * Whether a (method, path) pair is safe to retry on a transient failure.
  *
- * GET / PUT / PATCH / DELETE are idempotent on every Caddy admin endpoint --
+ * GET / PATCH / DELETE are idempotent on every Caddy admin endpoint --
  * replaying them yields the same end state, so they always retry under the
  * normal transient-failure policy.
+ *
+ * PUT is idempotent only when the destination is NOT an array position. Caddy's
+ * PUT semantics are "insert at a position in an array, strictly create
+ * otherwise" -- so a PUT to `.../routes/0` that succeeded server-side but lost
+ * its response (status 0), or 5xx'd after committing, would insert a SECOND
+ * element on replay. That is the same silent-duplicate hazard the POST carve-out
+ * below exists to prevent, so PUT to an array-index path skips the retry loop.
+ * A config key that is literally numeric (a server named "0") is a false
+ * positive here; the cost is one un-retried request, versus a duplicated route
+ * if we guessed the other way.
  *
  * POST is split by path:
  *  - `/config/<path>` and `/id/<id>` are non-idempotent: they append to
@@ -143,6 +185,7 @@ function isTransientFailure(res: ApiResponse): boolean {
  *    server is a no-op (it just yields ECONNREFUSED), so retry is benign.
  */
 function isRetryableMethod(method: string, path: string): boolean {
+  if (method === "PUT") return !ARRAY_INDEX_TAIL_RE.test(path);
   if (method !== "POST") return true;
   return !path.startsWith("/config/") && !path.startsWith("/id/");
 }
@@ -235,6 +278,20 @@ async function attemptRequest<T = any>(
         // with an empty body; point at the likely cause instead of a bare code.
         const hint = res.status === 401 || res.status === 403 ? " -- check CADDY_API_TOKEN" : "";
         return { ok: false, status: res.status, error: `HTTP ${res.status}${hint}` };
+      }
+      // A 403 naming an origin is Caddy's admin allowlist, not auth. We already
+      // send a matching Origin, so reaching here means CADDY_ADMIN_URL differs
+      // from the origin Caddy accepts -- say so instead of leaving the caller
+      // with a bare "not allowed to access from origin ''".
+      if (res.status === 403 && /origin/i.test(text)) {
+        return {
+          ok: false,
+          status: 403,
+          error:
+            `${text.trim()} -- Caddy's admin API rejected this client's Origin. ` +
+            `Set CADDY_ADMIN_URL to the exact origin Caddy allows (default http://localhost:2019), ` +
+            `or add this origin to the admin.origins list in Caddy's config.`,
+        };
       }
       return { ok: false, status: res.status, error: text };
     }

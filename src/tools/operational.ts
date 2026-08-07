@@ -40,7 +40,13 @@ interface CaddyConfigShape {
  */
 const HTTPS_PORT_RE = /:443(?:\D|$)/;
 
-function describeServer(raw: CaddyServerSummary): string {
+function describeServer(rawValue: unknown): string {
+  // The config body is whatever the admin API returned, not a validated shape --
+  // a malformed entry ("srv0": null, or a string) must render, not throw.
+  const raw: CaddyServerSummary =
+    rawValue !== null && typeof rawValue === "object" && !Array.isArray(rawValue)
+      ? (rawValue as CaddyServerSummary)
+      : {};
   const listen: unknown[] = Array.isArray(raw.listen) ? raw.listen : [];
   const routes: unknown[] = Array.isArray(raw.routes) ? raw.routes : [];
   const hasExplicitTls = !!raw.tls_connection_policies;
@@ -223,7 +229,7 @@ export function registerOperationalTools(server: McpServer) {
     "Get Prometheus metrics from Caddy. Shows request counts, durations, TLS handshake stats, active connections, and more. " +
       "Output can be megabytes on busy servers -- use `filter` to keep only metrics whose name contains a substring " +
       "(e.g. 'http_requests' or 'tls'); HELP/TYPE comment lines for retained metrics are kept. " +
-      "Filter-mode drops blank lines and free-form '# comment' lines (including '# EOF'); only '# HELP'/'# TYPE' lines for matching metrics are kept. " +
+      "Filter-mode drops blank lines and free-form '# comment' lines, keeping only '# HELP'/'# TYPE' lines for matching metrics; the '# EOF' end-of-file marker is always preserved. " +
       "Use `max_lines` to cap the response (default 500); a trailing comment reports how many lines were dropped.",
     {
       filter: z

@@ -225,6 +225,29 @@ describe("caddy-mcp tools", () => {
       // than silently dropping data the caller may have meant.
       expect(parseFrom("foo:bar")).toEqual({ host: ["foo:bar"] });
     });
+
+    it("leaves a bare (bracket-less) IPv6 literal intact", async () => {
+      const { parseFrom } = await import("../tools/routes.js");
+      // The last group of "::1" is an address segment, not a port -- IPv6
+      // carries a port only in the bracketed form. Shearing at the final colon
+      // would reduce "::1" to ":".
+      expect(parseFrom("::1")).toEqual({ host: ["::1"] });
+      expect(parseFrom("fe80::1")).toEqual({ host: ["fe80::1"] });
+      expect(parseFrom("2001:db8::8a2e:370:7334")).toEqual({ host: ["2001:db8::8a2e:370:7334"] });
+    });
+
+    it("leaves a bare IPv6 literal intact when followed by a path", async () => {
+      const { parseFrom } = await import("../tools/routes.js");
+      expect(parseFrom("::1/api")).toEqual({ host: ["::1"], path: ["/api"] });
+    });
+
+    it("leaves an unterminated bracket intact rather than guessing", async () => {
+      // "[::1" has no closing "]" -- there is no port to strip and no safe way
+      // to infer where the address ends, so the value passes through unchanged.
+      const { parseFrom } = await import("../tools/routes.js");
+      expect(parseFrom("[::1")).toEqual({ host: ["[::1"] });
+      expect(parseFrom("[::1/api")).toEqual({ host: ["[::1"], path: ["/api"] });
+    });
   });
 
   it("registers 4 resources", async () => {

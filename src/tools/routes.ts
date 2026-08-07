@@ -43,6 +43,52 @@ interface CaddyUpstream {
   dial?: unknown;
 }
 
+/**
+ * Max characters of raw route JSON attached as the second content block of
+ * caddy_list_routes. A server fronting many hosts can carry megabytes of route
+ * config; the full JSON is always reachable via caddy_config_get.
+ */
+const ROUTES_JSON_MAX_CHARS = 20000;
+
+/**
+ * Max route summary lines emitted by caddy_list_routes. Matches the spirit of
+ * METRICS_DEFAULT_MAX_LINES -- one line per route is cheap until a server
+ * fronts thousands of them.
+ */
+const ROUTES_SUMMARY_MAX = 500;
+
+/**
+ * Serialize as many WHOLE routes as fit under ROUTES_JSON_MAX_CHARS.
+ *
+ * Two reasons this isn't `JSON.stringify(routes).slice(0, cap)`:
+ *   1. A character-level cut lands mid-token, so the block stops being valid
+ *      JSON -- and this block is the machine-readable half of the tool's
+ *      output, which callers parse.
+ *   2. Slicing still materializes the full megabyte string before throwing most
+ *      of it away, which defeats the point of the cap.
+ *
+ * Output matches `JSON.stringify(array, null, 2)` formatting so a consumer
+ * can't tell a capped block from a complete one except by its length. The
+ * first route is always included even if it alone exceeds the cap -- an empty
+ * array would be less useful than one oversized entry.
+ */
+function serializeRoutesCapped(routes: unknown[]): { json: string; shown: number } {
+  const parts: string[] = [];
+  let used = 2; // the enclosing "[" and "]"
+  for (const route of routes) {
+    const entry = JSON.stringify(route, null, 2)
+      .split("\n")
+      .map((line) => `  ${line}`)
+      .join("\n");
+    const cost = entry.length + (parts.length > 0 ? 2 : 1); // ",\n" or the opening "\n"
+    if (parts.length > 0 && used + cost > ROUTES_JSON_MAX_CHARS) break;
+    parts.push(entry);
+    used += cost;
+  }
+  if (parts.length === 0) return { json: "[]", shown: 0 };
+  return { json: `[\n${parts.join(",\n")}\n]`, shown: parts.length };
+}
+
 /** Join an unknown value as comma-separated strings if it's an array; return "" otherwise */
 function safeJoin(value: unknown): string {
   if (!Array.isArray(value)) return "";
@@ -65,6 +111,7 @@ function safeJoin(value: unknown): string {
  *   - "[::1]:8080"        -> "[::1]" (IPv6 bracket form)
  *   - "[::1]"             -> "[::1]" (no port — unchanged)
  *   - "example.com"       -> "example.com" (no port — unchanged)
+ *   - "::1"               -> "::1" (bare IPv6 — unchanged; see below)
  *   - "foo:bar"           -> "foo:bar" (non-numeric suffix — leave alone
  *                            rather than silently losing data we don't
  *                            recognize as a port).
@@ -77,6 +124,12 @@ function stripPort(host: string): string {
   }
   const colonIdx = host.lastIndexOf(":");
   if (colonIdx === -1) return host;
+  // Two or more colons with no brackets is a bare IPv6 literal ("::1",
+  // "fe80::1"). Its last group is an address segment, not a port -- a port on
+  // IPv6 requires the bracketed form handled above. Shearing at the final
+  // colon would turn "::1" into ":", exactly the silent data loss the
+  // non-numeric-suffix case below refuses to do.
+  if (host.indexOf(":") !== colonIdx) return host;
   const portCandidate = host.substring(colonIdx + 1);
   if (portCandidate.length === 0 || !/^\d+$/.test(portCandidate)) return host;
   return host.substring(0, colonIdx);
@@ -178,11 +231,14 @@ export function registerRouteTools(server: McpServer) {
     "caddy_reverse_proxy",
     "Add a reverse proxy route. The most common operation — just specify where traffic comes from and where it goes. Example: from='api.local' to=['localhost:3000']. " +
       "When `id` is OMITTED the route is appended to the server's routes array — calling the tool twice with the same args produces TWO duplicate routes (non-idempotent). " +
-      "When `id` is SUPPLIED the route is written via PUT under that @id, so repeat calls REPLACE in place (idempotent). " +
+      "When `id` is SUPPLIED the route is written via PATCH under that @id, so repeat calls REPLACE in place (idempotent). " +
       "Strongly recommended: supply a stable `id` for any route managed from automation or production tooling. " +
       "Note: @ids are config-global in Caddy (NOT route-scoped). If `id` collides with an @id used by a non-route object (TLS issuer, server, etc.) the call refuses with an error rather than clobbering it. Once an @id is registered to a route under one server, subsequent calls update that route in place regardless of the `server` argument.",
     {
-      from: z.string().describe("Domain, path, or domain/path to match (e.g., 'api.local', '/api/*', 'app.local/ws')"),
+      from: z
+        .string()
+        .min(1)
+        .describe("Domain, path, or domain/path to match (e.g., 'api.local', '/api/*', 'app.local/ws')"),
       to: z.array(z.string()).describe("Upstream addresses (e.g., ['localhost:3000', 'localhost:3001'])"),
       server: z
         .string()
@@ -200,7 +256,25 @@ export function registerRouteTools(server: McpServer) {
     },
     { readOnlyHint: false, destructiveHint: false, idempotentHint: false, openWorldHint: false },
     async ({ from, to, server: srv, id }) => {
-      const match = parseFrom(from);
+      // Trim before parsing so surrounding whitespace doesn't become part of a
+      // matcher: "  /api" is a legitimate path, but parsing it untrimmed yields
+      // host ["   "] alongside it.
+      const match = parseFrom(from.trim());
+      // A `from` that carries no matchable token ("https://", " ", "  ")
+      // survives the min(1) schema check but parses to an empty host matcher,
+      // which can never fire. Refuse rather than write a dead route. The
+      // trim() on the host covers any whitespace the parse leaves behind.
+      if (match.host?.[0]?.trim() === "" || (match.host === undefined && match.path === undefined)) {
+        return {
+          isError: true,
+          content: [
+            {
+              type: "text" as const,
+              text: `Error: "from" value ${JSON.stringify(from)} has no host or path to match on. Supply a domain ('api.local'), a path ('/api/*'), or both ('app.local/ws').`,
+            },
+          ],
+        };
+      }
       const cleanedTo = to.map(cleanUpstreamAddr);
       const route: Record<string, unknown> = {
         match: [match],
@@ -215,7 +289,7 @@ export function registerRouteTools(server: McpServer) {
       if (id) {
         route["@id"] = id;
         // GET-first dispatch on the supplied @id:
-        //   200 + route shape  -> PUT /id/<id> to replace in place (idempotent).
+        //   200 + route shape  -> PATCH /id/<id> to replace in place (idempotent).
         //   200 + non-route    -> refuse: @ids are config-global, don't clobber
         //                         a TLS issuer / server / handler that happens
         //                         to share this id.
@@ -243,7 +317,14 @@ export function registerRouteTools(server: McpServer) {
               ],
             };
           }
-          const putRes = await api.configByIdSet(id, route, "PUT");
+          // PATCH, not PUT. Caddy's /id/<id> resolves to a position in the
+          // routes array, and PUT at an array position INSERTS -- so a PUT
+          // here appends a second copy carrying the same @id and Caddy then
+          // rejects the whole config with
+          //   "indexing config: duplicate ID '<id>' found at .../routes/0 and .../routes/1"
+          // Verified against Caddy 2.11.4: PUT -> 400 duplicate ID (config
+          // rolled back), PATCH -> 200 with the route replaced in place.
+          const putRes = await api.configByIdSet(id, route, "PATCH");
           if (putRes.ok) {
             return {
               content: [
@@ -328,7 +409,9 @@ export function registerRouteTools(server: McpServer) {
 
   server.tool(
     "caddy_list_routes",
-    "List all routes on a Caddy HTTP server with a human-readable summary of matchers and handlers.",
+    "List all routes on a Caddy HTTP server with a human-readable summary of matchers and handlers, followed by the raw route JSON. " +
+      "Both halves are capped on large servers: the summary at 500 routes, the JSON at 20000 characters (truncated on whole-route boundaries, so it always parses). " +
+      "When either cap trims output, a note says how many routes were omitted -- read the rest with caddy_config_get at 'apps/http/servers/<server>/routes'.",
     {
       server: z
         .string()
@@ -359,7 +442,8 @@ export function registerRouteTools(server: McpServer) {
       }
 
       const lines: string[] = [`Server: ${srv} (listen: ${listenStr})`, ""];
-      for (let i = 0; i < routes.length; i++) {
+      const summarized = Math.min(routes.length, ROUTES_SUMMARY_MAX);
+      for (let i = 0; i < summarized; i++) {
         const rawRoute = routes[i];
         if (!rawRoute || typeof rawRoute !== "object") {
           lines.push(`  Route ${i}: <invalid>`);
@@ -472,13 +556,26 @@ export function registerRouteTools(server: McpServer) {
         const terminal = route.terminal === true ? " [terminal]" : "";
         lines.push(`  Route ${i}:${id}${group} ${matchers} → ${handlers}${terminal}`);
       }
+      if (summarized < routes.length) {
+        lines.push(
+          `  ... ${routes.length - summarized} more route(s) not shown (summary caps at ${ROUTES_SUMMARY_MAX}).`,
+        );
+      }
 
-      return {
-        content: [
-          { type: "text" as const, text: lines.join("\n") },
-          { type: "text" as const, text: JSON.stringify(routes, null, 2) },
-        ],
-      };
+      const { json, shown } = serializeRoutesCapped(routes);
+      const content: { type: "text"; text: string }[] = [
+        { type: "text" as const, text: lines.join("\n") },
+        { type: "text" as const, text: json },
+      ];
+      // Truncation notes go in their own block so the JSON block above stays
+      // parseable as-is.
+      if (shown < routes.length) {
+        content.push({
+          type: "text" as const,
+          text: `[JSON block truncated: showing ${shown} of ${routes.length} routes to stay under ${ROUTES_JSON_MAX_CHARS} characters. Read the rest with caddy_config_get at path 'apps/http/servers/${srv}/routes', or one route at a time with caddy_config_by_id.]`,
+        });
+      }
+      return { content };
     },
   );
 
@@ -544,8 +641,10 @@ export function registerRouteTools(server: McpServer) {
       if (!readRes.ok) return formatResult(readRes);
       const routes = readRes.data;
       if (routes === undefined || routes === null) {
-        // routes key absent -- mirror caddy_list_routes, which treats a missing
-        // routes array as zero routes rather than a malformed-config error.
+        // routes key absent. caddy_list_routes renders this as "no routes
+        // configured" and succeeds, but a delete naming a specific index has
+        // nothing to act on, so report it as an error rather than a silent
+        // no-op. The wording is shared with list_routes; the result kind is not.
         return {
           isError: true,
           content: [{ type: "text" as const, text: `Error: server "${srv}" has no routes configured` }],

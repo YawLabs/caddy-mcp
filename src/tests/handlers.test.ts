@@ -82,6 +82,32 @@ describe("tool handler behavior", () => {
       expect(routeArg.handle[0].upstreams[0].dial).toBe("localhost:3000");
     });
 
+    it.each([
+      "https://",
+      " ",
+      "   ",
+      "https:// ",
+      "\t",
+    ])("refuses `from`=%j instead of writing a dead route", async (from) => {
+      // These survive the min(1) schema check but carry no matchable token.
+      // Regression: only the exact-empty case was caught, so whitespace
+      // produced a host matcher of [" "] that can never fire.
+      const result = await handler({ from, to: ["localhost:3000"], server: "srv0" });
+
+      expect(api.configPost).not.toHaveBeenCalled();
+      expect(result.isError).toBe(true);
+      expect(result.content[0].text).toContain("no host or path to match on");
+    });
+
+    it("trims surrounding whitespace rather than baking it into the matcher", async () => {
+      api.configPost.mockResolvedValue(ok());
+
+      await handler({ from: "  /api  ", to: ["localhost:3000"], server: "srv0" });
+
+      const routeArg = api.configPost.mock.calls[0][1];
+      expect(routeArg.match).toEqual([{ path: ["/api"] }]);
+    });
+
     it("returns server-not-found error when server does not exist (legacy body match, 500)", async () => {
       // Regression: keep the existing body-match path working even when status is non-404.
       api.configPost.mockResolvedValue(err(500, "key does not exist"));
@@ -104,9 +130,23 @@ describe("tool handler behavior", () => {
       expect(result.content[0].text).toContain('Server "srv99" does not exist');
     });
 
-    it("replaces in place via PUT when @id resolves to an existing route", async () => {
+    it("surfaces an ordinary validation failure verbatim, NOT as server-not-found", async () => {
+      // The parent-missing translation must not swallow a real Caddy
+      // validation error -- "unknown handler" means the route is wrong, not
+      // that the server is missing, and mistranslating sends the caller to fix
+      // the wrong thing.
+      api.configPost.mockResolvedValue(err(400, "loading handler module: unknown handler 'reverse_prox'"));
+
+      const result = await handler({ from: "app.local", to: ["localhost:3000"], server: "srv0" });
+
+      expect(result.isError).toBe(true);
+      expect(result.content[0].text).toContain("unknown handler 'reverse_prox'");
+      expect(result.content[0].text).not.toContain("does not exist. Use caddy_list_servers");
+    });
+
+    it("replaces in place via PATCH when @id resolves to an existing route", async () => {
       // GET /id/<id> returns a route-shaped object (top-level handle array)
-      // -> tool PUTs the new body in place. No POST, no clobber check fires.
+      // -> tool PATCHes the new body in place. No POST, no clobber check fires.
       api.configByIdGet.mockResolvedValue(
         ok({
           "@id": "my-api-route",
@@ -134,7 +174,9 @@ describe("tool handler behavior", () => {
           handle: [{ handler: "reverse_proxy", upstreams: [{ dial: "localhost:3000" }] }],
           terminal: true,
         },
-        "PUT",
+        // PATCH, not PUT: /id/<id> resolves to an array position, where PUT
+        // inserts a duplicate and Caddy rejects the config with "duplicate ID".
+        "PATCH",
       );
       expect(result.content[0].text).toContain('Route set @id="my-api-route"');
     });
@@ -364,6 +406,21 @@ describe("tool handler behavior", () => {
       expect(result.isError).toBe(true);
       expect(result.content[0].text).toContain('Server "missing" does not exist');
     });
+
+    it("surfaces an ordinary validation failure verbatim, NOT as server-not-found", async () => {
+      api.configPost.mockResolvedValue(err(400, "invalid matcher: unrecognized field 'hosts'"));
+
+      const result = await handler({
+        match: [{ hosts: ["x.local"] }],
+        handle: [{ handler: "file_server" }],
+        server: "srv0",
+        terminal: true,
+      });
+
+      expect(result.isError).toBe(true);
+      expect(result.content[0].text).toContain("unrecognized field 'hosts'");
+      expect(result.content[0].text).not.toContain("does not exist. Use caddy_list_servers");
+    });
   });
 
   // ─── caddy_list_routes ────────────────────────────────────────────────
@@ -451,6 +508,165 @@ describe("tool handler behavior", () => {
       const result = await handler({ server: "srv0" });
 
       expect(result.content[0].text).toContain("no routes configured");
+    });
+
+    it("attaches the raw JSON block in full when it is under the cap", async () => {
+      api.configGet.mockResolvedValue(
+        ok({ listen: [":443"], routes: [{ match: [{ host: ["a.local"] }], handle: [{ handler: "encode" }] }] }),
+      );
+
+      const result = await handler({ server: "srv0" });
+
+      expect(result.content).toHaveLength(2);
+      expect(result.content[1].text).not.toContain("truncated");
+      expect(() => JSON.parse(result.content[1].text)).not.toThrow();
+    });
+
+    function bulkRoutes(n: number) {
+      return Array.from({ length: n }, (_, i) => ({
+        match: [{ host: [`host-${i}.example.com`] }],
+        handle: [{ handler: "reverse_proxy", upstreams: [{ dial: `10.0.0.${i % 255}:8080` }] }],
+        terminal: true,
+      }));
+    }
+
+    it("truncates the JSON block on whole-route boundaries so it still parses", async () => {
+      // Regression: a character-level slice left the block invalid JSON, which
+      // broke any caller that parsed it. Truncation must cut between routes.
+      const many = bulkRoutes(400);
+      api.configGet.mockResolvedValue(ok({ listen: [":443"], routes: many }));
+
+      const result = await handler({ server: "srv0" });
+      const json = result.content[1].text;
+
+      const parsed = JSON.parse(json);
+      expect(Array.isArray(parsed)).toBe(true);
+      expect(parsed.length).toBeGreaterThan(0);
+      expect(parsed.length).toBeLessThan(many.length);
+      // Whole routes, not fragments.
+      expect(parsed[0]).toEqual(many[0]);
+      expect(parsed[parsed.length - 1]).toEqual(many[parsed.length - 1]);
+      expect(json.length).toBeLessThanOrEqual(20000);
+    });
+
+    it("emits the truncation note in its own block, leaving the JSON block clean", async () => {
+      const many = bulkRoutes(400);
+      api.configGet.mockResolvedValue(ok({ listen: [":443"], routes: many }));
+
+      const result = await handler({ server: "srv0" });
+
+      expect(result.content).toHaveLength(3);
+      expect(() => JSON.parse(result.content[1].text)).not.toThrow();
+      const note = result.content[2].text;
+      expect(note).toContain("of 400 routes");
+      expect(note).toContain("caddy_config_get");
+      expect(note).toContain("apps/http/servers/srv0/routes");
+    });
+
+    it("omits the note block entirely when nothing was truncated", async () => {
+      api.configGet.mockResolvedValue(ok({ listen: [":443"], routes: bulkRoutes(2) }));
+
+      const result = await handler({ server: "srv0" });
+
+      expect(result.content).toHaveLength(2);
+      expect(JSON.parse(result.content[1].text)).toHaveLength(2);
+    });
+
+    it("keeps the first route even when it alone exceeds the JSON cap", async () => {
+      const huge = [
+        { match: [{ host: ["big.local"] }], handle: [{ handler: "static_response", body: "x".repeat(40000) }] },
+      ];
+      api.configGet.mockResolvedValue(ok({ listen: [":443"], routes: huge }));
+
+      const result = await handler({ server: "srv0" });
+
+      // One oversized entry beats an empty array, and it must still parse.
+      expect(JSON.parse(result.content[1].text)).toHaveLength(1);
+      expect(result.content).toHaveLength(2);
+    });
+
+    it("caps the summary at 500 routes and says how many were omitted", async () => {
+      api.configGet.mockResolvedValue(ok({ listen: [":443"], routes: bulkRoutes(640) }));
+
+      const result = await handler({ server: "srv0" });
+      const summary = result.content[0].text;
+
+      expect(summary).toContain("Route 0:");
+      expect(summary).toContain("Route 499:");
+      expect(summary).not.toContain("Route 500:");
+      expect(summary).toContain("140 more route(s) not shown");
+    });
+  });
+
+  // ─── caddy_config_get ─────────────────────────────────────────────────
+
+  describe("caddy_config_get", () => {
+    let handler: (...args: any[]) => Promise<any>;
+
+    beforeEach(async () => {
+      const mockServer = { tool: vi.fn(), resource: vi.fn() };
+      const { registerConfigTools } = await import("../tools/config.js");
+      registerConfigTools(mockServer as any);
+      handler = getToolHandler(mockServer, "caddy_config_get");
+    });
+
+    it("passes the requested path straight through", async () => {
+      api.configGet.mockResolvedValue(ok({ listen: [":443"] }));
+
+      const result = await handler({ path: "apps/http/servers/srv0" });
+
+      expect(api.configGet).toHaveBeenCalledWith("apps/http/servers/srv0");
+      expect(result.isError).toBeFalsy();
+      expect(result.content[0].text).toContain(":443");
+    });
+
+    it("reads the whole config when path is the empty default", async () => {
+      api.configGet.mockResolvedValue(ok({ apps: {} }));
+
+      await handler({ path: "" });
+
+      expect(api.configGet).toHaveBeenCalledWith("");
+    });
+
+    it("surfaces a read failure as a tool error", async () => {
+      api.configGet.mockResolvedValue(err(0, "Cannot connect to Caddy admin API"));
+
+      const result = await handler({ path: "" });
+
+      expect(result.isError).toBe(true);
+      expect(result.content[0].text).toContain("Cannot connect");
+    });
+  });
+
+  // ─── caddy_upstreams ──────────────────────────────────────────────────
+
+  describe("caddy_upstreams", () => {
+    let handler: (...args: any[]) => Promise<any>;
+
+    beforeEach(async () => {
+      const mockServer = { tool: vi.fn(), resource: vi.fn() };
+      const { registerOperationalTools } = await import("../tools/operational.js");
+      registerOperationalTools(mockServer as any);
+      handler = getToolHandler(mockServer, "caddy_upstreams");
+    });
+
+    it("returns upstream health from the api", async () => {
+      api.getUpstreams.mockResolvedValue(ok([{ address: "localhost:3000", num_requests: 2, fails: 0 }]));
+
+      const result = await handler({});
+
+      expect(api.getUpstreams).toHaveBeenCalled();
+      expect(result.isError).toBeFalsy();
+      expect(result.content[0].text).toContain("localhost:3000");
+    });
+
+    it("surfaces a failure as a tool error", async () => {
+      api.getUpstreams.mockResolvedValue(err(500, "upstream probe failed"));
+
+      const result = await handler({});
+
+      expect(result.isError).toBe(true);
+      expect(result.content[0].text).toContain("upstream probe failed");
     });
   });
 
@@ -741,6 +957,19 @@ describe("tool handler behavior", () => {
       expect(api.configPut).not.toHaveBeenCalled();
       expect(result.isError).toBe(true);
       expect(result.content[0].text).toContain("issuers");
+    });
+
+    it("PATCH fails + policies[0] is non-object -> refuses with shape-specific error", async () => {
+      // The one shape variant the sibling refusal tests miss.
+      api.configPatch.mockResolvedValue(err(500, "key does not exist"));
+      api.configGet.mockResolvedValue(ok({ automation: { policies: ["not-an-object"] } }));
+
+      const result = await handler({ action: "set_email", email: "test@example.com" });
+
+      expect(api.configPost).not.toHaveBeenCalled();
+      expect(api.configPut).not.toHaveBeenCalled();
+      expect(result.isError).toBe(true);
+      expect(result.content[0].text).toContain("policies[0] is not an object");
     });
 
     it("PATCH fails + issuers[0] is non-object -> refuses with shape-specific error", async () => {
@@ -1046,6 +1275,28 @@ describe("tool handler behavior", () => {
 
       expect(result.content[0].text).toContain("No HTTP servers configured");
     });
+
+    it("renders a malformed server entry instead of throwing", async () => {
+      // The GET body is raw admin-API JSON, not a validated shape. A null or
+      // primitive server entry must degrade to the empty-config rendering.
+      api.configGet.mockResolvedValue(
+        ok({
+          good: { listen: [":443"], routes: [{}] },
+          broken: null,
+          alsoBroken: "not-a-server",
+          arrayish: [],
+        }),
+      );
+
+      const result = await handler({});
+      const text = result.content[0].text;
+
+      expect(result.isError).toBeFalsy();
+      expect(text).toContain("good: 1 route(s), listen: :443");
+      expect(text).toContain("broken: 0 route(s), listen: default");
+      expect(text).toContain("alsoBroken: 0 route(s), listen: default");
+      expect(text).toContain("arrayish: 0 route(s), listen: default");
+    });
   });
 
   // ─── caddy_metrics ────────────────────────────────────────────────────
@@ -1220,6 +1471,27 @@ describe("tool handler behavior", () => {
       expect(eofCount).toBe(1);
     });
 
+    it("drops blank lines and free-form comments when filtering", async () => {
+      // metricNameFromLine returns undefined for these, so they can never match
+      // a filter -- pinning that they're dropped rather than silently kept.
+      const body = ["", "# a free-form note", "   ", "# HELP foo c", "foo 1", "bar 2"].join("\n");
+      api.getMetrics.mockResolvedValue(ok(body));
+
+      const lines = (await handler({ filter: "foo" })).content[0].text.split("\n");
+
+      expect(lines).toEqual(["# HELP foo c", "foo 1"]);
+    });
+
+    it("stringifies a non-string metrics body", async () => {
+      // /metrics is text, but a proxy returning JSON would make data an object.
+      api.getMetrics.mockResolvedValue(ok({ unexpected: "json" }));
+
+      const result = await handler({});
+
+      expect(result.isError).toBeFalsy();
+      expect(result.content[0].text).toContain("object");
+    });
+
     it("does not invent a `# EOF` when input had none", async () => {
       const body = ["a 1", "a 2", "a 3", "a 4"].join("\n");
       api.getMetrics.mockResolvedValue(ok(body));
@@ -1285,11 +1557,22 @@ describe("tool handler behavior", () => {
       handler = getToolHandler(mockServer, "caddy_load");
     });
 
+    it("refuses to replace the running config without confirm=true", async () => {
+      // caddy_load discards every server and route absent from the supplied
+      // config -- the same gate every other destructive tool here carries.
+      const result = await handler({ config: { apps: {} }, format: "json" });
+
+      expect(result.isError).toBe(true);
+      expect(result.content[0].text).toContain("confirm=true");
+      expect(api.loadConfig).not.toHaveBeenCalled();
+      expect(api.configGet).not.toHaveBeenCalled();
+    });
+
     it("sends JSON content type by default", async () => {
       api.configGet.mockResolvedValue(ok({ apps: { http: {} } }));
       api.loadConfig.mockResolvedValue(ok());
 
-      await handler({ config: { apps: {} }, format: "json" });
+      await handler({ config: { apps: {} }, format: "json", confirm: true });
 
       expect(api.loadConfig).toHaveBeenCalledWith({ apps: {} }, "application/json");
     });
@@ -1298,7 +1581,7 @@ describe("tool handler behavior", () => {
       api.configGet.mockResolvedValue(ok({ apps: { http: {} } }));
       api.loadConfig.mockResolvedValue(ok());
 
-      await handler({ config: "example.com { }", format: "caddyfile" });
+      await handler({ config: "example.com { }", format: "caddyfile", confirm: true });
 
       expect(api.loadConfig).toHaveBeenCalledWith("example.com { }", "text/caddyfile");
     });
@@ -1307,7 +1590,7 @@ describe("tool handler behavior", () => {
       api.configGet.mockResolvedValue(ok({ apps: { http: {} } }));
       api.loadConfig.mockResolvedValue(ok());
 
-      const result = await handler({ config: { apps: {} }, format: "json" });
+      const result = await handler({ config: { apps: {} }, format: "json", confirm: true });
 
       expect(result.isError).toBeFalsy();
       expect(result.content[0].text).toBeDefined();
@@ -1318,7 +1601,7 @@ describe("tool handler behavior", () => {
       api.configGet.mockResolvedValue(ok(prior));
       api.loadConfig.mockResolvedValue(ok());
 
-      await handler({ config: { apps: {} }, format: "json" });
+      await handler({ config: { apps: {} }, format: "json", confirm: true });
 
       const { listSnapshots } = await import("../snapshots.js");
       const snaps = listSnapshots();
@@ -1331,7 +1614,7 @@ describe("tool handler behavior", () => {
       api.configGet.mockResolvedValue(err(500, "down"));
       api.loadConfig.mockResolvedValue(ok());
 
-      await handler({ config: { apps: {} }, format: "json" });
+      await handler({ config: { apps: {} }, format: "json", confirm: true });
 
       const { listSnapshots } = await import("../snapshots.js");
       expect(listSnapshots()).toHaveLength(0);
@@ -1344,7 +1627,7 @@ describe("tool handler behavior", () => {
       for (const bogus of ["", "raw-text", null, [], 42]) {
         api.configGet.mockResolvedValueOnce(ok(bogus));
         api.loadConfig.mockResolvedValueOnce(ok());
-        await handler({ config: { apps: {} }, format: "json" });
+        await handler({ config: { apps: {} }, format: "json", confirm: true });
         expect(listSnapshots()).toHaveLength(0);
       }
     });
@@ -1358,7 +1641,7 @@ describe("tool handler behavior", () => {
       api.configGet.mockResolvedValue(ok(prior));
       api.loadConfig.mockResolvedValue(err(500, "config invalid"));
 
-      const result = await handler({ config: { apps: {} }, format: "json" });
+      const result = await handler({ config: { apps: {} }, format: "json", confirm: true });
 
       expect(result.isError).toBe(true);
       const { listSnapshots } = await import("../snapshots.js");
@@ -1383,6 +1666,46 @@ describe("tool handler behavior", () => {
     it("list returns 'no snapshots' when empty", async () => {
       const result = await handler({ action: "list", index: 0, confirm: false });
       expect(result.content[0].text).toContain("No snapshots");
+    });
+
+    it("list renders index, ISO timestamp, trigger, and size for each snapshot", async () => {
+      // This is the output an operator reads to pick a rollback target -- a
+      // wrong index or ordering means reverting production to the wrong config.
+      const { saveSnapshot } = await import("../snapshots.js");
+      saveSnapshot({ apps: { oldest: true } }, "caddy_load");
+      saveSnapshot({ apps: { newest: true } }, "manual");
+
+      const result = await handler({ action: "list", index: 0, confirm: false });
+      const lines = result.content[0].text.split("\n");
+
+      expect(lines[0]).toBe("Snapshots:");
+      // Newest first: index 0 is the most recent save.
+      expect(lines[1]).toContain("[0]");
+      expect(lines[1]).toContain("trigger=manual");
+      expect(lines[2]).toContain("[1]");
+      expect(lines[2]).toContain("trigger=caddy_load");
+      // Timestamp is ISO-8601 and size is the serialized byte length.
+      expect(lines[1]).toMatch(/\[0\] \d{4}-\d{2}-\d{2}T[\d:.]+Z /);
+      expect(lines[1]).toContain(`size=${JSON.stringify({ apps: { newest: true } }).length}B`);
+    });
+
+    it("list index ordering matches what apply resolves", async () => {
+      // The listed index must be the same index `apply` takes, or an operator
+      // reading the list reverts to a different config than the one shown.
+      const { saveSnapshot } = await import("../snapshots.js");
+      const older = { apps: { generation: 1 } };
+      const newer = { apps: { generation: 2 } };
+      saveSnapshot(older, "caddy_load");
+      saveSnapshot(newer, "manual");
+
+      const listed = await handler({ action: "list", index: 0, confirm: false });
+      expect(listed.content[0].text.split("\n")[2]).toContain("[1]");
+
+      api.configGet.mockResolvedValue(ok({ apps: { current: true } }));
+      api.loadConfig.mockResolvedValue(ok());
+      await handler({ action: "apply", index: 1, confirm: true });
+
+      expect(api.loadConfig).toHaveBeenCalledWith(older, "application/json");
     });
 
     it("save captures current config as a snapshot", async () => {
@@ -1558,6 +1881,22 @@ describe("tool handler behavior", () => {
       expect(result.isError).toBe(true);
       expect(result.content[0].text).toContain("not found");
     });
+
+    it('renders a null body as the literal "null"', async () => {
+      // Caddy returns null for an empty config, so caddy_config_get against a
+      // fresh instance lands here. Pinning current behavior: "null" (a truthy
+      // string) wins over the "OK" fallback.
+      const { formatResult } = await import("../format.js");
+      const result = formatResult({ ok: true, status: 200, data: null });
+      expect(result.content[0].text).toBe("null");
+    });
+
+    it("falls back to the status code when a failed response carries no error text", async () => {
+      const { formatResult } = await import("../format.js");
+      const result = formatResult({ ok: false, status: 503 });
+      expect(result.isError).toBe(true);
+      expect(result.content[0].text).toBe("Error: HTTP 503");
+    });
   });
 
   // ─── caddy_add_route (happy path) ─────────────────────────────────────
@@ -1705,6 +2044,35 @@ describe("tool handler behavior", () => {
       expect(result.isError).toBe(true);
       expect(result.content[0].text).toContain("id-delete-failed");
     });
+
+    it("surfaces the api error when the index-path delete fails after bounds-checking passes", async () => {
+      // Bounds checks are well covered; the delete itself failing is not. This
+      // stops a regression that reports "Route N removed" on a failed delete.
+      api.configGet.mockResolvedValue(
+        ok([
+          { match: [], handle: [] },
+          { match: [], handle: [] },
+        ]),
+      );
+      api.configDelete.mockResolvedValue(err(409, "config modified concurrently"));
+
+      const result = await handler({ index: 1, server: "srv0", confirm: true });
+
+      expect(api.configDelete).toHaveBeenCalledWith("apps/http/servers/srv0/routes/1");
+      expect(result.isError).toBe(true);
+      expect(result.content[0].text).toContain("config modified concurrently");
+      expect(result.content[0].text).not.toContain("removed from server");
+    });
+
+    it("surfaces a read failure before attempting any delete", async () => {
+      api.configGet.mockResolvedValue(err(0, "Cannot connect to Caddy admin API"));
+
+      const result = await handler({ index: 0, server: "srv0", confirm: true });
+
+      expect(api.configDelete).not.toHaveBeenCalled();
+      expect(result.isError).toBe(true);
+      expect(result.content[0].text).toContain("Cannot connect");
+    });
   });
 
   // ─── caddy_list_routes handler-formatter branches ────────────────────
@@ -1717,6 +2085,68 @@ describe("tool handler behavior", () => {
       const { registerRouteTools } = await import("../tools/routes.js");
       registerRouteTools(mockServer as any);
       handler = getToolHandler(mockServer, "caddy_list_routes");
+    });
+
+    it("renders protocol, client_ip, query, header, expression, and not matchers", async () => {
+      // caddy_list_routes is how an operator inspects a live config; a matcher
+      // that renders wrong misrepresents what the route actually matches.
+      api.configGet.mockResolvedValue(
+        ok({
+          listen: [":443"],
+          routes: [
+            {
+              match: [
+                {
+                  protocol: "grpc",
+                  client_ip: { ranges: ["10.0.0.0/8", "192.168.0.0/16"] },
+                  query: { debug: ["1"] },
+                  header: { "X-Api-Key": ["secret"] },
+                  expression: "{http.request.uri.path}.startsWith('/v2')",
+                  not: [{ path: ["/health"] }],
+                },
+              ],
+              handle: [{ handler: "static_response", status_code: 200 }],
+            },
+          ],
+        }),
+      );
+
+      const text = (await handler({ server: "srv0" })).content[0].text;
+
+      expect(text).toContain("protocol=grpc");
+      expect(text).toContain("client_ip=[10.0.0.0/8,192.168.0.0/16]");
+      expect(text).toContain("query=...");
+      expect(text).toContain("header=...");
+      expect(text).toContain("expr({http.request.uri.path}.startsWith('/v2'))");
+      expect(text).toContain("not(...)");
+    });
+
+    it("falls back to a placeholder for a non-string expression and empty ip ranges", async () => {
+      api.configGet.mockResolvedValue(
+        ok({
+          listen: [":443"],
+          routes: [
+            {
+              match: [{ expression: { file: "matchers.cel" }, client_ip: {}, remote_ip: {} }],
+              handle: [{ handler: "encode" }],
+            },
+          ],
+        }),
+      );
+
+      const text = (await handler({ server: "srv0" })).content[0].text;
+
+      expect(text).toContain("expr(...)");
+      expect(text).toContain("client_ip=[...]");
+      expect(text).toContain("remote_ip=[...]");
+    });
+
+    it("renders a matcher object with no recognized keys as catch-all", async () => {
+      api.configGet.mockResolvedValue(
+        ok({ listen: [":443"], routes: [{ match: [{}], handle: [{ handler: "encode" }] }] }),
+      );
+
+      expect((await handler({ server: "srv0" })).content[0].text).toContain("catch-all");
     });
 
     it("renders authentication, error, encode, and headers handlers", async () => {
@@ -1775,6 +2205,34 @@ describe("tool handler behavior", () => {
       expect(result.content[1].text).toBe("OK (no output)");
     });
 
+    it("falls back on a warning object whose fields are the wrong type", async () => {
+      // Adapter modules are third-party; a warning with a numeric directive or
+      // an object message must still render rather than print [object Object].
+      api.adapt.mockResolvedValue(
+        ok({
+          result: { apps: {} },
+          warnings: [
+            { directive: 42, message: "numeric directive" },
+            { directive: "tls", message: { nested: "object message" } },
+          ],
+        }),
+      );
+
+      const text = (await handler({ config: "x", adapter: "caddyfile" })).content[0].text;
+
+      expect(text).toContain("unknown: numeric directive");
+      expect(text).toContain('tls: {"directive":"tls","message":{"nested":"object message"}}');
+    });
+
+    it("treats a non-array warnings field as no warnings", async () => {
+      api.adapt.mockResolvedValue(ok({ result: { apps: {} }, warnings: "not-an-array" }));
+
+      const result = await handler({ config: "x", adapter: "caddyfile" });
+
+      expect(result.content).toHaveLength(1);
+      expect(result.content[0].text).toContain('"apps"');
+    });
+
     it("renders a non-object warning entry via the unknown fallback", async () => {
       // formatWarning's defensive path: warnings array contains a primitive.
       api.adapt.mockResolvedValue(
@@ -1813,6 +2271,13 @@ describe("tool handler behavior", () => {
       api.configGet.mockResolvedValue(ok({}));
       const result = await handler({});
       expect(result.content[0].text).toContain("No HTTP servers configured");
+    });
+
+    it("does not throw when a server entry is null", async () => {
+      api.configGet.mockResolvedValue(ok({ apps: { http: { servers: { srv0: null } } } }));
+      const result = await handler({});
+      expect(result.isError).toBeFalsy();
+      expect(result.content[0].text).toContain('Server "srv0": 0 route(s)');
     });
   });
 
@@ -1890,6 +2355,31 @@ describe("tool handler behavior", () => {
       result = await handler();
       expect(result.contents[0].mimeType).toBe("text/plain");
       expect(result.contents[0].text).toMatch(/^Error: /);
+    });
+
+    it.each([
+      ["caddy-config", "configGet"],
+      ["caddy-upstreams", "getUpstreams"],
+      ["caddy-servers", "configGet"],
+    ])("%s: renders {} when the read succeeds with no body", async (resource, method) => {
+      // Caddy returns an empty body for an absent config subtree, so `data` is
+      // undefined -- the `?? {}` fallback keeps the resource valid JSON instead
+      // of emitting the string "undefined".
+      (api as any)[method].mockResolvedValueOnce(ok(undefined));
+      const handler = await getResourceHandler(resource);
+      const result = await handler();
+
+      expect(result.contents[0].mimeType).toBe("application/json");
+      expect(JSON.parse(result.contents[0].text)).toEqual({});
+    });
+
+    it("caddy://metrics: stringifies a non-string body", async () => {
+      api.getMetrics.mockResolvedValueOnce(ok({ unexpected: "json" }));
+      const handler = await getResourceHandler("caddy-metrics");
+      const result = await handler();
+
+      expect(result.contents[0].mimeType).toBe("text/plain");
+      expect(result.contents[0].text).toContain("object");
     });
 
     it("caddy://metrics: text/plain mimeType in both success and failure", async () => {

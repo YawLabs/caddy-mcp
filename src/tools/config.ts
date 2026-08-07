@@ -78,7 +78,7 @@ export function registerConfigTools(server: McpServer) {
 
   server.tool(
     "caddy_load",
-    "Replace the entire Caddy configuration atomically. Accepts a JSON config object, or a Caddyfile string with format='caddyfile'. This is the safest way to make large config changes. Has a 60-second timeout to allow for TLS provisioning.",
+    "Replace the entire Caddy configuration atomically. Accepts a JSON config object, or a Caddyfile string with format='caddyfile'. This is the safest way to make large config changes. Has a 60-second timeout to allow for TLS provisioning. Requires confirm=true: this DISCARDS the entire running config, including servers and routes not present in the supplied config. The prior config is snapshotted first and can be restored with caddy_revert.",
     {
       config: z
         .union([z.record(z.string(), z.any()), z.string()])
@@ -88,9 +88,27 @@ export function registerConfigTools(server: McpServer) {
         .optional()
         .default("json")
         .describe("Config format: 'json' (default) or 'caddyfile'"),
+      confirm: z
+        .boolean()
+        .optional()
+        .default(false)
+        .describe("Must be true to replace the running configuration (safety)"),
     },
     { readOnlyHint: false, destructiveHint: true, idempotentHint: true, openWorldHint: false },
-    async ({ config, format }) => {
+    async ({ config, format, confirm }) => {
+      // Every other destructive tool here gates on confirm; this one replaces
+      // ALL configuration, so it gets the same gate rather than the weakest one.
+      if (!confirm) {
+        return {
+          isError: true,
+          content: [
+            {
+              type: "text" as const,
+              text: "Refusing to replace the running configuration without confirm=true. caddy_load discards every server and route not present in the supplied config. Re-run with confirm:true to proceed (the prior config is snapshotted and restorable via caddy_revert).",
+            },
+          ],
+        };
+      }
       const contentType = format === "caddyfile" ? "text/caddyfile" : "application/json";
       // Capture the pre-load state but defer the snapshot push until AFTER the
       // load returns ok. Mirrors the deferral in caddy_revert apply: a failed
