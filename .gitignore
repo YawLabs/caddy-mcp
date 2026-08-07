@@ -2,6 +2,7 @@ node_modules/
 dist/
 *.tgz
 .claude/
-bin/
+bin/*
+!bin/caddy-mcp.mjs
 build-tmp/
 dist-release/

@@ -21,7 +21,7 @@
 // package-lock.json, src/, or node_modules, and it never runs `npm install`.
 
 import { execFileSync } from 'node:child_process';
-import { chmodSync, copyFileSync, mkdirSync, readFileSync, rmSync, statSync } from 'node:fs';
+import { chmodSync, copyFileSync, existsSync, mkdirSync, readFileSync, rmSync, statSync } from 'node:fs';
 import { dirname, join, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import esbuild from 'esbuild';
@@ -37,10 +37,27 @@ const { version } = pkg;
 // Binary name = the package's first `bin` command, so this script is
 // copy-paste generic across @yawlabs/* servers -- no per-repo rename.
 const binName = Object.keys(pkg.bin ?? {})[0] ?? pkg.name.split('/').pop();
-// Bundle the SOURCE behind the bin's dist entry (src/index.ts, src/server.ts,
-// src/runner.ts, ...) so this works regardless of the server's entry filename.
-const binEntry = Object.values(pkg.bin ?? {})[0] ?? pkg.main ?? 'dist/index.js';
-const srcEntry = binEntry.replace(/^\.\//, '').replace(/^dist\//, 'src/').replace(/\.[cm]?js$/, '.ts');
+// The CLI source entry, pinned rather than derived.
+//
+// This used to map from `bin`'s VALUE (dist/index.js -> src/index.ts). That
+// breaks silently the moment `bin` is repointed at the runtime launcher: the
+// mapping yields `bin/caddy-mcp.ts`, a file that does not exist. postgres-mcp
+// shipped exactly that breakage in its 0.9.0 and had to repair it afterwards.
+//
+// Deriving from `main` instead is not the answer here either -- `main` is
+// ./dist/server.js, the LIBRARY export, while the binary must embed the CLI
+// entry. A compiled standalone binary IS its runtime, so there is no launcher
+// to embed and nothing to select; it wants the server's own entry.
+//
+// Nothing about this file is generic enough to be worth guessing at, and this
+// script is a manual per-host step that neither `npm test` nor the release
+// flow exercises -- so a wrong guess stays invisible until someone builds a
+// binary. Pin it, and fail loudly if it moves.
+const srcEntry = 'src/index.ts';
+if (!existsSync(join(repoRoot, srcEntry))) {
+  console.error(`build-binary: source entry '${srcEntry}' does not exist -- update this constant`);
+  process.exit(1);
+}
 
 const platformDir = `${process.platform}-${process.arch}`;
 const binDir = join(repoRoot, 'bin', platformDir);
@@ -111,8 +128,27 @@ console.log(`bundle: ${fmtSize(bundlePath)}`);
 //     oam compiled binary   529 ms   57.53 MB
 //
 // oam precompiles the bundle to bytecode at compile time, which is where the
-// startup win comes from; `oam run` on loose source is SLOWER than node (853
-// vs 701 ms) and is deliberately not used anywhere in this repo.
+// compiled binary's startup win comes from.
+//
+// CORRECTION -- `oam run` is NOT slower than node here. An earlier revision of
+// this comment recorded 853 vs 701 ms and concluded `oam run` was deliberately
+// unused. That measurement timed the oam binary at
+// target/release/oam.exe, and the on-access virus scanner rescans a binary in a
+// build output directory on EVERY exec while node.exe is installed and long
+// since cached. `findOam()` still resolves that path, so anyone re-measuring
+// naively reproduces the artifact.
+//
+// Re-measured on windows-arm64, n=8 medians, `--version` against this repo's
+// dist/index.js, with the identical oam bytes copied out of target/ and exec'd
+// once to absorb the scan:
+//
+//     node dist/index.js                        386 ms
+//     oam run, binary from target/release       432 ms   1.12x  <- the artifact
+//     oam run, binary warmed elsewhere          367 ms   0.95x  <- the truth
+//
+// The sign flips. The scanner alone accounts for 1.18x on oam and nothing on
+// node. Near parity, slightly ahead -- and dogfooding our own runtime is how it
+// gets faster, so `oam run` IS used: bin/caddy-mcp.mjs prefers it at launch.
 const wantOam = process.env.CADDY_MCP_RUNTIME === 'oam';
 const oam = wantOam ? findOam({ require: true }) : null;
 console.log(
