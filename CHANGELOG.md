@@ -11,6 +11,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [2.1.0] — 2026-08-07
+
 ### Added
 - Runtime launcher at `bin/caddy-mcp.mjs`: the published `caddy-mcp` command now prefers the [oam](https://oamjs.org) runtime and falls back to Node. `CADDY_MCP_RUNTIME` selects (`auto` / `oam` / `node`) and `OAM_BIN` overrides discovery. Both paths were verified against the full MCP surface — handshake and all 18 tools — and behave identically. Unlike npmjs-mcp this server is not a zero-dependency bundle; oam resolves `@modelcontextprotocol/sdk` and `zod` from `node_modules` without complaint.
 
