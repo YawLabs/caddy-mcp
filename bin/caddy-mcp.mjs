@@ -77,6 +77,17 @@ function findOam() {
 
 /** Run the server in THIS process. The zero-overhead fallback. */
 async function runInProcess() {
+  // A server may gate its bootstrap on being the process ENTRY POINT --
+  // `import.meta.url === pathToFileURL(process.argv[1]).href` -- so that its own
+  // test file can import the module for unit tests without connecting a stdio
+  // transport. aws-mcp does exactly this. Importing the server here would leave
+  // argv[1] pointing at THIS launcher, the guard would read false, and the
+  // server would load but never serve: the MCP handshake just hangs.
+  //
+  // Point argv[1] at the server first, so the in-process path is
+  // indistinguishable from having executed the file directly. The spawn path
+  // needs no equivalent -- there argv[1] is already the server.
+  process.argv[1] = SERVER_ENTRY;
   await import(SERVER_URL.href);
 }
 
