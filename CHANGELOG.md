@@ -9,7 +9,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 > entries. See the [git tag list](https://github.com/YawLabs/caddy-mcp/tags)
 > and release notes for those versions.
 
-## [Unreleased]
+## [2.0.0] — 2026-08-07
 
 ### Changed
 

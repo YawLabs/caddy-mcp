@@ -1340,9 +1340,7 @@ describe("api", () => {
     it("getPkiCertificates appends /certificates to the CA path", async () => {
       // Segment order matters -- swapping it still returns 200 against a mock.
       expect((await capture((a) => a.getPkiCertificates())).pathname).toBe("/pki/ca/local/certificates");
-      expect((await capture((a) => a.getPkiCertificates("internal"))).pathname).toBe(
-        "/pki/ca/internal/certificates",
-      );
+      expect((await capture((a) => a.getPkiCertificates("internal"))).pathname).toBe("/pki/ca/internal/certificates");
     });
 
     it("adapt POSTs /adapt with a text/<adapter> content type", async () => {

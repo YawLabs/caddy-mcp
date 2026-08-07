@@ -105,12 +105,17 @@ if [ "$IS_CI" != "true" ] && [ "$CURRENT_VERSION" != "$VERSION" ]; then
     read -p "Continue? (y/N) " -n 1 -r
     echo
     [[ $REPLY =~ ^[Yy]$ ]] || { echo "Aborted."; exit 0; }
-  fi
-  
-  step 1 "Test and lint"
   else
+    # Belongs to the `[ -t 0 ]` test, not to the outer one. Previously this sat
+    # on the OUTER else, so a resume run (CURRENT_VERSION == VERSION) printed
+    # "Non-interactive shell" in an interactive terminal, and the `step 1`
+    # header was skipped even though the checks below still ran.
     info "Non-interactive shell -- proceeding without confirmation"
   fi
+fi
+
+# Runs on every path, including a resume, so the header always matches the work.
+step 1 "Test and lint"
 npm run build || fail "Build failed"
 npm run lint || fail "Lint failed"
 npm run typecheck || fail "Type check failed"
