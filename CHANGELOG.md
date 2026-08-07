@@ -9,6 +9,64 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 > entries. See the [git tag list](https://github.com/YawLabs/caddy-mcp/tags)
 > and release notes for those versions.
 
+## [Unreleased]
+
+### Changed
+
+- **BREAKING: `caddy_load` now requires `confirm=true`.** It replaces the
+  entire running configuration, discarding every server and route absent from
+  the supplied config, and was the only destructive tool without a
+  confirmation gate. Callers that omit `confirm` now receive a refusal instead
+  of a load. The prior config is still snapshotted first and is restorable via
+  `caddy_revert`.
+
+### Fixed
+
+- **The admin API rejected every request against a stock Caddy.** Node's global
+  `fetch` always sends `Sec-Fetch-Mode: cors`, which Caddy reads as a
+  browser-initiated cross-origin request; it then enforces its admin origin
+  allowlist, and with no `Origin` header the computed origin is `''`, which is
+  never allowed. Every tool returned
+  `{"error":"client is not allowed to access from origin ''"}`. Requests now
+  send an `Origin` matching `CADDY_ADMIN_URL`. `curl` and `node:http` send no
+  `Sec-Fetch-Mode` and were always allowed, which is why manual testing never
+  surfaced this. Verified against Caddy 2.11.4.
+- **`caddy_reverse_proxy` with an `id` duplicated the route instead of
+  replacing it.** `/id/<id>` resolves to a position in the routes array, where
+  `PUT` *inserts*; the second call appended a route carrying the same `@id` and
+  Caddy rejected the whole config with `indexing config: duplicate ID`. The
+  documented "repeat calls REPLACE in place (idempotent)" behavior now actually
+  holds, via `PATCH`.
+- **Transient-failure retries could duplicate an array element.** `PUT` at a
+  path ending in an array index is no longer retried, matching the existing
+  carve-out for non-idempotent `POST`.
+- **The root `/config/` ETag entry was never invalidated** by a descendant
+  write, so a later write to the config root sent a stale `If-Match` and
+  surfaced a spurious `HTTP 412`. The ancestor check built `/config//`, which
+  matched nothing.
+- **A bracket-less IPv6 host in `from` was mangled** — `::1` became `:` because
+  the final address group was treated as a port.
+- **`caddy_status` and `caddy_list_servers` threw** on a malformed server entry
+  (`null`, a string, an array) instead of rendering it.
+- **A whitespace-only or scheme-only `from`** produced a route whose host
+  matcher could never fire; it is now refused, and surrounding whitespace is
+  trimmed rather than baked into the matcher.
+- **`caddy_metrics`' description contradicted its behavior**, claiming filter
+  mode drops the `# EOF` marker when the marker is always preserved.
+- **`npm run build` failed.** tsup's bundled `rollup-plugin-dts` is built
+  against TypeScript 5.x and crashes on TypeScript 7 while emitting
+  declarations, which broke `prepublishOnly` and the release script.
+  Declarations now come from `tsc -p tsconfig.build.json`.
+
+### Added
+
+- `caddy_list_routes` output is now bounded: the summary caps at 500 routes and
+  the raw JSON block at 20000 characters, truncated on whole-route boundaries
+  so the block always parses. Both report how many routes were omitted.
+- Live-Caddy integration coverage for the `@id` round-trip, `PUT`-inserts-at-an-
+  array-index semantics, and the ETag 412 path. Run with
+  `CADDY_MCP_INTEGRATION=1` against a running Caddy.
+
 ## [1.2.7] — 2026-05-19
 
 ### Fixed
