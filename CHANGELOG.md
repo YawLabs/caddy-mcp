@@ -9,6 +9,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 > entries. See the [git tag list](https://github.com/YawLabs/caddy-mcp/tags)
 > and release notes for those versions.
 
+## [Unreleased]
+
+### Added
+- Runtime launcher at `bin/caddy-mcp.mjs`: the published `caddy-mcp` command now prefers the [oam](https://oamjs.org) runtime and falls back to Node. `CADDY_MCP_RUNTIME` selects (`auto` / `oam` / `node`) and `OAM_BIN` overrides discovery. Both paths were verified against the full MCP surface — handshake and all 18 tools — and behave identically. Unlike npmjs-mcp this server is not a zero-dependency bundle; oam resolves `@modelcontextprotocol/sdk` and `zod` from `node_modules` without complaint.
+
+### Changed
+- `bin` points at the launcher rather than `dist/index.js`. The fallback does **not** re-exec Node — npm has already started Node to run the launcher, so it is an in-process `import()` with no extra spawn for users without oam.
+- `.gitignore` excludes `bin/*` rather than `bin/`, so the launcher can be re-included with a negation. A directory-level exclusion cannot be undone by a negation for a file inside it — that trap shipped a broken `bin` in postgres-mcp, where the launcher was untracked and absent from every fresh clone.
+- `scripts/build-binary.mjs` pins the CLI source entry instead of deriving it from `bin`'s value. The old derivation would have produced `bin/caddy-mcp.ts` the moment `bin` moved to the launcher — the exact breakage postgres-mcp shipped in 0.9.0. Deriving from `main` is not the fix either, since `main` is the library export (`./dist/server.js`) while the binary needs the CLI entry.
+
+### Fixed
+- Corrected the benchmark note claiming `oam run` is slower than Node (853 vs 701 ms) and "deliberately not used". That measurement timed an oam binary inside `target/release` while a concurrent `cargo build` was replacing it. Re-measured against an installed oam, interleaved, n=12 medians: node 213 ms, oam 184 ms — **0.86x**. oam is ahead even here, where `dist/` resolves its dependencies from `node_modules`; on a zero-dependency bundle the gap is wider (npmjs-mcp: 167 → 112 ms, 0.67x).
+- `findOam()` prefers an installed oam (`~/.oam/bin`, `%LOCALAPPDATA%\oam\bin`) over a `target/` binary on PATH, resolves PATH hits to absolute paths, and flags `fromBuildTree` so timing-sensitive callers can warn. `$OAM_BIN` still wins outright — it is an instruction, not a hint.
+
 ## [2.0.0] — 2026-08-07
 
 ### Changed
