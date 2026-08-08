@@ -25,7 +25,10 @@ describe("release metadata", () => {
   it("server.json top-level version matches package.json", () => {
     const pkg = readJson("package.json");
     const server = readJson("server.json");
-    expect(server.version, `server.json version (${String(server.version)}) must match package.json version (${String(pkg.version)})`).toBe(pkg.version);
+    expect(
+      server.version,
+      `server.json version (${String(server.version)}) must match package.json version (${String(pkg.version)})`,
+    ).toBe(pkg.version);
   });
 
   it("server.json packages[].version all match package.json", () => {
@@ -34,7 +37,10 @@ describe("release metadata", () => {
     const packages = server.packages as Array<{ version: string; identifier?: string }> | undefined;
     expect(Array.isArray(packages) && packages.length > 0, "server.json must declare at least one package").toBe(true);
     for (const entry of packages ?? []) {
-      expect(entry.version, `server.json packages entry (${entry.identifier ?? "<unnamed>"}) version (${entry.version}) must match package.json version (${String(pkg.version)})`).toBe(pkg.version);
+      expect(
+        entry.version,
+        `server.json packages entry (${entry.identifier ?? "<unnamed>"}) version (${entry.version}) must match package.json version (${String(pkg.version)})`,
+      ).toBe(pkg.version);
     }
   });
 
@@ -46,8 +52,14 @@ describe("release metadata", () => {
     const server = readJson("server.json");
     // Both must be present, or the equality below passes vacuously when a
     // refactor drops both fields.
-    expect(typeof pkg.mcpName === "string" && (pkg.mcpName as string).length > 0, "package.json must declare a non-empty \`mcpName\`").toBe(true);
-    expect(typeof server.name === "string" && (server.name as string).length > 0, "server.json must declare a non-empty \`name\`").toBe(true);
+    expect(
+      typeof pkg.mcpName === "string" && (pkg.mcpName as string).length > 0,
+      "package.json must declare a non-empty `mcpName`",
+    ).toBe(true);
+    expect(
+      typeof server.name === "string" && (server.name as string).length > 0,
+      "server.json must declare a non-empty `name`",
+    ).toBe(true);
     expect(pkg.mcpName, "package.json mcpName must equal server.json name").toBe(server.name);
   });
 });
