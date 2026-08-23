@@ -31,15 +31,50 @@ describe.skipIf(!RUN)("integration: live Caddy admin API", () => {
    */
   const noAutoHttps = { automatic_https: { disable_redirects: true } };
 
+  /**
+   * Block until the admin endpoint answers again.
+   *
+   * Caddy restarts its admin listener on EVERY `POST /load` -- its own log
+   * emits "admin endpoint started" once per load, 34 times across a 24-load
+   * run. The listener is briefly unavailable while it rebinds, and a request
+   * landing in that window comes back as a connect error or a timeout.
+   *
+   * Retries do not paper over it: `POST /config/<path>` is deliberately NOT
+   * retryable (it appends, so a replay could duplicate a route), so exactly the
+   * calls this suite makes right after a load are the ones with no safety net.
+   * That is what made the suite fail 1-3 tests non-deterministically on Windows
+   * while every one of them passed in isolation.
+   *
+   * configGet is idempotent and self-retrying, which makes it the right probe.
+   */
+  async function waitForAdmin(timeoutMs = 10000): Promise<void> {
+    const deadline = Date.now() + timeoutMs;
+    for (;;) {
+      const probe = await api.configGet();
+      if (probe.ok) return;
+      if (Date.now() > deadline) {
+        throw new Error(`admin endpoint did not return after /load: ${probe.error}`);
+      }
+      await new Promise((r) => setTimeout(r, 25));
+    }
+  }
+
+  /** loadConfig, then wait for the restarted admin endpoint to accept requests. */
+  async function loadAndSettle(config: unknown, contentType?: string) {
+    const res = await api.loadConfig(config, contentType);
+    if (res.ok) await waitForAdmin();
+    return res;
+  }
+
   beforeEach(async () => {
     // Reset to empty config for a clean slate per test.
-    const res = await api.loadConfig({}, "application/json");
+    const res = await loadAndSettle({}, "application/json");
     if (!res.ok) throw new Error(`Reset failed: ${res.error}`);
   });
 
   it("loadConfig + configGet round-trip", async () => {
     const cfg = { apps: { http: { servers: { srv0: { listen: [":18881"], routes: [] } } } } };
-    const loadRes = await api.loadConfig(cfg);
+    const loadRes = await loadAndSettle(cfg);
     expect(loadRes.ok).toBe(true);
 
     const getRes = await api.configGet<typeof cfg>();
@@ -54,7 +89,7 @@ describe.skipIf(!RUN)("integration: live Caddy admin API", () => {
   });
 
   it("POSTs a reverse_proxy route and reads it back", async () => {
-    const loadRes = await api.loadConfig({
+    const loadRes = await loadAndSettle({
       apps: { http: { servers: { srv0: { listen: [":18883"], routes: [], ...noAutoHttps } } } },
     });
     assertOk(loadRes, "loadConfig");
@@ -74,7 +109,7 @@ describe.skipIf(!RUN)("integration: live Caddy admin API", () => {
   });
 
   it("DELETE removes a route by path", async () => {
-    const loadRes = await api.loadConfig({
+    const loadRes = await loadAndSettle({
       apps: {
         http: {
           servers: {
@@ -103,7 +138,7 @@ describe.skipIf(!RUN)("integration: live Caddy admin API", () => {
   });
 
   it("PATCH applies successfully after a fresh GET (ETag round-trip)", async () => {
-    await api.loadConfig({
+    await loadAndSettle({
       apps: { http: { servers: { srv0: { listen: [":18885"] } } } },
     });
 
@@ -115,7 +150,7 @@ describe.skipIf(!RUN)("integration: live Caddy admin API", () => {
   });
 
   it("returns 412 when ETag is stale (caught concurrent modification)", async () => {
-    await api.loadConfig({
+    await loadAndSettle({
       apps: { http: { servers: { srv0: { listen: [":18887"] } } } },
     });
 
@@ -156,7 +191,7 @@ describe.skipIf(!RUN)("integration: live Caddy admin API", () => {
   // If a future Caddy version regresses any of these contracts the tool's
   // "supply id for idempotent writes" promise breaks; this test catches it.
   it("@id round-trip: POST registers, GET resolves, PATCH replaces in place", async () => {
-    const loadRes = await api.loadConfig({
+    const loadRes = await loadAndSettle({
       apps: { http: { servers: { srv0: { listen: [":18891"], routes: [], ...noAutoHttps } } } },
     });
     assertOk(loadRes, "loadConfig empty server");
@@ -215,7 +250,7 @@ describe.skipIf(!RUN)("integration: live Caddy admin API", () => {
   // fails and the carve-out can be relaxed. If it starts failing the other way
   // (length 1), the carve-out was never needed.
   it("PUT at an array index inserts rather than replaces", async () => {
-    const loadRes = await api.loadConfig({
+    const loadRes = await loadAndSettle({
       apps: {
         http: {
           servers: {
@@ -262,7 +297,7 @@ describe.skipIf(!RUN)("integration: live Caddy admin API", () => {
   // fails and the fallback could be simplified; if PATCH ever starts requiring
   // something else, it fails the other way.
   it("PUT on an existing object key conflicts; PATCH replaces it", async () => {
-    const loadRes = await api.loadConfig({
+    const loadRes = await loadAndSettle({
       apps: {
         tls: { automation: { policies: [{ issuers: [{ module: "acme", email: "a@b.test" }] }] } },
         http: { servers: { srv0: { listen: [":18893"] } } },
@@ -292,7 +327,7 @@ describe.skipIf(!RUN)("integration: live Caddy admin API", () => {
   // set_acme_profile reaches the fallback on the normal path rather than as an
   // edge case.
   it("PATCH of an absent issuer sub-key 404s, sending set_acme_profile down the fallback", async () => {
-    const loadRes = await api.loadConfig({
+    const loadRes = await loadAndSettle({
       apps: {
         tls: { automation: { policies: [{ issuers: [{ module: "acme", email: "a@b.test" }] }] } },
         http: { servers: { srv0: { listen: [":18894"] } } },
@@ -311,7 +346,7 @@ describe.skipIf(!RUN)("integration: live Caddy admin API", () => {
   // character ...". Mocked tests cannot see this, which is how every
   // string-valued write shipped broken.
   it("writes a string value as JSON rather than a bare body", async () => {
-    const loadRes = await api.loadConfig({
+    const loadRes = await loadAndSettle({
       apps: {
         tls: { automation: { policies: [{ issuers: [{ module: "acme", email: "a@b.test" }] }] } },
         http: { servers: { srv0: { listen: [":18895"] } } },
@@ -336,7 +371,7 @@ describe.skipIf(!RUN)("integration: live Caddy admin API", () => {
   });
 
   it("configByIdGet + Delete works end-to-end", async () => {
-    const loadRes = await api.loadConfig({
+    const loadRes = await loadAndSettle({
       apps: {
         http: {
           servers: {
