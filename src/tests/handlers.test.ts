@@ -2500,6 +2500,84 @@ describe("tool handler behavior", () => {
       expect(snaps[0]?.config).toEqual({ good: true });
     });
 
+    // persist() sanitizes the trigger into the filename with [^\w-] -> "_", and
+    // hydrate() parses it back with ([\w-]+). If those two ever drift, snapshots
+    // write files that can never be read back -- silent loss of the rollback
+    // target, which is the one thing this feature exists to protect.
+    it.each([
+      ["caddy_load", "caddy_load"],
+      ["caddy_revert", "caddy_revert"],
+      ["manual", "manual"],
+      ["with spaces", "with_spaces"],
+      ["slash/and:colon", "slash_and_colon"],
+    ])("round-trips the trigger %s through the filename", async (trigger, expected) => {
+      const snapshots = await import("../snapshots.js");
+      snapshots.clearSnapshots();
+      snapshots.saveSnapshot({ a: 1 }, trigger);
+
+      vi.resetModules();
+      const restarted = await import("../snapshots.js");
+      const snaps = restarted.listSnapshots();
+      expect(snaps).toHaveLength(1);
+      expect(snaps[0]?.trigger).toBe(expected);
+    });
+
+    it("ignores files that are not snapshots", async () => {
+      // Pointing the dir at an existing or shared location is realistic.
+      const { writeFileSync } = await import("node:fs");
+      const { join } = await import("node:path");
+      const snapshots = await import("../snapshots.js");
+      snapshots.clearSnapshots();
+      snapshots.saveSnapshot({ real: true }, "manual");
+
+      writeFileSync(join(tmp as string, "notes.txt"), "hello", "utf-8");
+      writeFileSync(join(tmp as string, "config.json"), '{"not":"a snapshot"}', "utf-8");
+      writeFileSync(join(tmp as string, "snapshot-nope-manual.json"), "{}", "utf-8");
+
+      vi.resetModules();
+      const restarted = await import("../snapshots.js");
+      const snaps = restarted.listSnapshots();
+      expect(snaps).toHaveLength(1);
+      expect(snaps[0]?.config).toEqual({ real: true });
+    });
+
+    it("reads only the newest MAX_SNAPSHOTS when more files exist on disk", async () => {
+      // persist() prunes on write, but a directory can still hold more (older
+      // version, external population). This is the read-side bound.
+      const { writeFileSync } = await import("node:fs");
+      const { join } = await import("node:path");
+      for (let i = 0; i < 25; i++) {
+        // Fixed-width timestamps so the filename sort matches a numeric one.
+        writeFileSync(
+          join(tmp as string, `snapshot-17000000000${String(i).padStart(2, "0")}-manual.json`),
+          `{"i":${i}}`,
+          "utf-8",
+        );
+      }
+
+      vi.resetModules();
+      const snapshots = await import("../snapshots.js");
+      const snaps = snapshots.listSnapshots();
+      expect(snaps).toHaveLength(10);
+      // Newest first: i=24 down to i=15.
+      expect((snaps[0]?.config as { i: number }).i).toBe(24);
+      expect((snaps[9]?.config as { i: number }).i).toBe(15);
+    });
+
+    it("clearSnapshots empties the ring without repopulating from disk", async () => {
+      const snapshots = await import("../snapshots.js");
+      snapshots.clearSnapshots();
+      snapshots.saveSnapshot({ a: 1 }, "manual");
+      expect(snapshots.listSnapshots()).toHaveLength(1);
+
+      snapshots.clearSnapshots();
+      // The persisted file is still there, but a clear must stay cleared --
+      // a "clear" that refills itself on the next read would be the wrong
+      // reading of the name.
+      expect(snapshots.listSnapshots()).toHaveLength(0);
+      expect(snapshots.getSnapshot(0)).toBeUndefined();
+    });
+
     it("falls back to memory-only when the directory cannot be written", async () => {
       // A path whose parent is a FILE, so mkdirSync fails. The save must still
       // land in the in-memory ring.

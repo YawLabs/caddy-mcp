@@ -265,7 +265,7 @@ npm install
 npm run lint       # Biome check
 npm run lint:fix   # Auto-fix
 npm run build      # tsup bundle
-npm test           # Vitest (333 unit tests, +2 POSIX-only unix-socket tests; +9 live-Caddy integration tests gated by CADDY_MCP_INTEGRATION=1)
+npm test           # Vitest (348 unit tests, +9 POSIX-only unix-socket tests; +9 live-Caddy integration tests gated by CADDY_MCP_INTEGRATION=1)
 npm run typecheck  # tsc --noEmit
 ```
 

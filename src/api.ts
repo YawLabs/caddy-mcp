@@ -224,6 +224,22 @@ function isRetryableMethod(method: string, path: string): boolean {
   return !path.startsWith("/config/") && !path.startsWith("/id/");
 }
 
+/**
+ * A CADDY_ADMIN_URL that plainly means "unix socket" but does not parse as one.
+ *
+ * `unix:/run/caddy.sock` (one slash) and `unix://relative.sock` both fail both
+ * patterns above and would otherwise fall through to the TCP path, where fetch
+ * reports `Cannot connect to Caddy admin API at null` -- an error naming
+ * neither the socket nor the actual mistake. Matching on `unix:` / `unix/`
+ * rather than a bare `unix` prefix so a real host like `unix.example.com:2019`
+ * is not swept up.
+ */
+function getMalformedUnixUrl(): string | undefined {
+  const raw = (process.env.CADDY_ADMIN_URL || "").trim();
+  if (!raw || !/^unix[:/]/i.test(raw)) return undefined;
+  return getUnixSocketPath() === undefined ? raw : undefined;
+}
+
 async function caddyRequest<T = any>(
   method: string,
   path: string,
@@ -231,6 +247,20 @@ async function caddyRequest<T = any>(
   contentType?: string,
   timeout?: number,
 ): Promise<ApiResponse<T>> {
+  // Checked here rather than in attemptRequest so it bypasses the retry loop:
+  // this is a static configuration mistake, and status 0 would otherwise be
+  // treated as a transient failure and replayed.
+  const malformed = getMalformedUnixUrl();
+  if (malformed) {
+    return {
+      ok: false,
+      status: 0,
+      error:
+        `CADDY_ADMIN_URL="${malformed}" looks like a unix socket address but is not a recognized form. ` +
+        `Use "unix:///absolute/path.sock" (URL form) or "unix//absolute/path.sock" (Caddy's own spelling). ` +
+        `A single slash after "unix:", or a relative path, will not parse.`,
+    };
+  }
   const maxRetries = getMaxRetries();
   let attempt = 0;
   let res: ApiResponse<T> = await attemptRequest<T>(method, path, body, contentType, timeout);

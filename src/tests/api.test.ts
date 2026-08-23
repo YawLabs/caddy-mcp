@@ -1393,6 +1393,92 @@ describe("api", () => {
     });
   });
 
+  describe("403 origin rejection", () => {
+    // This branch is the whole reason requests work against a stock Caddy:
+    // Node's fetch always sends Sec-Fetch-Mode, which makes Caddy enforce its
+    // admin origin allowlist. When that still fails, this message is the only
+    // thing pointing the operator at the cause.
+    it("explains the admin origin allowlist on a 403 naming an origin", async () => {
+      const api = await import("../api.js");
+      globalThis.fetch = vi.fn(
+        async () => new Response(`{"error":"client is not allowed to access from origin ''"}`, { status: 403 }),
+      ) as any;
+
+      const res = await api.configGet();
+      expect(res.ok).toBe(false);
+      expect(res.status).toBe(403);
+      // Caddy's own body is preserved ahead of our explanation.
+      expect(res.error).toContain("not allowed to access from origin");
+      expect(res.error).toContain("CADDY_ADMIN_URL");
+      expect(res.error).toContain("admin.origins");
+    });
+
+    it("leaves an unrelated 403 body alone", async () => {
+      const api = await import("../api.js");
+      globalThis.fetch = vi.fn(async () => new Response("forbidden: bad token", { status: 403 })) as any;
+
+      const res = await api.configGet();
+      expect(res.error).toBe("forbidden: bad token");
+      expect(res.error).not.toContain("admin.origins");
+    });
+  });
+
+  describe("malformed unix socket URLs", () => {
+    // Both of these previously fell through to fetch and surfaced
+    // "Cannot connect to Caddy admin API at null", naming neither the socket
+    // nor the mistake.
+    it.each([
+      ["single slash after unix:", "unix:/run/caddy-admin.sock"],
+      ["relative path", "unix://relative.sock"],
+      ["bare scheme", "unix://"],
+    ])("rejects %s with actionable guidance and never hits fetch", async (_label, adminUrl) => {
+      const api = await import("../api.js");
+      process.env.CADDY_ADMIN_URL = adminUrl;
+      let fetchCalls = 0;
+      globalThis.fetch = vi.fn(async () => {
+        fetchCalls++;
+        return new Response("{}", { status: 200 });
+      }) as any;
+
+      const res = await api.configGet();
+      expect(res.ok).toBe(false);
+      expect(res.error).toContain("looks like a unix socket address");
+      expect(res.error).toContain("unix:///absolute/path.sock");
+      expect(fetchCalls).toBe(0);
+    });
+
+    it("does not retry a malformed URL despite status 0", async () => {
+      // status 0 is normally treated as a transient failure and replayed; a
+      // static config mistake must not burn the retry budget.
+      process.env.CADDY_MAX_RETRIES = "3";
+      process.env.CADDY_ADMIN_URL = "unix:/run/caddy-admin.sock";
+      const api = await import("../api.js");
+      let fetchCalls = 0;
+      globalThis.fetch = vi.fn(async () => {
+        fetchCalls++;
+        return new Response("{}", { status: 200 });
+      }) as any;
+
+      const res = await api.configGet();
+      expect(res.ok).toBe(false);
+      expect(fetchCalls).toBe(0);
+    });
+
+    it("does not mistake a real host starting with 'unix' for a socket", async () => {
+      process.env.CADDY_ADMIN_URL = "http://unix.example.com:2019";
+      const api = await import("../api.js");
+      let calledUrl = "";
+      globalThis.fetch = vi.fn(async (url: any) => {
+        calledUrl = url.toString();
+        return new Response("{}", { status: 200 });
+      }) as any;
+
+      const res = await api.configGet();
+      expect(res.ok).toBe(true);
+      expect(calledUrl).toContain("unix.example.com:2019");
+    });
+  });
+
   describe("unix socket admin endpoint", () => {
     // A missing socket path is the cheapest way to prove the request was routed
     // to node:http rather than fetch: the global fetch stub stays untouched and
@@ -1443,52 +1529,212 @@ describe("api", () => {
 
     // The real round-trip. AF_UNIX is a POSIX deployment concern and Windows
     // uses named pipes with different semantics, so it runs where it matters.
+    // The unix transport is the least-exercised code in this module, so these
+    // drive a REAL unix socket rather than a mock. AF_UNIX is a POSIX
+    // deployment concern and Caddy has no Windows named-pipe admin listener
+    // (its admin address parser only knows unix/unixgram/unixpacket and fd),
+    // so there is nothing to gain from a named-pipe variant here.
     describe.skipIf(process.platform === "win32")("against a live unix socket", () => {
-      it("completes a request and sends NO Origin or Sec-Fetch-Mode header", async () => {
+      interface Captured {
+        method?: string;
+        url?: string;
+        headers: Record<string, string | string[] | undefined>;
+        body: string;
+      }
+
+      /**
+       * Spin a unix-socket HTTP server that replies with `reply`, capturing the
+       * request. A `reply` returning null accepts the connection and never
+       * responds, which is what the timeout case needs.
+       */
+      async function withSocketServer(
+        reply: (req: Captured) => { status?: number; headers?: Record<string, string>; body?: string } | null,
+        run: (captured: Captured) => Promise<void>,
+      ) {
         const { createServer } = await import("node:http");
+        const { mkdtempSync, rmSync } = await import("node:fs");
         const { tmpdir } = await import("node:os");
         const { join } = await import("node:path");
-        const { unlinkSync, existsSync } = await import("node:fs");
 
-        const sockPath = join(tmpdir(), `caddy-mcp-test-${process.pid}.sock`);
-        if (existsSync(sockPath)) unlinkSync(sockPath);
+        // mkdtemp keeps the path short -- POSIX caps sun_path around 104 bytes.
+        const dir = mkdtempSync(join(tmpdir(), "cmcp-"));
+        const sockPath = join(dir, "s.sock");
+        const captured: Captured = { headers: {}, body: "" };
 
-        let seenOrigin: string | undefined = "unset";
-        let seenSecFetch: string | undefined = "unset";
         const srv = createServer((req, res) => {
-          seenOrigin = req.headers.origin;
-          seenSecFetch = req.headers["sec-fetch-mode"] as string | undefined;
-          res.setHeader("ETag", '"/config/ abc123"');
-          res.setHeader("Content-Type", "application/json");
-          res.end(JSON.stringify({ apps: { http: {} } }));
+          captured.method = req.method;
+          captured.url = req.url;
+          captured.headers = req.headers;
+          const chunks: Buffer[] = [];
+          req.on("data", (c: Buffer) => chunks.push(c));
+          req.on("end", () => {
+            captured.body = Buffer.concat(chunks).toString("utf8");
+            const r = reply(captured);
+            if (r === null) return; // hang deliberately -- the timeout case
+            for (const [k, v] of Object.entries(r.headers ?? {})) res.setHeader(k, v);
+            res.statusCode = r.status ?? 200;
+            res.end(r.body ?? "");
+          });
         });
         await new Promise<void>((ok) => srv.listen(sockPath, ok));
 
         try {
-          const api = await import("../api.js");
           process.env.CADDY_ADMIN_URL = `unix://${sockPath}`;
-          let fetchCalls = 0;
-          globalThis.fetch = vi.fn(async () => {
-            fetchCalls++;
-            return new Response("{}", { status: 200 });
-          }) as any;
-
-          const res = await api.configGet<{ apps?: unknown }>();
-          expect(res.ok).toBe(true);
-          expect(res.data?.apps).toBeDefined();
-          expect(fetchCalls).toBe(0);
-
-          // The security-relevant assertion. Caddy builds NO default origin
-          // allowlist for a unix admin listener, and only runs its origin check
-          // when the request carries Origin or Sec-Fetch-Mode -- so sending
-          // either would opt into a check against an empty list and 403.
-          expect(seenOrigin).toBeUndefined();
-          expect(seenSecFetch).toBeUndefined();
+          await run(captured);
         } finally {
           await new Promise<void>((ok) => srv.close(() => ok()));
-          if (existsSync(sockPath)) unlinkSync(sockPath);
+          rmSync(dir, { recursive: true, force: true });
         }
+      }
+
+      /** Fetch stub that fails loudly if the unix path ever falls through to TCP. */
+      function forbidFetch() {
+        globalThis.fetch = vi.fn(async () => {
+          throw new Error("fetch must not be used when CADDY_ADMIN_URL is a unix socket");
+        }) as any;
+      }
+
+      it("completes a GET and sends NO Origin or Sec-Fetch-Mode header", async () => {
+        await withSocketServer(
+          () => ({ headers: { ETag: '"/config/ abc123"' }, body: JSON.stringify({ apps: { http: {} } }) }),
+          async (captured) => {
+            const api = await import("../api.js");
+            forbidFetch();
+
+            const res = await api.configGet<{ apps?: unknown }>();
+            expect(res.ok).toBe(true);
+            expect(res.data?.apps).toBeDefined();
+
+            // The security-relevant assertion. Caddy builds NO default origin
+            // allowlist for a unix admin listener and only runs its origin
+            // check when the request carries Origin or Sec-Fetch-Mode -- so
+            // sending either opts into a check against an empty list and 403s.
+            expect(captured.headers.origin).toBeUndefined();
+            expect(captured.headers["sec-fetch-mode"]).toBeUndefined();
+          },
+        );
       });
+
+      it("sends a write request with its body and content type", async () => {
+        // Writes are the point of this server, and req.write() plus chunked
+        // encoding is a different path from the bodyless GET above.
+        await withSocketServer(
+          () => ({ status: 200, body: "" }),
+          async (captured) => {
+            const api = await import("../api.js");
+            forbidFetch();
+
+            const res = await api.configPost("apps/http/servers/srv0/routes", { handle: [{ handler: "static" }] });
+            expect(res.ok).toBe(true);
+            expect(captured.method).toBe("POST");
+            expect(captured.url).toBe("/config/apps/http/servers/srv0/routes");
+            expect(captured.headers["content-type"]).toBe("application/json");
+            expect(JSON.parse(captured.body)).toEqual({ handle: [{ handler: "static" }] });
+          },
+        );
+      });
+
+      it("still sends Authorization when CADDY_API_TOKEN is set", async () => {
+        // getHeaders returns early for the unix path; that early return sits
+        // AFTER the token block. If it ever moves up, auth silently vanishes
+        // on socket endpoints and only a user would notice.
+        await withSocketServer(
+          () => ({ body: "{}" }),
+          async (captured) => {
+            process.env.CADDY_API_TOKEN = "sock-token";
+            const api = await import("../api.js");
+            forbidFetch();
+
+            await api.configGet();
+            expect(captured.headers.authorization).toBe("Bearer sock-token");
+            expect(captured.headers.origin).toBeUndefined();
+          },
+        );
+      });
+
+      it("maps a non-2xx socket response to the same error shape as TCP", async () => {
+        // `ok` is hand-rolled here (status >= 200 && < 300) where the fetch
+        // path gets res.ok for free.
+        await withSocketServer(
+          () => ({ status: 404, body: "key does not exist" }),
+          async () => {
+            const api = await import("../api.js");
+            forbidFetch();
+
+            const res = await api.configGet("apps/http/servers/nope");
+            expect(res.ok).toBe(false);
+            expect(res.status).toBe(404);
+            expect(res.error).toBe("key does not exist");
+          },
+        );
+      });
+
+      it("returns an empty-body 2xx as ok with no data", async () => {
+        await withSocketServer(
+          () => ({ status: 200, body: "" }),
+          async () => {
+            const api = await import("../api.js");
+            forbidFetch();
+
+            const res = await api.configGet();
+            expect(res.ok).toBe(true);
+            expect(res.data).toBeUndefined();
+          },
+        );
+      });
+
+      it("explains enforce_origin, not CADDY_ADMIN_URL, on a 403 over a socket", async () => {
+        // The TCP advice ("point CADDY_ADMIN_URL at the allowed origin") is
+        // actively wrong here -- it would move the operator off the socket.
+        await withSocketServer(
+          () => ({ status: 403, body: `{"error":"client is not allowed to access from origin ''"}` }),
+          async () => {
+            const api = await import("../api.js");
+            forbidFetch();
+
+            const res = await api.configGet();
+            expect(res.status).toBe(403);
+            expect(res.error).toContain("enforce_origin");
+            expect(res.error).not.toContain("Set CADDY_ADMIN_URL to the exact origin");
+          },
+        );
+      });
+
+      it("captures an ETag and replays it as If-Match on the next write", async () => {
+        await withSocketServer(
+          (req) => (req.method === "GET" ? { headers: { ETag: '"/config/apps 1234"' }, body: "{}" } : { body: "" }),
+          async (captured) => {
+            const api = await import("../api.js");
+            forbidFetch();
+
+            await api.configGet("apps");
+            const res = await api.configPatch("apps", { http: {} });
+            expect(res.ok).toBe(true);
+            expect(captured.headers["if-match"]).toBe('"/config/apps 1234"');
+          },
+        );
+      });
+
+      it("times out on an absolute deadline rather than an inactivity timer", async () => {
+        // AbortSignal.timeout, not req.setTimeout. A server that accepts and
+        // never replies must still abort, and the AbortError must classify as
+        // a timeout rather than falling through to the generic transport case.
+        await withSocketServer(
+          () => null,
+          async () => {
+            process.env.CADDY_TIMEOUT = "150";
+            const api = await import("../api.js");
+            forbidFetch();
+            const started = Date.now();
+
+            const res = await api.configGet();
+            expect(res.ok).toBe(false);
+            expect(res.status).toBe(0);
+            expect(res.error).toContain("timed out after 150ms");
+            expect(Date.now() - started).toBeLessThan(5000);
+          },
+        );
+      }, 15000);
     });
   });
 });

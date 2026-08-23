@@ -53,6 +53,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- A `CADDY_ADMIN_URL` that plainly means "unix socket" but does not parse as one --
+  `unix:/run/caddy.sock` (a single slash) or `unix://relative.sock` -- used to fall
+  through to the TCP path and report `Cannot connect to Caddy admin API at null`,
+  naming neither the socket nor the mistake. It now fails immediately with the two
+  accepted spellings, and without burning the retry budget on what is a static
+  configuration error.
 - README reported "230 unit tests; +8 live-Caddy integration tests"; the actual counts
   are 313 and 9.
 - Documented that since Caddy 2.11.1, `SIGUSR1` reloads from the Caddyfile **only** if
