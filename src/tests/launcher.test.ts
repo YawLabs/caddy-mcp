@@ -138,8 +138,21 @@ describe.skipIf(!existsSync(DIST_CLI))("launcher: runtime selection", () => {
  * to the whole process group -- behavior this harness cannot drive.
  */
 describe.skipIf(isWin || !existsSync(DIST_CLI))("launcher: signal handling", () => {
+  /**
+   * Answering `--version` is MANDATORY for any stand-in oam.
+   *
+   * Before spawning, the launcher runs a synchronous `execFileSync(oam,
+   * ["--version"])` and requires >= OAM_MIN (0.9.0). A fake that ignores the
+   * probe does not merely fail the gate -- if it blocks, execFileSync blocks
+   * the launcher forever, and if it answers unparseably the launcher silently
+   * falls back to Node, so the test would measure the fallback path while
+   * appearing to exercise signal forwarding.
+   */
+  const VERSION_PROBE = ['if [ "$1" = "--version" ]; then echo "oam 0.9.0"; exit 0; fi'];
+
   const GRACEFUL = [
     "#!/bin/bash",
+    ...VERSION_PROBE,
     'cleanup() { echo "CHILD: cleanup ran" >&2; exit 0; }',
     "trap cleanup TERM INT",
     'echo "CHILD: up" >&2',
@@ -149,20 +162,39 @@ describe.skipIf(isWin || !existsSync(DIST_CLI))("launcher: signal handling", () 
 
   const WEDGED = [
     "#!/bin/bash",
+    ...VERSION_PROBE,
     "trap '' TERM INT",
     'echo "CHILD: up" >&2',
     "while true; do sleep 0.05; done",
     "",
   ].join("\n");
 
-  /** A stand-in oam that either shuts down cleanly on a signal or ignores it. */
-  function fakeOam(kind: "graceful" | "wedged"): string {
+  /** An oam that satisfies discovery but is older than the launcher's floor. */
+  const TOO_OLD = ["#!/bin/bash", 'echo "oam 0.8.9"', "exit 0", ""].join("\n");
+
+  function writeFake(body: string): string {
     const dir = mkdtempSync(join(tmpdir(), "caddy-mcp-fake-oam-"));
     const file = join(dir, "oam");
-    writeFileSync(file, kind === "graceful" ? GRACEFUL : WEDGED, "utf-8");
+    writeFileSync(file, body, "utf-8");
     chmodSync(file, 0o755);
     return file;
   }
+
+  /** A stand-in oam that either shuts down cleanly on a signal or ignores it. */
+  function fakeOam(kind: "graceful" | "wedged"): string {
+    return writeFake(kind === "graceful" ? GRACEFUL : WEDGED);
+  }
+
+  it("rejects an oam older than the supported floor", async () => {
+    // The version gate is the first subprocess the launcher runs, and it has to
+    // tell "too old" apart from "unreadable" -- they have different remedies.
+    const res = await runLauncher(["--version"], {
+      CADDY_MCP_RUNTIME: "oam",
+      OAM_BIN: writeFake(TOO_OLD),
+    });
+    expect(res.code).toBe(1);
+    expect(res.stderr).toContain("0.8.9");
+  }, 30000);
 
   /** Signal the launcher `count` times, starting once the child is up. */
   function runWithSignals(oam: string, count: number) {
