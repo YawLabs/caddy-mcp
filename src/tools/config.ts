@@ -2,16 +2,7 @@ import type { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { z } from "zod";
 import * as api from "../api.js";
 import { formatResult } from "../format.js";
-import { getSnapshot, listSnapshots, saveSnapshot } from "../snapshots.js";
-
-/**
- * A snapshot must be re-applyable via /load, which requires a JSON object root.
- * Strings, arrays, null, and primitives are not valid Caddy configs -- refuse
- * to capture them so a later `caddy_revert apply` can't replay garbage.
- */
-function isSnapshotableConfig(data: unknown): data is Record<string, unknown> {
-  return data !== null && typeof data === "object" && !Array.isArray(data);
-}
+import { getSnapshot, isSnapshotableConfig, listSnapshots, saveSnapshot } from "../snapshots.js";
 
 export function registerConfigTools(server: McpServer) {
   server.tool(
@@ -126,7 +117,10 @@ export function registerConfigTools(server: McpServer) {
 
   server.tool(
     "caddy_revert",
-    "Manage config snapshots for rollback. Snapshots are auto-captured before caddy_load and kept in-memory (last 10). Actions: 'list' shows snapshots with timestamps, 'save' manually captures the current config, 'apply' restores a snapshot (requires confirm=true).",
+    "Manage config snapshots for rollback. Snapshots are auto-captured before caddy_load (last 10). " +
+      "By default they live in memory only and are LOST when this server restarts -- set CADDY_MCP_SNAPSHOT_DIR " +
+      "to a writable directory to persist them across restarts (they contain full Caddy configs, so pick the location deliberately). " +
+      "Actions: 'list' shows snapshots with timestamps, 'save' manually captures the current config, 'apply' restores a snapshot (requires confirm=true).",
     {
       action: z.enum(["list", "save", "apply"]).describe("Action to perform"),
       index: z

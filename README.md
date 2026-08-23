@@ -78,11 +78,28 @@ That's it. Now ask your AI assistant:
 
 | Environment variable | Default | Description |
 |---|---|---|
-| `CADDY_ADMIN_URL` | `http://localhost:2019` | Caddy admin API URL. Set to `http://caddy:2019` inside Docker, or an https URL for remote admin. |
+| `CADDY_ADMIN_URL` | `http://localhost:2019` | Caddy admin API URL. Set to `http://caddy:2019` inside Docker, or an https URL for remote admin. Also accepts a unix socket, in either `unix:///var/run/caddy-admin.sock` or Caddy's own `unix//var/run/caddy-admin.sock` spelling — see below. |
 | `CADDY_API_TOKEN` | (none) | Optional Bearer token for authenticated admin endpoints. Only needed if you've configured Caddy with auth. |
+| `CADDY_MCP_SNAPSHOT_DIR` | (none) | Directory for persisting `caddy_revert` snapshots. Unset, snapshots live in memory only and are lost when this server restarts. Snapshots are full Caddy configs and can contain secrets, so the location is opt-in rather than defaulted. |
 | `CADDY_MAX_RETRIES` | `2` | Number of retries on transient failures (5xx, network errors). 4xx and 412 never retry. POSTs to `/config/*` and `/id/*` also skip retry (non-idempotent appends/creates -- retrying could duplicate routes or 409 a half-applied create). POSTs to `/load`, `/adapt`, `/stop` still retry. Hard-capped at 5; values above the cap log a one-time stderr notice so the clamp is visible. Set to `0` to disable. |
 | `CADDY_TIMEOUT` | `10000` | Timeout in ms for all admin API requests except `/load` (which uses `CADDY_LOAD_TIMEOUT`). Non-numeric, `<= 0`, or fractional values below 1ms fall back to the default. |
 | `CADDY_LOAD_TIMEOUT` | `60000` | Timeout in ms for the `/load` endpoint; raise for ACME-heavy bring-ups where provisioning many certificates can exceed the default. Non-numeric, `<= 0`, or fractional values below 1ms fall back to the default. |
+
+**Unix socket admin endpoints:**
+
+Caddy's recommended hardening is to move the admin API off a loopback port and
+onto a unix socket, where access is governed by filesystem permissions:
+
+```
+{
+  admin unix//var/run/caddy-admin.sock
+}
+```
+
+Point `CADDY_ADMIN_URL` at the same path (`unix:///var/run/caddy-admin.sock`)
+and requests are sent over the socket instead of TCP. The process running
+caddy-mcp needs read/write permission on the socket file. `CADDY_API_TOKEN`
+still applies if you have auth in front of the endpoint.
 
 **Alternate MCP clients:**
 
@@ -217,6 +234,17 @@ Browsable read-only data — MCP clients can fetch these directly without a tool
 - You have `admin.listen` or `admin.origins` restrictions set in your Caddy config, or you're missing an `Authorization` header.
 - Set `CADDY_API_TOKEN` in your MCP config env if Caddy expects a Bearer token.
 
+**`SIGUSR1` / `systemctl reload caddy` stops reloading the Caddyfile**
+
+- Expected, and not caused by a bug here. Since Caddy 2.11.1, `SIGUSR1` reloads
+  from the file on disk **only if the config has never been changed through the
+  admin API**. The first write from caddy-mcp (or any other API client) makes
+  Caddy consider the running config API-owned, and `SIGUSR1` becomes a no-op.
+- Pick one owner per instance. If the Caddyfile is the source of truth, use
+  caddy-mcp read-only tools (`caddy_status`, `caddy_list_routes`, `caddy_adapt`)
+  and reload from the file. If caddy-mcp owns the config, apply changes with
+  `caddy_load` instead of `SIGUSR1`.
+
 **Windows: MCP server doesn't start**
 
 - Use the `cmd /c npx ...` pattern from the Quick start section. Node 20+ can't spawn `.cmd` files directly.
@@ -224,7 +252,9 @@ Browsable read-only data — MCP clients can fetch these directly without a tool
 ## Requirements
 
 - Node.js 20+
-- Caddy 2.x with admin API enabled (default: `localhost:2019`)
+- Caddy 2.x with admin API enabled (default: `localhost:2019`). Verified against
+  Caddy 2.11.4; the `@id` write path relies on `PATCH` semantics that the live
+  integration suite pins per release.
 
 ## Contributing
 
@@ -235,7 +265,7 @@ npm install
 npm run lint       # Biome check
 npm run lint:fix   # Auto-fix
 npm run build      # tsup bundle
-npm test           # Vitest (230 unit tests; +8 live-Caddy integration tests gated by CADDY_MCP_INTEGRATION=1)
+npm test           # Vitest (357 unit tests, +9 POSIX-only unix-socket tests; +13 live-Caddy integration tests gated by CADDY_MCP_INTEGRATION=1)
 npm run typecheck  # tsc --noEmit
 ```
 

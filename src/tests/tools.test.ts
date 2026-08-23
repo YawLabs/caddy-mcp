@@ -550,7 +550,7 @@ describe("caddy-mcp tools", () => {
       expect(result.content[0].text).toContain("caddy_config_set");
     });
 
-    it("PUTs merged config when GET returns expected shape, preserving siblings", async () => {
+    it("PATCHes merged config when GET returns expected shape, preserving siblings", async () => {
       const handler = await getTlsHandler();
       const existing = {
         automation: {
@@ -559,23 +559,30 @@ describe("caddy-mcp tools", () => {
         },
       };
       const captured: { method?: string; body?: any } = {};
-      globalThis.fetch = vi.fn(async (_url: any, opts: any) => {
-        if (opts?.method === "PATCH") {
-          return new Response("patch-failed", { status: 500 });
-        }
+      // Dispatch on URL, not method, the way a real Caddy does: a PATCH of the
+      // issuer sub-path 404s when that key is absent, while a PATCH of the whole
+      // apps/tls object succeeds. Keying on method alone would fail the merge
+      // too, now that both writes are PATCHes.
+      globalThis.fetch = vi.fn(async (url: any, opts: any) => {
+        const path = new URL(url.toString()).pathname;
+        const isWholeTls = path === "/config/apps/tls";
         if (opts?.method === "GET") {
           return new Response(JSON.stringify(existing), { status: 200 });
         }
-        if (opts?.method === "PUT") {
-          captured.method = "PUT";
+        if (opts?.method === "PATCH" && !isWholeTls) {
+          return new Response("key does not exist", { status: 404 });
+        }
+        if (opts?.method === "PATCH" && isWholeTls) {
+          captured.method = "PATCH";
           captured.body = JSON.parse(opts.body);
           return new Response("", { status: 200 });
         }
-        return new Response("nope", { status: 500 });
+        // A PUT here would be the 409 bug -- fail loudly if one is ever sent.
+        return new Response(`unexpected ${opts?.method} ${path}`, { status: 500 });
       }) as any;
       const result = await handler({ action: "set_acme_ca", ca: "https://new.ca/dir" });
       expect(result.isError).toBeFalsy();
-      expect(captured.method).toBe("PUT");
+      expect(captured.method).toBe("PATCH");
       expect(captured.body.automation.on_demand).toEqual({ rate_limit: { interval: "10s" } });
       expect(captured.body.automation.policies[0].issuers[0]).toEqual({
         module: "acme",

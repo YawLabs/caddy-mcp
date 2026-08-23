@@ -1,3 +1,5 @@
+import { request as httpRequest } from "node:http";
+
 const DEFAULT_URL = "http://localhost:2019";
 const TIMEOUT = 10000;
 const RETRY_BASE_MS = 100;
@@ -75,6 +77,30 @@ function getBaseUrl(): string {
   return (process.env.CADDY_ADMIN_URL || DEFAULT_URL).replace(/\/+$/, "");
 }
 
+/**
+ * The unix socket path when CADDY_ADMIN_URL points at one, else undefined.
+ *
+ * Caddy's own hardening guidance is to move the admin endpoint onto a unix
+ * socket (`admin { listen unix//var/run/caddy-admin.sock }`), where access is
+ * governed by filesystem permissions instead of a loopback port. Node's global
+ * `fetch` cannot dial a unix socket at all, so those instances are unreachable
+ * without a separate transport -- see sendViaUnixSocket.
+ *
+ * Two spellings are accepted, because operators copy from both places:
+ *   - URL form:   unix:///var/run/caddy-admin.sock
+ *   - Caddy form: unix//var/run/caddy-admin.sock  (its network-address syntax,
+ *                 `<network>/<address>`, as written in the admin config)
+ */
+function getUnixSocketPath(): string | undefined {
+  const raw = (process.env.CADDY_ADMIN_URL || "").trim();
+  if (!raw) return undefined;
+  const urlForm = /^unix:\/\/(\/.*)$/.exec(raw);
+  if (urlForm) return urlForm[1];
+  const caddyForm = /^unix\/(\/.*)$/.exec(raw);
+  if (caddyForm) return caddyForm[1];
+  return undefined;
+}
+
 let warnedRetryClamp = false;
 function getMaxRetries(): number {
   const raw = process.env.CADDY_MAX_RETRIES;
@@ -101,11 +127,19 @@ function getAdminOrigin(): string | undefined {
   }
 }
 
-function getHeaders(contentType?: string): Record<string, string> {
+function getHeaders(contentType?: string, overUnixSocket = false): Record<string, string> {
   const headers: Record<string, string> = {};
   if (contentType) headers["Content-Type"] = contentType;
   const token = process.env.CADDY_API_TOKEN;
   if (token) headers.Authorization = `Bearer ${token}`;
+  // Over a unix socket, send NO Origin -- the opposite of the TCP case below.
+  // Caddy builds no default origin allowlist for a unix/fd admin listener (it
+  // reasons that browsers can't reach a unix socket, so DNS rebinding and
+  // cross-site requests don't apply), and it skips the Origin check entirely
+  // unless the request carries an Origin or Sec-Fetch-Mode header. Sending one
+  // opts us INTO a check against an empty allowlist, which always fails. The
+  // node:http transport lets us omit both headers, so we do.
+  if (overUnixSocket) return headers;
   // Node's global fetch ALWAYS sends `Sec-Fetch-Mode: cors`. Caddy's admin API
   // reads that as a browser-initiated cross-origin request and enforces its
   // Origin allowlist; with no Origin header the computed origin is "", which is
@@ -190,24 +224,128 @@ function isRetryableMethod(method: string, path: string): boolean {
   return !path.startsWith("/config/") && !path.startsWith("/id/");
 }
 
+/**
+ * A CADDY_ADMIN_URL that plainly means "unix socket" but does not parse as one.
+ *
+ * `unix:/run/caddy.sock` (one slash) and `unix://relative.sock` both fail both
+ * patterns above and would otherwise fall through to the TCP path, where fetch
+ * reports `Cannot connect to Caddy admin API at null` -- an error naming
+ * neither the socket nor the actual mistake. Matching on `unix:` / `unix/`
+ * rather than a bare `unix` prefix so a real host like `unix.example.com:2019`
+ * is not swept up.
+ */
+function getMalformedUnixUrl(): string | undefined {
+  const raw = (process.env.CADDY_ADMIN_URL || "").trim();
+  if (!raw || !/^unix[:/]/i.test(raw)) return undefined;
+  return getUnixSocketPath() === undefined ? raw : undefined;
+}
+
 async function caddyRequest<T = any>(
   method: string,
   path: string,
   body?: unknown,
   contentType?: string,
   timeout?: number,
+  rawStringBody = false,
 ): Promise<ApiResponse<T>> {
+  // Checked here rather than in attemptRequest so it bypasses the retry loop:
+  // this is a static configuration mistake, and status 0 would otherwise be
+  // treated as a transient failure and replayed.
+  const malformed = getMalformedUnixUrl();
+  if (malformed) {
+    return {
+      ok: false,
+      status: 0,
+      error:
+        `CADDY_ADMIN_URL="${malformed}" looks like a unix socket address but is not a recognized form. ` +
+        `Use "unix:///absolute/path.sock" (URL form) or "unix//absolute/path.sock" (Caddy's own spelling). ` +
+        `A single slash after "unix:", or a relative path, will not parse.`,
+    };
+  }
   const maxRetries = getMaxRetries();
   let attempt = 0;
-  let res: ApiResponse<T> = await attemptRequest<T>(method, path, body, contentType, timeout);
+  let res: ApiResponse<T> = await attemptRequest<T>(method, path, body, contentType, timeout, rawStringBody);
   while (isRetryableMethod(method, path) && isTransientFailure(res) && attempt < maxRetries) {
     attempt++;
     const backoff = Math.min(RETRY_BASE_MS * 2 ** (attempt - 1), RETRY_MAX_DELAY_MS);
     const delay = backoff + Math.random() * RETRY_MAX_JITTER_MS;
     await sleep(delay);
-    res = await attemptRequest<T>(method, path, body, contentType, timeout);
+    res = await attemptRequest<T>(method, path, body, contentType, timeout, rawStringBody);
   }
   return res;
+}
+
+/** The transport-agnostic shape both send paths reduce to. */
+interface RawResponse {
+  ok: boolean;
+  status: number;
+  text: string;
+  etag?: string;
+}
+
+/**
+ * Send one request over a unix socket via node:http.
+ *
+ * Errors reject rather than resolve, so attemptRequest's existing catch block
+ * does the classification for both transports. The timeout rejection carries
+ * the literal word "timeout" because that catch matches on it.
+ */
+function sendViaUnixSocket(
+  socketPath: string,
+  path: string,
+  method: string,
+  headers: Record<string, string>,
+  body: string | undefined,
+  timeoutMs: number,
+): Promise<RawResponse> {
+  return new Promise((resolve, reject) => {
+    // AbortSignal.timeout, not req.setTimeout: setTimeout is an INACTIVITY
+    // timer, so a response that trickles bytes steadily would never fire it,
+    // while the fetch path below aborts on an absolute deadline. Using the same
+    // signal here keeps CADDY_TIMEOUT / CADDY_LOAD_TIMEOUT meaning one thing on
+    // both transports. The resulting AbortError message contains "aborted",
+    // which attemptRequest's catch already classifies as a timeout.
+    const req = httpRequest({ socketPath, path, method, headers, signal: AbortSignal.timeout(timeoutMs) }, (res) => {
+      const chunks: Buffer[] = [];
+      res.on("data", (chunk: Buffer) => chunks.push(chunk));
+      res.on("error", reject);
+      res.on("end", () => {
+        const status = res.statusCode ?? 0;
+        const etag = res.headers.etag;
+        resolve({
+          ok: status >= 200 && status < 300,
+          status,
+          text: Buffer.concat(chunks).toString("utf8"),
+          etag: typeof etag === "string" ? etag : undefined,
+        });
+      });
+    });
+    req.on("error", reject);
+    if (body !== undefined) req.write(body);
+    req.end();
+  });
+}
+
+/** Send one request over TCP via the global fetch. */
+async function sendViaFetch(
+  url: string,
+  method: string,
+  headers: Record<string, string>,
+  body: string | undefined,
+  timeoutMs: number,
+): Promise<RawResponse> {
+  const res = await fetch(url, {
+    method,
+    headers,
+    body,
+    signal: AbortSignal.timeout(timeoutMs),
+  });
+  return {
+    ok: res.ok,
+    status: res.status,
+    text: await res.text(),
+    etag: res.headers.get("ETag") || undefined,
+  };
 }
 
 async function attemptRequest<T = any>(
@@ -216,12 +354,14 @@ async function attemptRequest<T = any>(
   body?: unknown,
   contentType?: string,
   timeout?: number,
+  rawStringBody = false,
 ): Promise<ApiResponse<T>> {
+  const socketPath = getUnixSocketPath();
   const url = `${getBaseUrl()}${path}`;
   const effectiveTimeout = timeout ?? getRequestTimeout();
   try {
     const hasBody = body !== undefined;
-    const headers = getHeaders(hasBody ? contentType || "application/json" : undefined);
+    const headers = getHeaders(hasBody ? contentType || "application/json" : undefined, socketPath !== undefined);
 
     // Send If-Match on config writes when we have a cached ETag for this path
     const isConfigPath = path.startsWith("/config/") || path.startsWith("/id/");
@@ -231,16 +371,26 @@ async function attemptRequest<T = any>(
       if (cachedEtag) headers["If-Match"] = cachedEtag;
     }
 
-    const res = await fetch(url, {
-      method,
-      headers,
-      body: hasBody ? (typeof body === "string" ? body : JSON.stringify(body)) : undefined,
-      signal: AbortSignal.timeout(effectiveTimeout),
-    });
-    const text = await res.text();
+    // Only /load and /adapt take a raw document as the body (a Caddyfile, an
+    // nginx.conf). Everywhere else the body is a JSON *value*, so a string must
+    // be JSON-encoded -- sending it bare makes Caddy reject the request with
+    //   500 {"error":"decoding request body: invalid character 'x' ..."}
+    // which is what every string-valued config write used to do: caddy_tls's
+    // set_email / set_acme_ca / set_acme_profile, and caddy_config_set or
+    // caddy_config_by_id with a string value. Verified against Caddy 2.11.4:
+    // bare -> 500, JSON-encoded -> 200.
+    const serializedBody = hasBody
+      ? rawStringBody && typeof body === "string"
+        ? body
+        : JSON.stringify(body)
+      : undefined;
+    const res = socketPath
+      ? await sendViaUnixSocket(socketPath, path, method, headers, serializedBody, effectiveTimeout)
+      : await sendViaFetch(url, method, headers, serializedBody, effectiveTimeout);
+    const text = res.text;
 
     // Capture ETag from config GET responses
-    const etag = res.headers.get("ETag") || undefined;
+    const etag = res.etag;
     if (method === "GET" && etag && isConfigPath) {
       setEtag(path, etag);
     }
@@ -284,13 +434,19 @@ async function attemptRequest<T = any>(
       // from the origin Caddy accepts -- say so instead of leaving the caller
       // with a bare "not allowed to access from origin ''".
       if (res.status === 403 && /origin/i.test(text)) {
+        // The remedy differs by transport, and the TCP advice is actively wrong
+        // over a socket -- it would tell the operator to abandon the socket.
+        const hint = socketPath
+          ? `Over a unix socket caddy-mcp deliberately sends no Origin header, because Caddy builds no ` +
+            `default origin allowlist for a unix listener (sending one would fail against an empty list). ` +
+            `Reaching here means admin.enforce_origin is enabled -- disable it, or move the admin endpoint ` +
+            `to a TCP address.`
+          : `Set CADDY_ADMIN_URL to the exact origin Caddy allows (default http://localhost:2019), ` +
+            `or add this origin to the admin.origins list in Caddy's config.`;
         return {
           ok: false,
           status: 403,
-          error:
-            `${text.trim()} -- Caddy's admin API rejected this client's Origin. ` +
-            `Set CADDY_ADMIN_URL to the exact origin Caddy allows (default http://localhost:2019), ` +
-            `or add this origin to the admin.origins list in Caddy's config.`,
+          error: `${text.trim()} -- Caddy's admin API rejected this client's Origin. ${hint}`,
         };
       }
       return { ok: false, status: res.status, error: text };
@@ -303,18 +459,29 @@ async function attemptRequest<T = any>(
     }
   } catch (err: unknown) {
     const msg = err instanceof Error ? err.message : String(err);
+    // ENOENT is the unix-socket-specific shape: the socket file itself is not
+    // there. Distinguish it from ECONNREFUSED (file present, nothing accepting)
+    // because the fixes differ -- wrong path vs. Caddy not running.
+    if (socketPath && msg.includes("ENOENT")) {
+      return {
+        ok: false,
+        status: 0,
+        error: `No socket at ${socketPath} — check the path in CADDY_ADMIN_URL and that Caddy's admin endpoint is configured to listen on it.`,
+      };
+    }
     if (msg.includes("ECONNREFUSED") || msg.includes("fetch failed")) {
-      const baseUrl = getBaseUrl();
-      let origin = baseUrl;
-      try {
-        origin = new URL(baseUrl).origin;
-      } catch {
-        // fall through — show raw value if unparseable
+      let target = socketPath ?? getBaseUrl();
+      if (!socketPath) {
+        try {
+          target = new URL(target).origin;
+        } catch {
+          // fall through — show raw value if unparseable
+        }
       }
       return {
         ok: false,
         status: 0,
-        error: `Cannot connect to Caddy admin API at ${origin} — is Caddy running?`,
+        error: `Cannot connect to Caddy admin API at ${target} — is Caddy running?`,
       };
     }
     if (msg.includes("abort") || msg.includes("timeout")) {
@@ -384,13 +551,13 @@ function getLoadTimeout(): number {
 }
 
 export async function loadConfig(config: unknown, contentType?: string): Promise<ApiResponse> {
-  const res = await caddyRequest("POST", "/load", config, contentType, getLoadTimeout());
+  const res = await caddyRequest("POST", "/load", config, contentType, getLoadTimeout(), true);
   if (res.ok) etagCache.clear();
   return res;
 }
 
 export function adapt<T = any>(config: string, adapter = "caddyfile"): Promise<ApiResponse<T>> {
-  return caddyRequest<T>("POST", "/adapt", config, `text/${adapter}`);
+  return caddyRequest<T>("POST", "/adapt", config, `text/${adapter}`, undefined, true);
 }
 
 export function stop(): Promise<ApiResponse> {

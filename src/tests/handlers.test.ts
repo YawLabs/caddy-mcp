@@ -819,6 +819,24 @@ describe("tool handler behavior", () => {
       handler = getToolHandler(mockServer, "caddy_tls");
     });
 
+    /**
+     * Mock configPatch the way real Caddy actually behaves on the fallback
+     * path: a PATCH of the issuer SUB-path 404s when that key is absent, while
+     * a PATCH of the whole apps/tls object succeeds because apps/tls exists.
+     *
+     * Both writes go through configPatch now, so a blanket
+     * `configPatch.mockResolvedValue(err(...))` would fail the merge too and
+     * silently invert what these tests claim to prove.
+     */
+    function subpathPatchFails(subpathError: any = err(404, "key does not exist")) {
+      api.configPatch.mockImplementation(async (path: string) => (path === "apps/tls" ? ok() : subpathError));
+    }
+
+    /** The merge write: the configPatch call targeting apps/tls as a whole. */
+    function mergeCall(): any[] | undefined {
+      return api.configPatch.mock.calls.find((c: any[]) => c[0] === "apps/tls");
+    }
+
     it("uses PATCH when path already exists (no GET, no POST/PUT)", async () => {
       api.configPatch.mockResolvedValue(ok());
 
@@ -866,7 +884,11 @@ describe("tool handler behavior", () => {
     });
 
     // Branch 2: shape OK — deep-merge into existing config and PUT it back.
-    it("PATCH fails + apps/tls exists with expected shape -> PUTs merged config (preserves siblings)", async () => {
+    // PATCH, never PUT. Caddy's PUT on a non-array key is strictly-create and
+    // returns 409 "key already exists: tls" whenever apps/tls is present --
+    // which is precisely the condition this branch runs under. Verified against
+    // a live Caddy 2.11.4.
+    it("PATCH fails + apps/tls exists with expected shape -> PATCHes merged config (preserves siblings)", async () => {
       const existing = {
         automation: {
           policies: [{ issuers: [{ module: "acme", email: "old@example.com" }] }],
@@ -874,20 +896,21 @@ describe("tool handler behavior", () => {
         },
         certificate_authorities: { custom: { name: "internal" } },
       };
-      api.configPatch.mockResolvedValue(err(500, "key does not exist"));
+      subpathPatchFails();
       api.configGet.mockResolvedValue(ok(existing));
-      api.configPut.mockResolvedValue(ok());
 
       const result = await handler({ action: "set_acme_ca", ca: "https://new.example.com/dir" });
 
-      expect(api.configPut).toHaveBeenCalledTimes(1);
-      const [putPath, putBody] = api.configPut.mock.calls[0];
-      expect(putPath).toBe("apps/tls");
+      // The merge must NOT go out as a PUT -- that is the 409.
+      expect(api.configPut).not.toHaveBeenCalled();
+      const call = mergeCall();
+      expect(call, "expected a configPatch to apps/tls").toBeDefined();
+      const mergedBody = (call as any[])[1];
       // Sibling fields preserved
-      expect(putBody.automation.on_demand).toEqual({ rate_limit: { interval: "10s", burst: 5 } });
-      expect(putBody.certificate_authorities).toEqual({ custom: { name: "internal" } });
+      expect(mergedBody.automation.on_demand).toEqual({ rate_limit: { interval: "10s", burst: 5 } });
+      expect(mergedBody.certificate_authorities).toEqual({ custom: { name: "internal" } });
       // Existing email kept, ca added
-      expect(putBody.automation.policies[0].issuers[0]).toEqual({
+      expect(mergedBody.automation.policies[0].issuers[0]).toEqual({
         module: "acme",
         email: "old@example.com",
         ca: "https://new.example.com/dir",
@@ -905,14 +928,13 @@ describe("tool handler behavior", () => {
           policies: [{ issuers: [{ module: "acme", email: "old@example.com", ca: "https://old.example.com" }] }],
         },
       };
-      api.configPatch.mockResolvedValue(err(500, "key does not exist"));
+      subpathPatchFails();
       api.configGet.mockResolvedValue(ok(existing));
-      api.configPut.mockResolvedValue(ok());
 
       await handler({ action: "set_email", email: "new@example.com" });
 
-      const [, putBody] = api.configPut.mock.calls[0];
-      expect(putBody.automation.policies[0].issuers[0]).toEqual({
+      const mergedBody = (mergeCall() as any[])[1];
+      expect(mergedBody.automation.policies[0].issuers[0]).toEqual({
         module: "acme",
         email: "new@example.com",
         ca: "https://old.example.com",
@@ -1010,16 +1032,17 @@ describe("tool handler behavior", () => {
       expect(result.content[0].text).toContain("post-fail");
     });
 
-    it("PATCH fails + shape OK + PUT fails -> surfaces both PATCH and PUT errors", async () => {
+    it("PATCH fails + shape OK + merge write fails -> surfaces both errors", async () => {
+      // Both writes fail here, so a blanket mock is what we actually want.
       api.configPatch.mockResolvedValue(err(500, "patch-fail"));
       api.configGet.mockResolvedValue(ok({ automation: { policies: [{ issuers: [{ module: "acme" }] }] } }));
-      api.configPut.mockResolvedValue(err(500, "put-fail"));
 
       const result = await handler({ action: "set_email", email: "test@example.com" });
 
       expect(result.isError).toBe(true);
       expect(result.content[0].text).toContain("patch-fail");
-      expect(result.content[0].text).toContain("put-fail");
+      expect(result.content[0].text).toContain("PATCH apps/tls fallback");
+      expect(api.configPut).not.toHaveBeenCalled();
     });
 
     it("returns error when email is missing for set_email", async () => {
@@ -1043,6 +1066,103 @@ describe("tool handler behavior", () => {
 
       expect(api.configGet).toHaveBeenCalledWith("apps/tls");
       expect(result.content[0].text).toContain("automation");
+    });
+
+    // ACME profiles landed in Caddy 2.10; the issuer field is `profile`.
+    it("set_acme_profile PATCHes the issuer's profile field", async () => {
+      api.configPatch.mockResolvedValue(ok());
+
+      const result = await handler({ action: "set_acme_profile", profile: "shortlived" });
+
+      expect(api.configPatch).toHaveBeenCalledWith("apps/tls/automation/policies/0/issuers/0/profile", "shortlived");
+      expect(result.isError).toBeFalsy();
+      expect(result.content[0].text).toContain("shortlived");
+    });
+
+    it("set_acme_profile falls back to a fresh apps/tls carrying the profile", async () => {
+      api.configPatch.mockResolvedValue(err(500, "key does not exist"));
+      api.configGet.mockResolvedValue(err(404, "not found"));
+      api.configPost.mockResolvedValue(ok());
+
+      const result = await handler({ action: "set_acme_profile", profile: "shortlived" });
+
+      expect(api.configPost).toHaveBeenCalledWith("apps/tls", {
+        automation: { policies: [{ issuers: [{ module: "acme", profile: "shortlived" }] }] },
+      });
+      expect(result.isError).toBeFalsy();
+    });
+
+    // This is the NORMAL path for set_acme_profile, not an edge case: a fresh
+    // ACME issuer carries no `profile` key, so the sub-path PATCH 404s and the
+    // fallback runs every time. Confirmed against a live Caddy 2.11.4.
+    it("set_acme_profile merges into an existing issuer without dropping siblings", async () => {
+      subpathPatchFails();
+      api.configGet.mockResolvedValue(
+        ok({
+          automation: { policies: [{ issuers: [{ module: "acme", email: "keep@example.com" }] }] },
+          certificates: { load_files: [{ certificate: "/c.pem" }] },
+        }),
+      );
+
+      const result = await handler({ action: "set_acme_profile", profile: "shortlived" });
+
+      expect(result.isError).toBeFalsy();
+      expect(api.configPut).not.toHaveBeenCalled();
+      const body = (mergeCall() as any[])[1];
+      expect(body.automation.policies[0].issuers[0]).toEqual({
+        module: "acme",
+        email: "keep@example.com",
+        profile: "shortlived",
+      });
+      // The sibling key must survive the merge.
+      expect(body.certificates).toEqual({ load_files: [{ certificate: "/c.pem" }] });
+    });
+
+    it("returns error when profile is missing for set_acme_profile", async () => {
+      const result = await handler({ action: "set_acme_profile" });
+      expect(result.isError).toBe(true);
+      expect(result.content[0].text).toContain("profile is required");
+      expect(api.configPatch).not.toHaveBeenCalled();
+    });
+
+    it("ech_status reads apps/tls/ech and never writes", async () => {
+      api.configGet.mockResolvedValue(ok({ publication: [{ domains: ["example.com"] }] }));
+
+      const result = await handler({ action: "ech_status" });
+
+      expect(api.configGet).toHaveBeenCalledWith("apps/tls/ech");
+      expect(api.configPatch).not.toHaveBeenCalled();
+      expect(api.configPost).not.toHaveBeenCalled();
+      expect(api.configPut).not.toHaveBeenCalled();
+      expect(result.content[0].text).toContain("example.com");
+    });
+
+    // ECH is rarely enabled, so this is the ordinary answer, not a failure.
+    it("ech_status reports 'not configured' rather than a 404 error", async () => {
+      api.configGet.mockResolvedValue(err(404, "not found"));
+
+      const result = await handler({ action: "ech_status" });
+
+      expect(result.isError).toBeFalsy();
+      expect(result.content[0].text).toContain("not configured");
+    });
+
+    it("ech_status treats an empty body as 'not configured' too", async () => {
+      api.configGet.mockResolvedValue(ok(null));
+
+      const result = await handler({ action: "ech_status" });
+
+      expect(result.isError).toBeFalsy();
+      expect(result.content[0].text).toContain("not configured");
+    });
+
+    it("ech_status still surfaces a real read failure as an error", async () => {
+      api.configGet.mockResolvedValue(err(500, "internal error"));
+
+      const result = await handler({ action: "ech_status" });
+
+      expect(result.isError).toBe(true);
+      expect(result.content[0].text).toContain("internal error");
     });
   });
 
@@ -2298,6 +2418,206 @@ describe("tool handler behavior", () => {
       expect((snaps[0]?.config as { generation: number }).generation).toBe(10);
       expect(snaps[9]?.trigger).toBe("seed-1");
       expect(snaps.some((s) => s.trigger === "seed-0")).toBe(false);
+    });
+  });
+
+  describe("snapshot persistence (CADDY_MCP_SNAPSHOT_DIR)", () => {
+    const savedDir = process.env.CADDY_MCP_SNAPSHOT_DIR;
+    let tmp: string | undefined;
+
+    beforeEach(async () => {
+      const { mkdtempSync } = await import("node:fs");
+      const { tmpdir } = await import("node:os");
+      const { join } = await import("node:path");
+      tmp = mkdtempSync(join(tmpdir(), "caddy-mcp-snap-"));
+      process.env.CADDY_MCP_SNAPSHOT_DIR = tmp;
+    });
+
+    afterEach(async () => {
+      const { rmSync } = await import("node:fs");
+      if (tmp) rmSync(tmp, { recursive: true, force: true });
+      if (savedDir !== undefined) process.env.CADDY_MCP_SNAPSHOT_DIR = savedDir;
+      else delete process.env.CADDY_MCP_SNAPSHOT_DIR;
+      vi.resetModules();
+    });
+
+    it("writes a file per snapshot and rehydrates it in a fresh module instance", async () => {
+      const { readdirSync } = await import("node:fs");
+      const first = await import("../snapshots.js");
+      first.clearSnapshots();
+      first.saveSnapshot({ apps: { http: {} } }, "caddy_load");
+      first.saveSnapshot({ apps: { tls: {} } }, "manual");
+
+      expect(readdirSync(tmp as string).filter((f) => f.endsWith(".json"))).toHaveLength(2);
+
+      // A fresh module registry stands in for a server restart: the ring starts
+      // empty in memory and must come back from disk, newest first.
+      vi.resetModules();
+      const restarted = await import("../snapshots.js");
+      const snaps = restarted.listSnapshots();
+      expect(snaps).toHaveLength(2);
+      expect(snaps[0]?.trigger).toBe("manual");
+      expect(snaps[1]?.trigger).toBe("caddy_load");
+      expect(restarted.getSnapshot(1)?.config).toEqual({ apps: { http: {} } });
+    });
+
+    it("prunes persisted files beyond the 10-deep ring", async () => {
+      const { readdirSync } = await import("node:fs");
+      const snapshots = await import("../snapshots.js");
+      snapshots.clearSnapshots();
+      for (let i = 0; i < 13; i++) snapshots.saveSnapshot({ generation: i }, `seed-${i}`);
+      expect(readdirSync(tmp as string).filter((f) => f.endsWith(".json"))).toHaveLength(10);
+    });
+
+    it("keeps distinct files for snapshots captured in the same millisecond", async () => {
+      const { readdirSync } = await import("node:fs");
+      const snapshots = await import("../snapshots.js");
+      snapshots.clearSnapshots();
+      // Tight loop -- several of these land on the same Date.now() value.
+      for (let i = 0; i < 5; i++) snapshots.saveSnapshot({ generation: i }, "caddy_load");
+      expect(readdirSync(tmp as string).filter((f) => f.endsWith(".json"))).toHaveLength(5);
+      expect(snapshots.listSnapshots()).toHaveLength(5);
+    });
+
+    // The in-memory save path refuses non-objects so `caddy_revert apply` can't
+    // replay garbage into /load; hydration has to hold the same line.
+    it.each([
+      ["a bare string", '"just a string"'],
+      ["an array", "[1,2,3]"],
+      ["null", "null"],
+      ["a number", "42"],
+    ])("refuses to hydrate %s that merely parses as JSON", async (_label, contents) => {
+      const { writeFileSync } = await import("node:fs");
+      const { join } = await import("node:path");
+      writeFileSync(join(tmp as string, "snapshot-1700000000000-manual.json"), contents, "utf-8");
+
+      vi.resetModules();
+      const snapshots = await import("../snapshots.js");
+      expect(snapshots.listSnapshots()).toHaveLength(0);
+    });
+
+    it("keeps valid snapshots alongside a non-object one", async () => {
+      const { writeFileSync } = await import("node:fs");
+      const { join } = await import("node:path");
+      writeFileSync(join(tmp as string, "snapshot-1700000000001-manual.json"), '"bad"', "utf-8");
+      writeFileSync(join(tmp as string, "snapshot-1700000000002-manual.json"), '{"apps":{}}', "utf-8");
+
+      vi.resetModules();
+      const snapshots = await import("../snapshots.js");
+      const snaps = snapshots.listSnapshots();
+      expect(snaps).toHaveLength(1);
+      expect(snaps[0]?.config).toEqual({ apps: {} });
+    });
+
+    it("survives a corrupt snapshot file instead of losing the whole ring", async () => {
+      const { writeFileSync, mkdirSync } = await import("node:fs");
+      const { join } = await import("node:path");
+      const snapshots = await import("../snapshots.js");
+      snapshots.clearSnapshots();
+      snapshots.saveSnapshot({ good: true }, "manual");
+
+      mkdirSync(tmp as string, { recursive: true });
+      writeFileSync(join(tmp as string, "snapshot-99-corrupt.json"), "{not json", "utf-8");
+
+      vi.resetModules();
+      const restarted = await import("../snapshots.js");
+      const snaps = restarted.listSnapshots();
+      expect(snaps).toHaveLength(1);
+      expect(snaps[0]?.config).toEqual({ good: true });
+    });
+
+    // persist() sanitizes the trigger into the filename with [^\w-] -> "_", and
+    // hydrate() parses it back with ([\w-]+). If those two ever drift, snapshots
+    // write files that can never be read back -- silent loss of the rollback
+    // target, which is the one thing this feature exists to protect.
+    it.each([
+      ["caddy_load", "caddy_load"],
+      ["caddy_revert", "caddy_revert"],
+      ["manual", "manual"],
+      ["with spaces", "with_spaces"],
+      ["slash/and:colon", "slash_and_colon"],
+    ])("round-trips the trigger %s through the filename", async (trigger, expected) => {
+      const snapshots = await import("../snapshots.js");
+      snapshots.clearSnapshots();
+      snapshots.saveSnapshot({ a: 1 }, trigger);
+
+      vi.resetModules();
+      const restarted = await import("../snapshots.js");
+      const snaps = restarted.listSnapshots();
+      expect(snaps).toHaveLength(1);
+      expect(snaps[0]?.trigger).toBe(expected);
+    });
+
+    it("ignores files that are not snapshots", async () => {
+      // Pointing the dir at an existing or shared location is realistic.
+      const { writeFileSync } = await import("node:fs");
+      const { join } = await import("node:path");
+      const snapshots = await import("../snapshots.js");
+      snapshots.clearSnapshots();
+      snapshots.saveSnapshot({ real: true }, "manual");
+
+      writeFileSync(join(tmp as string, "notes.txt"), "hello", "utf-8");
+      writeFileSync(join(tmp as string, "config.json"), '{"not":"a snapshot"}', "utf-8");
+      writeFileSync(join(tmp as string, "snapshot-nope-manual.json"), "{}", "utf-8");
+
+      vi.resetModules();
+      const restarted = await import("../snapshots.js");
+      const snaps = restarted.listSnapshots();
+      expect(snaps).toHaveLength(1);
+      expect(snaps[0]?.config).toEqual({ real: true });
+    });
+
+    it("reads only the newest MAX_SNAPSHOTS when more files exist on disk", async () => {
+      // persist() prunes on write, but a directory can still hold more (older
+      // version, external population). This is the read-side bound.
+      const { writeFileSync } = await import("node:fs");
+      const { join } = await import("node:path");
+      for (let i = 0; i < 25; i++) {
+        // Fixed-width timestamps so the filename sort matches a numeric one.
+        writeFileSync(
+          join(tmp as string, `snapshot-17000000000${String(i).padStart(2, "0")}-manual.json`),
+          `{"i":${i}}`,
+          "utf-8",
+        );
+      }
+
+      vi.resetModules();
+      const snapshots = await import("../snapshots.js");
+      const snaps = snapshots.listSnapshots();
+      expect(snaps).toHaveLength(10);
+      // Newest first: i=24 down to i=15.
+      expect((snaps[0]?.config as { i: number }).i).toBe(24);
+      expect((snaps[9]?.config as { i: number }).i).toBe(15);
+    });
+
+    it("clearSnapshots empties the ring without repopulating from disk", async () => {
+      const snapshots = await import("../snapshots.js");
+      snapshots.clearSnapshots();
+      snapshots.saveSnapshot({ a: 1 }, "manual");
+      expect(snapshots.listSnapshots()).toHaveLength(1);
+
+      snapshots.clearSnapshots();
+      // The persisted file is still there, but a clear must stay cleared --
+      // a "clear" that refills itself on the next read would be the wrong
+      // reading of the name.
+      expect(snapshots.listSnapshots()).toHaveLength(0);
+      expect(snapshots.getSnapshot(0)).toBeUndefined();
+    });
+
+    it("falls back to memory-only when the directory cannot be written", async () => {
+      // A path whose parent is a FILE, so mkdirSync fails. The save must still
+      // land in the in-memory ring.
+      const { writeFileSync } = await import("node:fs");
+      const { join } = await import("node:path");
+      const blocker = join(tmp as string, "blocker");
+      writeFileSync(blocker, "x", "utf-8");
+      process.env.CADDY_MCP_SNAPSHOT_DIR = join(blocker, "nested");
+
+      vi.resetModules();
+      const snapshots = await import("../snapshots.js");
+      snapshots.clearSnapshots();
+      expect(() => snapshots.saveSnapshot({ a: 1 }, "manual")).not.toThrow();
+      expect(snapshots.listSnapshots()).toHaveLength(1);
     });
   });
 

@@ -120,6 +120,64 @@ npm run build || fail "Build failed"
 npm run lint || fail "Lint failed"
 npm run typecheck || fail "Type check failed"
 npm test || fail "Tests failed"
+
+# --- Live-Caddy admin-API semantics gate -------------------------------------
+# The 9 tests in src/tests/integration.test.ts are the ONLY thing pinning the
+# Caddy contracts this server is built on: PUT at an array index INSERTS (it
+# never replaces), PATCH is the verb that replaces an @id in place, a stale
+# If-Match yields 412, and Node's fetch needs a matching Origin to clear Caddy's
+# admin allowlist. `npm test` skips every one of them unless
+# CADDY_MCP_INTEGRATION=1 -- so without this gate, a Caddy release that changed
+# any of those contracts ships silently and breaks only for users.
+#
+# It runs against a SCRATCH Caddy on its own admin port, never whatever the
+# developer has running: the suite's beforeEach does `loadConfig({})`, which
+# would wipe the config of any Caddy listening on 2019.
+#
+# SKIP_INTEGRATION=1 bypasses it (mirrors SKIP_LINT above).
+if [ "${SKIP_INTEGRATION:-}" = "1" ]; then
+  warn "SKIP_INTEGRATION=1 -- live-Caddy admin-API semantics NOT verified for this release"
+elif ! command -v caddy >/dev/null 2>&1; then
+  fail "caddy is not on PATH -- needed to verify admin-API semantics against a scratch instance. Install Caddy, or re-run with SKIP_INTEGRATION=1 to release without that verification."
+else
+  INTEGRATION_ADMIN_PORT="${INTEGRATION_ADMIN_PORT:-2999}"
+  INTEGRATION_ADMIN_URL="http://localhost:${INTEGRATION_ADMIN_PORT}"
+  CADDY_SCRATCH_LOG="$(mktemp -t caddy-release-XXXXXX.log)"
+  CADDY_ADMIN="localhost:${INTEGRATION_ADMIN_PORT}" caddy run >"$CADDY_SCRATCH_LOG" 2>&1 &
+  CADDY_SCRATCH_PID=$!
+  # Reap the scratch instance on EVERY exit path, including `fail`'s exit 1.
+  trap 'kill "$CADDY_SCRATCH_PID" 2>/dev/null || true' EXIT
+
+  for _ in $(seq 1 40); do
+    curl -fsS -m 2 -o /dev/null "${INTEGRATION_ADMIN_URL}/config/" 2>/dev/null && break
+    sleep 0.25
+  done
+  # A successful curl only proves SOMETHING is listening on that port. If our
+  # caddy failed to bind -- most likely the port is already taken by an orphaned
+  # scratch instance from an aborted release -- it has since exited, and the
+  # tests would run against a foreign Caddy whose config the suite's
+  # `loadConfig({})` then wipes. That is exactly what the scratch instance
+  # exists to prevent, so confirm the process WE started is the live one.
+  if ! kill -0 "$CADDY_SCRATCH_PID" 2>/dev/null; then
+    warn "scratch Caddy log: $CADDY_SCRATCH_LOG"
+    fail "scratch Caddy exited -- port ${INTEGRATION_ADMIN_PORT} may already be in use. Refusing to run the integration suite against a Caddy this script did not start (it would wipe that instance's config). Free the port, or set INTEGRATION_ADMIN_PORT to another one."
+  fi
+  if ! curl -fsS -m 2 -o /dev/null "${INTEGRATION_ADMIN_URL}/config/" 2>/dev/null; then
+    warn "scratch Caddy log: $CADDY_SCRATCH_LOG"
+    fail "scratch Caddy never came up on ${INTEGRATION_ADMIN_URL}"
+  fi
+  info "scratch Caddy up on ${INTEGRATION_ADMIN_URL} (pid $CADDY_SCRATCH_PID)"
+
+  CADDY_MCP_INTEGRATION=1 CADDY_ADMIN_URL="$INTEGRATION_ADMIN_URL" \
+    npx vitest run src/tests/integration.test.ts \
+    || fail "Live-Caddy integration tests failed -- Caddy admin-API semantics have changed"
+
+  kill "$CADDY_SCRATCH_PID" 2>/dev/null || true
+  trap - EXIT
+  rm -f "$CADDY_SCRATCH_LOG"
+  info "admin-API semantics verified against $(caddy version 2>/dev/null | head -1)"
+fi
+
 info "All checks passed"
 
 step 2 "Bump version to $VERSION"
