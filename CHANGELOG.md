@@ -11,6 +11,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed
+- **The minimum oam version is now actually enforced.** `oamVersion()` and `atLeast()` were defined but never called, so `OAM_MIN` was dead code and any oam on the box was spawned regardless of version — including the pre-0.9.0 releases the floor exists to exclude, where `child_process.execFile` ran its arguments through a shell, `exec` accepted `timeout` and ignored it, and `stdio: 'inherit'` behaved as `'pipe'`. This launcher shells out on its main paths, so those were reachable bugs. An oam below the floor is now refused under `CADDY_MCP_RUNTIME=oam` and bypassed for Node under `auto`, in both cases saying which version it found.
+
 ### Fixed
 - **The launcher no longer dies with a raw stack trace when `spawn` fails.** Node throws synchronously rather than emitting `error` for some unexecutable targets — notably a `.cmd`/`.bat` on Windows — and the `error` listener is registered *after* the `spawn` call, so it could never observe that throw. Both failure modes now route through one handler.
 - **Windows `PATH` discovery accepts `oam.exe` only**, instead of walking every `PATHEXT` entry and returning an `oam.cmd` Node cannot execute. A skipped shim is still **named** in the diagnostic, so an npm-style install no longer reports as "no oam binary was found".

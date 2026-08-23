@@ -250,6 +250,14 @@ if (mode === "node") {
   await runInProcess();
 } else {
   const oam = findOam();
+  // Read the version ONCE, and only when discovery found something: the gate
+  // below has to tell "too old" apart from "could not be read at all", and
+  // re-probing inside the branch would cost a second subprocess.
+  //
+  // This is the first subprocess the launcher runs -- discovery itself is
+  // stat-only. Paid on every launch that finds an oam, including the ones
+  // that go on to fall back to Node.
+  const found = oam ? oamVersion(oam) : null;
 
   if (!oam) {
     // An oam-named .cmd/.bat on PATH is a real install in a shape this
@@ -276,6 +284,29 @@ if (mode === "node") {
     // auto: falling back is correct, but silence is how someone never learns
     // their oam install is a shape this launcher skips.
     if (oamShim) await errSync(`caddy-mcp: ${shimNote}Using Node instead.\n`);
+    await runInProcess();
+  } else if (!atLeast(found, OAM_MIN)) {
+    const min = OAM_MIN.join(".");
+    // Two different causes reach this branch and they need different
+    // remedies. `found === null` is NOT "old": oamVersion returns null when
+    // the binary could not be run at all (not executable, wrong arch, a
+    // .cmd/.bat Node refuses, deleted between the stat and the probe) or
+    // when its --version output did not parse. Telling that user to
+    // `oam self-update` sends them after the one cause it definitely is not.
+    const detail = found
+      ? `${oam} is oam ${found.join(".")}, older than ${min}`
+      : `${oam} could not be run, or did not report a version this launcher understands`;
+    const remedy = found
+      ? "Run `oam self-update`, or use CADDY_MCP_RUNTIME=node.\n"
+      : "Check that it is an executable oam binary for this platform, or use CADDY_MCP_RUNTIME=node.\n";
+    if (mode === "oam") {
+      await errSync(`caddy-mcp: CADDY_MCP_RUNTIME=oam but ${detail}.\n${remedy}`);
+      process.exit(1);
+    }
+    // auto: neither cause is worth failing over -- prefer Node. Say so,
+    // because a silent downgrade is how someone keeps running an oam they
+    // meant to update, or never learns their oam is unexecutable.
+    await errSync(`caddy-mcp: ${detail}; using Node instead.\n`);
     await runInProcess();
   } else {
     // `--` separates oam's own flags from the script's argv, so `caddy-mcp
