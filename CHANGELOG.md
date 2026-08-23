@@ -11,6 +11,54 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- **Unix socket admin endpoints.** `CADDY_ADMIN_URL` now accepts `unix:///var/run/caddy-admin.sock`
+  (and Caddy's own `unix//var/run/caddy-admin.sock` spelling), routing requests through
+  `node:http` with `socketPath` instead of the global `fetch`, which cannot dial a unix
+  socket at all. Moving the admin API onto a unix socket is Caddy's own hardening
+  recommendation, and those instances were previously unreachable. The unix path sends
+  **no** `Origin` header — the exact opposite of the TCP path: Caddy builds no default
+  origin allowlist for a unix/fd admin listener and only runs its origin check when
+  `Origin` or `Sec-Fetch-Mode` is present, so sending one opts into a check against an
+  empty allowlist and always 403s.
+- **`caddy_tls` action `set_acme_profile`.** Sets the ACME issuer's `profile` field
+  (Caddy 2.10+). Let's Encrypt uses it to issue 6-day short-lived certificates under
+  the `shortlived` profile. Valid names are defined by the CA, so the value passes
+  through unvalidated.
+- **`caddy_tls` action `ech_status`.** Reads the Encrypted ClientHello config at
+  `apps/tls/ech` (Caddy 2.10+). Read-only: enabling ECH needs a DNS provider credential
+  and a publication policy, which belong in a full config applied via `caddy_load`.
+  ECH is rarely enabled, so an absent config reports "not configured" as the answer
+  rather than surfacing Caddy's raw 404 as a read error.
+- **Optional snapshot persistence.** `CADDY_MCP_SNAPSHOT_DIR` writes each `caddy_revert`
+  snapshot to disk and rehydrates the ring on first access, so a rollback target survives
+  a server restart. Unset keeps the previous memory-only behavior. Opt-in because
+  snapshots are full Caddy configs and can carry secrets. Corrupt files are skipped rather
+  than taking out the ring, and any write failure degrades to in-memory.
+
+### Changed
+
+- `release.sh` now runs the 9 live-Caddy integration tests as part of its check step,
+  against a **scratch** Caddy started on its own admin port (the suite's `beforeEach`
+  does `loadConfig({})`, which would wipe the config of whatever is listening on 2019).
+  Those tests are the only thing pinning the Caddy admin-API contracts this server is
+  built on — PUT-at-an-array-index inserts, PATCH replaces an `@id` in place, stale
+  `If-Match` yields 412 — and `npm test` skips every one of them unless
+  `CADDY_MCP_INTEGRATION=1`, so a Caddy release that changed any of them would previously
+  have shipped silently. `SKIP_INTEGRATION=1` bypasses, mirroring `SKIP_LINT`.
+- The three `caddy_tls` set actions share one `setIssuerField` helper instead of three
+  hand-copied PATCH-then-fallback blocks, so the clobber-safety semantics cannot drift
+  between them.
+
+### Fixed
+
+- README reported "230 unit tests; +8 live-Caddy integration tests"; the actual counts
+  are 313 and 9.
+- Documented that since Caddy 2.11.1, `SIGUSR1` reloads from the Caddyfile **only** if
+  the config has never been changed through the admin API — so the first write from
+  caddy-mcp makes `systemctl reload caddy` a silent no-op.
+
 ## [2.1.0] — 2026-08-07
 
 ### Added

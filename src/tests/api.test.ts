@@ -1392,4 +1392,103 @@ describe("api", () => {
       expect(called).toBe(0);
     });
   });
+
+  describe("unix socket admin endpoint", () => {
+    // A missing socket path is the cheapest way to prove the request was routed
+    // to node:http rather than fetch: the global fetch stub stays untouched and
+    // the error comes back in the socket-specific shape.
+    it.each([
+      ["URL form", `unix://${process.platform === "win32" ? "/nope" : "/tmp/caddy-mcp-does-not-exist.sock"}`],
+      [
+        "Caddy network-address form",
+        `unix/${process.platform === "win32" ? "/nope" : "/tmp/caddy-mcp-does-not-exist.sock"}`,
+      ],
+    ])("routes %s away from fetch entirely", async (_label, adminUrl) => {
+      const api = await import("../api.js");
+      process.env.CADDY_ADMIN_URL = adminUrl;
+      let fetchCalls = 0;
+      globalThis.fetch = vi.fn(async () => {
+        fetchCalls++;
+        return new Response("{}", { status: 200 });
+      }) as any;
+
+      const res = await api.configGet();
+      expect(res.ok).toBe(false);
+      // Never fell through to the TCP transport.
+      expect(fetchCalls).toBe(0);
+    });
+
+    // POSIX-only: a nonexistent path reliably yields ENOENT there. The Windows
+    // named-pipe equivalent does not survive the unix:// URL form, so gating
+    // keeps the assertion exact instead of loosening it to match both branches.
+    it.skipIf(process.platform === "win32")(
+      "reports a missing socket distinctly from a refused connection",
+      async () => {
+        const api = await import("../api.js");
+        const sock = "/tmp/caddy-mcp-does-not-exist.sock";
+        process.env.CADDY_ADMIN_URL = `unix://${sock}`;
+        globalThis.fetch = vi.fn(async () => new Response("{}", { status: 200 })) as any;
+
+        const res = await api.configGet();
+        expect(res.ok).toBe(false);
+        expect(res.status).toBe(0);
+        // Must be the socket-specific message, NOT the generic
+        // "Cannot connect ... is Caddy running?" a refused connection gets --
+        // the two point at different fixes (wrong path vs Caddy not running).
+        expect(res.error).toContain("No socket at");
+        expect(res.error).toContain(sock);
+        expect(res.error).not.toContain("is Caddy running?");
+      },
+    );
+
+    // The real round-trip. AF_UNIX is a POSIX deployment concern and Windows
+    // uses named pipes with different semantics, so it runs where it matters.
+    describe.skipIf(process.platform === "win32")("against a live unix socket", () => {
+      it("completes a request and sends NO Origin or Sec-Fetch-Mode header", async () => {
+        const { createServer } = await import("node:http");
+        const { tmpdir } = await import("node:os");
+        const { join } = await import("node:path");
+        const { unlinkSync, existsSync } = await import("node:fs");
+
+        const sockPath = join(tmpdir(), `caddy-mcp-test-${process.pid}.sock`);
+        if (existsSync(sockPath)) unlinkSync(sockPath);
+
+        let seenOrigin: string | undefined = "unset";
+        let seenSecFetch: string | undefined = "unset";
+        const srv = createServer((req, res) => {
+          seenOrigin = req.headers.origin;
+          seenSecFetch = req.headers["sec-fetch-mode"] as string | undefined;
+          res.setHeader("ETag", '"/config/ abc123"');
+          res.setHeader("Content-Type", "application/json");
+          res.end(JSON.stringify({ apps: { http: {} } }));
+        });
+        await new Promise<void>((ok) => srv.listen(sockPath, ok));
+
+        try {
+          const api = await import("../api.js");
+          process.env.CADDY_ADMIN_URL = `unix://${sockPath}`;
+          let fetchCalls = 0;
+          globalThis.fetch = vi.fn(async () => {
+            fetchCalls++;
+            return new Response("{}", { status: 200 });
+          }) as any;
+
+          const res = await api.configGet<{ apps?: unknown }>();
+          expect(res.ok).toBe(true);
+          expect(res.data?.apps).toBeDefined();
+          expect(fetchCalls).toBe(0);
+
+          // The security-relevant assertion. Caddy builds NO default origin
+          // allowlist for a unix admin listener, and only runs its origin check
+          // when the request carries Origin or Sec-Fetch-Mode -- so sending
+          // either would opt into a check against an empty list and 403.
+          expect(seenOrigin).toBeUndefined();
+          expect(seenSecFetch).toBeUndefined();
+        } finally {
+          await new Promise<void>((ok) => srv.close(() => ok()));
+          if (existsSync(sockPath)) unlinkSync(sockPath);
+        }
+      });
+    });
+  });
 });

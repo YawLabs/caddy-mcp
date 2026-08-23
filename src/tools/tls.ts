@@ -4,11 +4,28 @@ import type { ApiResponse } from "../api.js";
 import * as api from "../api.js";
 import { formatResult } from "../format.js";
 
+/**
+ * The ACME issuer fields this tool can set. Each maps 1:1 onto a field of
+ * Caddy's `acme` issuer module: `email`, `ca`, and `profile`.
+ *
+ * `profile` arrived in Caddy 2.10 (ACME profiles, an experimental draft). It
+ * selects certificate properties the CA offers by name -- Let's Encrypt uses
+ * it to issue 6-day short-lived certs under the "shortlived" profile. Caddy
+ * passes the value through untouched, so the set of valid names is the CA's to
+ * define, not ours to validate.
+ */
+interface IssuerFields {
+  email?: string;
+  ca?: string;
+  profile?: string;
+}
+
 /** Build a minimal TLS automation config with ACME issuer fields (used only when apps/tls is absent) */
-function buildTlsConfig(fields: { email?: string; ca?: string }) {
+function buildTlsConfig(fields: IssuerFields) {
   const issuer: Record<string, string> = { module: "acme" };
   if (fields.email) issuer.email = fields.email;
   if (fields.ca) issuer.ca = fields.ca;
+  if (fields.profile) issuer.profile = fields.profile;
   return {
     automation: {
       policies: [{ issuers: [issuer] }],
@@ -44,13 +61,14 @@ function deepClone<T>(v: T): T {
  * Apply email/ca patch to a deep copy of an existing apps/tls config that already
  * contains automation.policies[0].issuers[0]. Caller must have validated the shape.
  */
-function mergeIssuerFields(existing: Record<string, unknown>, fields: { email?: string; ca?: string }) {
+function mergeIssuerFields(existing: Record<string, unknown>, fields: IssuerFields) {
   const merged = deepClone(existing);
   // Cast through unknown — we've shape-checked the path before reaching here.
   const automation = merged.automation as { policies: Array<{ issuers: Array<Record<string, unknown>> }> };
   const issuer = automation.policies[0].issuers[0];
   if (fields.email !== undefined) issuer.email = fields.email;
   if (fields.ca !== undefined) issuer.ca = fields.ca;
+  if (fields.profile !== undefined) issuer.profile = fields.profile;
   return merged;
 }
 
@@ -98,11 +116,7 @@ type FallbackOutcome =
  *  - merge into existing config and PUT it back (preserves siblings), or
  *  - refuse with a shape-specific error (do not clobber).
  */
-async function safeFallback(
-  label: string,
-  patchRes: ApiResponse,
-  fields: { email?: string; ca?: string },
-): Promise<FallbackOutcome> {
+async function safeFallback(label: string, patchRes: ApiResponse, fields: IssuerFields): Promise<FallbackOutcome> {
   const getRes = await api.configGet<unknown>("apps/tls");
 
   // Branch 1: apps/tls absent (404 or empty/null body) -> POST is safe.
@@ -169,44 +183,89 @@ async function safeFallback(
   return { kind: "tool-error", result: bothErrors(label, patchRes, putRes, "PUT") };
 }
 
+/**
+ * Set one ACME issuer field: PATCH the exact sub-path first (which works
+ * whenever the issuer already exists), then fall back to the shape-checked
+ * create-or-merge path when it does not.
+ *
+ * Shared by set_email / set_acme_ca / set_acme_profile so all three keep
+ * identical clobber-safety semantics -- the fallback is the delicate part, and
+ * three hand-copied versions of it would drift.
+ */
+async function setIssuerField(field: keyof IssuerFields, value: string, label: string) {
+  const patchRes = await api.configPatch(`apps/tls/automation/policies/0/issuers/0/${field}`, value);
+  const ok = { content: [{ type: "text" as const, text: `${label} set to: ${value}` }] };
+  if (patchRes.ok) return ok;
+  const outcome = await safeFallback(label, patchRes, { [field]: value });
+  return outcome.kind === "ok" ? ok : outcome.result;
+}
+
+function missingArgError(text: string) {
+  return { isError: true as const, content: [{ type: "text" as const, text: `Error: ${text}` }] };
+}
+
 export function registerTlsTools(server: McpServer) {
   server.tool(
     "caddy_tls",
-    "Get or configure TLS/HTTPS settings. Actions: 'status' shows current TLS config, 'set_email' sets the ACME email, 'set_acme_ca' sets the ACME CA URL. Works on both fresh and existing Caddy instances.",
+    "Get or configure TLS/HTTPS settings. Actions: 'status' shows current TLS config, 'set_email' sets the ACME email, " +
+      "'set_acme_ca' sets the ACME CA URL, 'set_acme_profile' sets the ACME profile (Caddy 2.10+), " +
+      "'ech_status' reads the Encrypted ClientHello config (Caddy 2.10+, read-only here). " +
+      "Works on both fresh and existing Caddy instances. Writes target policies[0].issuers[0] only -- " +
+      "on a multi-policy TLS config, edit the intended policy with caddy_config_set instead.",
     {
-      action: z.enum(["status", "set_email", "set_acme_ca"]).describe("Action to perform"),
+      action: z
+        .enum(["status", "set_email", "set_acme_ca", "set_acme_profile", "ech_status"])
+        .describe("Action to perform"),
       email: z.string().optional().describe("ACME email address (for 'set_email' action)"),
       ca: z.string().optional().describe("ACME CA URL (for 'set_acme_ca' action)"),
+      profile: z
+        .string()
+        .optional()
+        .describe(
+          "ACME profile name (for 'set_acme_profile'). Requires Caddy 2.10+ and a CA that offers profiles; " +
+            "Let's Encrypt uses 'shortlived' for 6-day certificates. Valid names are defined by the CA, not by Caddy.",
+        ),
     },
     { readOnlyHint: false, destructiveHint: false, idempotentHint: true, openWorldHint: false },
-    async ({ action, email, ca }) => {
+    async ({ action, email, ca, profile }) => {
       if (action === "status") {
         return formatResult(await api.configGet("apps/tls"));
       }
-      if (action === "set_email") {
-        if (!email)
+      if (action === "ech_status") {
+        // Encrypted ClientHello lives at apps/tls/ech (Caddy 2.10+). Read-only:
+        // enabling ECH needs a DNS provider credential and a publication policy,
+        // which belong in a full config written via caddy_load, not a one-field
+        // PATCH.
+        const echRes = await api.configGet("apps/tls/ech");
+        // ECH is rarely enabled, so "not configured" is the ordinary answer
+        // rather than a failure. Caddy reports a missing config path as a 404
+        // (or an empty body); surfacing that as `Error: not found` would answer
+        // the common case with a error the caller has to interpret.
+        const absent =
+          (!echRes.ok && echRes.status === 404) || (echRes.ok && (echRes.data === undefined || echRes.data === null));
+        if (absent) {
           return {
-            isError: true,
-            content: [{ type: "text" as const, text: "Error: email is required for set_email action" }],
+            content: [
+              {
+                type: "text" as const,
+                text: "ECH (Encrypted ClientHello) is not configured on this instance. Requires Caddy 2.10+; enable it by applying a config with apps/tls/ech via caddy_load.",
+              },
+            ],
           };
-        // Try PATCH first (works when the path already exists)
-        const patchRes = await api.configPatch("apps/tls/automation/policies/0/issuers/0/email", email);
-        if (patchRes.ok) return { content: [{ type: "text" as const, text: `ACME email set to: ${email}` }] };
-        const outcome = await safeFallback("ACME email", patchRes, { email });
-        if (outcome.kind === "ok") return { content: [{ type: "text" as const, text: `ACME email set to: ${email}` }] };
-        return outcome.result;
+        }
+        return formatResult(echRes);
+      }
+      if (action === "set_email") {
+        if (!email) return missingArgError("email is required for set_email action");
+        return setIssuerField("email", email, "ACME email");
       }
       if (action === "set_acme_ca") {
-        if (!ca)
-          return {
-            isError: true,
-            content: [{ type: "text" as const, text: "Error: ca is required for set_acme_ca action" }],
-          };
-        const patchRes = await api.configPatch("apps/tls/automation/policies/0/issuers/0/ca", ca);
-        if (patchRes.ok) return { content: [{ type: "text" as const, text: `ACME CA set to: ${ca}` }] };
-        const outcome = await safeFallback("ACME CA", patchRes, { ca });
-        if (outcome.kind === "ok") return { content: [{ type: "text" as const, text: `ACME CA set to: ${ca}` }] };
-        return outcome.result;
+        if (!ca) return missingArgError("ca is required for set_acme_ca action");
+        return setIssuerField("ca", ca, "ACME CA");
+      }
+      if (action === "set_acme_profile") {
+        if (!profile) return missingArgError("profile is required for set_acme_profile action");
+        return setIssuerField("profile", profile, "ACME profile");
       }
       return { isError: true, content: [{ type: "text" as const, text: `Unknown action: ${action}` }] };
     },

@@ -1044,6 +1044,100 @@ describe("tool handler behavior", () => {
       expect(api.configGet).toHaveBeenCalledWith("apps/tls");
       expect(result.content[0].text).toContain("automation");
     });
+
+    // ACME profiles landed in Caddy 2.10; the issuer field is `profile`.
+    it("set_acme_profile PATCHes the issuer's profile field", async () => {
+      api.configPatch.mockResolvedValue(ok());
+
+      const result = await handler({ action: "set_acme_profile", profile: "shortlived" });
+
+      expect(api.configPatch).toHaveBeenCalledWith("apps/tls/automation/policies/0/issuers/0/profile", "shortlived");
+      expect(result.isError).toBeFalsy();
+      expect(result.content[0].text).toContain("shortlived");
+    });
+
+    it("set_acme_profile falls back to a fresh apps/tls carrying the profile", async () => {
+      api.configPatch.mockResolvedValue(err(500, "key does not exist"));
+      api.configGet.mockResolvedValue(err(404, "not found"));
+      api.configPost.mockResolvedValue(ok());
+
+      const result = await handler({ action: "set_acme_profile", profile: "shortlived" });
+
+      expect(api.configPost).toHaveBeenCalledWith("apps/tls", {
+        automation: { policies: [{ issuers: [{ module: "acme", profile: "shortlived" }] }] },
+      });
+      expect(result.isError).toBeFalsy();
+    });
+
+    it("set_acme_profile merges into an existing issuer without dropping siblings", async () => {
+      api.configPatch.mockResolvedValue(err(500, "key does not exist"));
+      api.configGet.mockResolvedValue(
+        ok({
+          automation: { policies: [{ issuers: [{ module: "acme", email: "keep@example.com" }] }] },
+          certificates: { load_files: [{ certificate: "/c.pem" }] },
+        }),
+      );
+      api.configPut.mockResolvedValue(ok());
+
+      await handler({ action: "set_acme_profile", profile: "shortlived" });
+
+      const [path, body] = api.configPut.mock.calls[0];
+      expect(path).toBe("apps/tls");
+      expect(body.automation.policies[0].issuers[0]).toEqual({
+        module: "acme",
+        email: "keep@example.com",
+        profile: "shortlived",
+      });
+      // The sibling key must survive the merge.
+      expect(body.certificates).toEqual({ load_files: [{ certificate: "/c.pem" }] });
+    });
+
+    it("returns error when profile is missing for set_acme_profile", async () => {
+      const result = await handler({ action: "set_acme_profile" });
+      expect(result.isError).toBe(true);
+      expect(result.content[0].text).toContain("profile is required");
+      expect(api.configPatch).not.toHaveBeenCalled();
+    });
+
+    it("ech_status reads apps/tls/ech and never writes", async () => {
+      api.configGet.mockResolvedValue(ok({ publication: [{ domains: ["example.com"] }] }));
+
+      const result = await handler({ action: "ech_status" });
+
+      expect(api.configGet).toHaveBeenCalledWith("apps/tls/ech");
+      expect(api.configPatch).not.toHaveBeenCalled();
+      expect(api.configPost).not.toHaveBeenCalled();
+      expect(api.configPut).not.toHaveBeenCalled();
+      expect(result.content[0].text).toContain("example.com");
+    });
+
+    // ECH is rarely enabled, so this is the ordinary answer, not a failure.
+    it("ech_status reports 'not configured' rather than a 404 error", async () => {
+      api.configGet.mockResolvedValue(err(404, "not found"));
+
+      const result = await handler({ action: "ech_status" });
+
+      expect(result.isError).toBeFalsy();
+      expect(result.content[0].text).toContain("not configured");
+    });
+
+    it("ech_status treats an empty body as 'not configured' too", async () => {
+      api.configGet.mockResolvedValue(ok(null));
+
+      const result = await handler({ action: "ech_status" });
+
+      expect(result.isError).toBeFalsy();
+      expect(result.content[0].text).toContain("not configured");
+    });
+
+    it("ech_status still surfaces a real read failure as an error", async () => {
+      api.configGet.mockResolvedValue(err(500, "internal error"));
+
+      const result = await handler({ action: "ech_status" });
+
+      expect(result.isError).toBe(true);
+      expect(result.content[0].text).toContain("internal error");
+    });
   });
 
   // ─── caddy_adapt ──────────────────────────────────────────────────────
@@ -2298,6 +2392,128 @@ describe("tool handler behavior", () => {
       expect((snaps[0]?.config as { generation: number }).generation).toBe(10);
       expect(snaps[9]?.trigger).toBe("seed-1");
       expect(snaps.some((s) => s.trigger === "seed-0")).toBe(false);
+    });
+  });
+
+  describe("snapshot persistence (CADDY_MCP_SNAPSHOT_DIR)", () => {
+    const savedDir = process.env.CADDY_MCP_SNAPSHOT_DIR;
+    let tmp: string | undefined;
+
+    beforeEach(async () => {
+      const { mkdtempSync } = await import("node:fs");
+      const { tmpdir } = await import("node:os");
+      const { join } = await import("node:path");
+      tmp = mkdtempSync(join(tmpdir(), "caddy-mcp-snap-"));
+      process.env.CADDY_MCP_SNAPSHOT_DIR = tmp;
+    });
+
+    afterEach(async () => {
+      const { rmSync } = await import("node:fs");
+      if (tmp) rmSync(tmp, { recursive: true, force: true });
+      if (savedDir !== undefined) process.env.CADDY_MCP_SNAPSHOT_DIR = savedDir;
+      else delete process.env.CADDY_MCP_SNAPSHOT_DIR;
+      vi.resetModules();
+    });
+
+    it("writes a file per snapshot and rehydrates it in a fresh module instance", async () => {
+      const { readdirSync } = await import("node:fs");
+      const first = await import("../snapshots.js");
+      first.clearSnapshots();
+      first.saveSnapshot({ apps: { http: {} } }, "caddy_load");
+      first.saveSnapshot({ apps: { tls: {} } }, "manual");
+
+      expect(readdirSync(tmp as string).filter((f) => f.endsWith(".json"))).toHaveLength(2);
+
+      // A fresh module registry stands in for a server restart: the ring starts
+      // empty in memory and must come back from disk, newest first.
+      vi.resetModules();
+      const restarted = await import("../snapshots.js");
+      const snaps = restarted.listSnapshots();
+      expect(snaps).toHaveLength(2);
+      expect(snaps[0]?.trigger).toBe("manual");
+      expect(snaps[1]?.trigger).toBe("caddy_load");
+      expect(restarted.getSnapshot(1)?.config).toEqual({ apps: { http: {} } });
+    });
+
+    it("prunes persisted files beyond the 10-deep ring", async () => {
+      const { readdirSync } = await import("node:fs");
+      const snapshots = await import("../snapshots.js");
+      snapshots.clearSnapshots();
+      for (let i = 0; i < 13; i++) snapshots.saveSnapshot({ generation: i }, `seed-${i}`);
+      expect(readdirSync(tmp as string).filter((f) => f.endsWith(".json"))).toHaveLength(10);
+    });
+
+    it("keeps distinct files for snapshots captured in the same millisecond", async () => {
+      const { readdirSync } = await import("node:fs");
+      const snapshots = await import("../snapshots.js");
+      snapshots.clearSnapshots();
+      // Tight loop -- several of these land on the same Date.now() value.
+      for (let i = 0; i < 5; i++) snapshots.saveSnapshot({ generation: i }, "caddy_load");
+      expect(readdirSync(tmp as string).filter((f) => f.endsWith(".json"))).toHaveLength(5);
+      expect(snapshots.listSnapshots()).toHaveLength(5);
+    });
+
+    // The in-memory save path refuses non-objects so `caddy_revert apply` can't
+    // replay garbage into /load; hydration has to hold the same line.
+    it.each([
+      ["a bare string", '"just a string"'],
+      ["an array", "[1,2,3]"],
+      ["null", "null"],
+      ["a number", "42"],
+    ])("refuses to hydrate %s that merely parses as JSON", async (_label, contents) => {
+      const { writeFileSync } = await import("node:fs");
+      const { join } = await import("node:path");
+      writeFileSync(join(tmp as string, "snapshot-1700000000000-manual.json"), contents, "utf-8");
+
+      vi.resetModules();
+      const snapshots = await import("../snapshots.js");
+      expect(snapshots.listSnapshots()).toHaveLength(0);
+    });
+
+    it("keeps valid snapshots alongside a non-object one", async () => {
+      const { writeFileSync } = await import("node:fs");
+      const { join } = await import("node:path");
+      writeFileSync(join(tmp as string, "snapshot-1700000000001-manual.json"), '"bad"', "utf-8");
+      writeFileSync(join(tmp as string, "snapshot-1700000000002-manual.json"), '{"apps":{}}', "utf-8");
+
+      vi.resetModules();
+      const snapshots = await import("../snapshots.js");
+      const snaps = snapshots.listSnapshots();
+      expect(snaps).toHaveLength(1);
+      expect(snaps[0]?.config).toEqual({ apps: {} });
+    });
+
+    it("survives a corrupt snapshot file instead of losing the whole ring", async () => {
+      const { writeFileSync, mkdirSync } = await import("node:fs");
+      const { join } = await import("node:path");
+      const snapshots = await import("../snapshots.js");
+      snapshots.clearSnapshots();
+      snapshots.saveSnapshot({ good: true }, "manual");
+
+      mkdirSync(tmp as string, { recursive: true });
+      writeFileSync(join(tmp as string, "snapshot-99-corrupt.json"), "{not json", "utf-8");
+
+      vi.resetModules();
+      const restarted = await import("../snapshots.js");
+      const snaps = restarted.listSnapshots();
+      expect(snaps).toHaveLength(1);
+      expect(snaps[0]?.config).toEqual({ good: true });
+    });
+
+    it("falls back to memory-only when the directory cannot be written", async () => {
+      // A path whose parent is a FILE, so mkdirSync fails. The save must still
+      // land in the in-memory ring.
+      const { writeFileSync } = await import("node:fs");
+      const { join } = await import("node:path");
+      const blocker = join(tmp as string, "blocker");
+      writeFileSync(blocker, "x", "utf-8");
+      process.env.CADDY_MCP_SNAPSHOT_DIR = join(blocker, "nested");
+
+      vi.resetModules();
+      const snapshots = await import("../snapshots.js");
+      snapshots.clearSnapshots();
+      expect(() => snapshots.saveSnapshot({ a: 1 }, "manual")).not.toThrow();
+      expect(snapshots.listSnapshots()).toHaveLength(1);
     });
   });
 
