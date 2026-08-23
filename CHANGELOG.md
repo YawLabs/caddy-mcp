@@ -11,6 +11,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+- **Tests for `bin/caddy-mcp.mjs`**, the published entry point. It sat outside both
+  existing gates -- `npm run lint` scopes to `src/`, and nothing exercised `bin/` --
+  so the launcher rewrite landed with no automated coverage despite being the file
+  every install runs. Covers runtime selection (`node` / `auto` fallback / explicit
+  `oam` failing loudly), an MCP handshake through the launcher, the oam version
+  floor, and the signal behavior: a graceful child runs its own shutdown, a wedged
+  child is escalated rather than hung on, and repeat signals do not hard-kill a
+  child that is already exiting.
+
+  Signal cases are POSIX-gated -- Windows has no POSIX signals, which is why the
+  launcher forwards nothing there. A stand-in `oam` supplied via `OAM_BIN` makes
+  this testable without installing the runtime; it must answer `--version` with a
+  version at or above the floor, because the launcher's probe is a synchronous
+  `execFileSync` and an unparseable answer silently downgrades it to the Node path.
+
 ### Changed
 - **The minimum oam version is now actually enforced.** `oamVersion()` and `atLeast()` were defined but never called, so `OAM_MIN` was dead code and any oam on the box was spawned regardless of version — including the pre-0.9.0 releases the floor exists to exclude, where `child_process.execFile` ran its arguments through a shell, `exec` accepted `timeout` and ignored it, and `stdio: 'inherit'` behaved as `'pipe'`. This launcher shells out on its main paths, so those were reachable bugs. An oam below the floor is now refused under `CADDY_MCP_RUNTIME=oam` and bypassed for Node under `auto`, in both cases saying which version it found.
 
