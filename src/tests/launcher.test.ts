@@ -212,8 +212,9 @@ describe.skipIf(isWin || !existsSync(DIST_CLI))("launcher: signal handling", () 
     const res = await runWithSignals(fakeOam("graceful"), 1);
     expect(res.stderr).toContain("CHILD: cleanup ran");
     expect(res.code).toBe(0);
-    // Well inside the 2s escalation window -- the child's own exit ended this.
-    expect(res.ms).toBeLessThan(6000);
+    // Must stay well BELOW ESCALATE_AFTER_MS (5s): that is what proves the
+    // child's own exit ended this rather than the escalation timer firing.
+    expect(res.ms).toBeLessThan(3000);
   }, 30000);
 
   it("escalates on a wedged child instead of hanging forever", async () => {
@@ -223,8 +224,8 @@ describe.skipIf(isWin || !existsSync(DIST_CLI))("launcher: signal handling", () 
     // hatch -- verified against the pre-fix launcher, which hung indefinitely.
     const res = await runWithSignals(fakeOam("wedged"), 1);
     expect(res.code).toBe(130); // 128 + SIGINT
-    expect(res.ms).toBeGreaterThan(1200); // the grace window was actually honored
-    expect(res.ms).toBeLessThan(8000);
+    expect(res.ms).toBeGreaterThan(4000); // the full 5s grace window was honored
+    expect(res.ms).toBeLessThan(12000);
   }, 30000);
 
   it("does not hard-kill a graceful child when signals repeat", async () => {

@@ -397,7 +397,12 @@ if (mode === "node") {
       // graceful shutdown the console's own Ctrl-C just started, skipping the
       // child's process.on("exit") cleanup. The console has already notified the
       // child, so on Windows the timer below is the only kill we issue.
-      const ESCALATE_AFTER_MS = 2000;
+      // 5s, not 2s. This is a HARD kill of a server that may be mid-shutdown --
+      // flushing a large config, finishing a TLS provision -- and the cost of
+      // waiting too long (a wedged child lingers a few extra seconds) is far
+      // smaller than the cost of cutting a legitimate shutdown short. The window
+      // only ever elapses when the child has NOT exited on its own.
+      const ESCALATE_AFTER_MS = 5000;
       let escalation = null;
       for (const sig of ["SIGINT", "SIGTERM"]) {
         process.on(sig, () => {

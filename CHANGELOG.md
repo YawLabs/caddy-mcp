@@ -11,6 +11,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed
+- **The launcher's shutdown grace window is 5 seconds, up from 2.** The timer only
+  ever elapses when the child has NOT exited on its own, and what follows is a hard
+  kill (`SIGKILL`, or `TerminateProcess` on Windows) of a server that may be
+  mid-shutdown -- flushing a large config, finishing a TLS provision. Waiting too
+  long costs a few extra seconds on an already-wedged child; waiting too little
+  truncates a legitimate shutdown, which is the failure this timer exists to avoid
+  causing. A graceful child is unaffected: it still exits on its own in
+  milliseconds, well inside either window.
+
 ## [2.3.1] — 2026-08-23
 
 ### Added
