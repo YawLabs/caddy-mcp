@@ -20,11 +20,11 @@
 // Exit code is forwarded verbatim so release.sh's `npm run typecheck || fail`
 // still gates correctly on either path.
 
-import { spawnSync } from 'node:child_process';
-import { readFileSync } from 'node:fs';
-import { createRequire } from 'node:module';
-import { dirname, join } from 'node:path';
-import { describeRuntime, findOam } from './runtime.mjs';
+import { spawnSync } from "node:child_process";
+import { readFileSync } from "node:fs";
+import { createRequire } from "node:module";
+import { dirname, join } from "node:path";
+import { describeRuntime, findOam } from "./runtime.mjs";
 
 const require_ = createRequire(import.meta.url);
 
@@ -38,10 +38,10 @@ const require_ = createRequire(import.meta.url);
  * on both TS 5/6 (no exports map) and TS 7.
  */
 function resolveTscEntry() {
-  const pkgJsonPath = require_.resolve('typescript/package.json');
-  const pkg = JSON.parse(readFileSync(pkgJsonPath, 'utf-8'));
-  const rel = typeof pkg.bin === 'string' ? pkg.bin : pkg.bin?.tsc;
-  if (!rel) throw new Error('typescript package.json has no bin.tsc entry');
+  const pkgJsonPath = require_.resolve("typescript/package.json");
+  const pkg = JSON.parse(readFileSync(pkgJsonPath, "utf-8"));
+  const rel = typeof pkg.bin === "string" ? pkg.bin : pkg.bin?.tsc;
+  if (!rel) throw new Error("typescript package.json has no bin.tsc entry");
   return join(dirname(pkgJsonPath), rel);
 }
 
@@ -53,7 +53,7 @@ function runTsc() {
     console.error(`typecheck: could not locate tsc (${err.message}) -- run \`npm install\` first.`);
     return 1;
   }
-  const res = spawnSync(process.execPath, [tscPath, '--noEmit'], { stdio: 'inherit' });
+  const res = spawnSync(process.execPath, [tscPath, "--noEmit"], { stdio: "inherit" });
   if (res.error) {
     console.error(`typecheck: could not run tsc: ${res.error.message}`);
     return 1;
@@ -68,7 +68,7 @@ if (!oam) {
   process.exit(runTsc());
 }
 
-const res = spawnSync(oam.cmd, ['check', '.'], { stdio: 'inherit' });
+const res = spawnSync(oam.cmd, ["check", "."], { stdio: "inherit" });
 
 // A runtime that resolved but then failed to spawn (deleted mid-run, EACCES)
 // must not read as a clean type-check -- fall back rather than exit 0.

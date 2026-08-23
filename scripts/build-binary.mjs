@@ -20,23 +20,23 @@
 // build-tmp/ and bin/<platform>-<arch>/. It does NOT mutate package.json,
 // package-lock.json, src/, or node_modules, and it never runs `npm install`.
 
-import { execFileSync } from 'node:child_process';
-import { chmodSync, copyFileSync, existsSync, mkdirSync, readFileSync, rmSync, statSync } from 'node:fs';
-import { dirname, join, resolve } from 'node:path';
-import { fileURLToPath } from 'node:url';
-import esbuild from 'esbuild';
-import { inject } from 'postject';
-import { describeRuntime, findOam } from './runtime.mjs';
+import { execFileSync } from "node:child_process";
+import { chmodSync, copyFileSync, existsSync, mkdirSync, readFileSync, rmSync, statSync } from "node:fs";
+import { dirname, join, resolve } from "node:path";
+import { fileURLToPath } from "node:url";
+import esbuild from "esbuild";
+import { inject } from "postject";
+import { describeRuntime, findOam } from "./runtime.mjs";
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
-const repoRoot = resolve(__dirname, '..');
-const isWin = process.platform === 'win32';
+const repoRoot = resolve(__dirname, "..");
+const isWin = process.platform === "win32";
 
-const pkg = JSON.parse(readFileSync(join(repoRoot, 'package.json'), 'utf-8'));
+const pkg = JSON.parse(readFileSync(join(repoRoot, "package.json"), "utf-8"));
 const { version } = pkg;
 // Binary name = the package's first `bin` command, so this script is
 // copy-paste generic across @yawlabs/* servers -- no per-repo rename.
-const binName = Object.keys(pkg.bin ?? {})[0] ?? pkg.name.split('/').pop();
+const binName = Object.keys(pkg.bin ?? {})[0] ?? pkg.name.split("/").pop();
 // The CLI source entry, pinned rather than derived.
 //
 // This used to map from `bin`'s VALUE (dist/index.js -> src/index.ts). That
@@ -53,23 +53,23 @@ const binName = Object.keys(pkg.bin ?? {})[0] ?? pkg.name.split('/').pop();
 // script is a manual per-host step that neither `npm test` nor the release
 // flow exercises -- so a wrong guess stays invisible until someone builds a
 // binary. Pin it, and fail loudly if it moves.
-const srcEntry = 'src/index.ts';
+const srcEntry = "src/index.ts";
 if (!existsSync(join(repoRoot, srcEntry))) {
   console.error(`build-binary: source entry '${srcEntry}' does not exist -- update this constant`);
   process.exit(1);
 }
 
 const platformDir = `${process.platform}-${process.arch}`;
-const binDir = join(repoRoot, 'bin', platformDir);
-const tmpDir = join(repoRoot, 'build-tmp');
-const bundlePath = join(tmpDir, 'sea-bundle.cjs');
-const blobPath = join(tmpDir, 'sea-bundle.blob');
+const binDir = join(repoRoot, "bin", platformDir);
+const tmpDir = join(repoRoot, "build-tmp");
+const bundlePath = join(tmpDir, "sea-bundle.cjs");
+const blobPath = join(tmpDir, "sea-bundle.blob");
 const exeName = isWin ? `${binName}.exe` : binName;
 const outExe = join(binDir, exeName);
 
 function run(cmd, args, opts = {}) {
-  console.log(`> ${cmd} ${args.join(' ')}`);
-  return execFileSync(cmd, args, { stdio: 'inherit', cwd: repoRoot, ...opts });
+  console.log(`> ${cmd} ${args.join(" ")}`);
+  return execFileSync(cmd, args, { stdio: "inherit", cwd: repoRoot, ...opts });
 }
 
 function fmtSize(p) {
@@ -88,20 +88,20 @@ mkdirSync(binDir, { recursive: true });
 await esbuild.build({
   entryPoints: [join(repoRoot, srcEntry)],
   bundle: true,
-  platform: 'node',
-  format: 'cjs',
-  target: 'node20',
+  platform: "node",
+  format: "cjs",
+  target: "node20",
   // esbuild leaves import.meta.url EMPTY in cjs output, so a server that reads
   // it (e.g. createRequire(import.meta.url) to find package.json) crashes at
   // load with createRequire(undefined). Polyfill it to the carrier's own path
   // (__filename is the executable in a SEA). Version reads should still prefer
   // the __VERSION__ define; this is the safety net for everything else.
   banner: { js: "const __seaImportMetaUrl = require('node:url').pathToFileURL(__filename).href;" },
-  define: { __VERSION__: JSON.stringify(version), 'import.meta.url': '__seaImportMetaUrl' },
+  define: { __VERSION__: JSON.stringify(version), "import.meta.url": "__seaImportMetaUrl" },
   // Optional native addons some servers pull transitively (ssh2 -> cpu-features)
   // are require()'d inside try/catch; mark them external so esbuild doesn't
   // choke on the .node binary -- they degrade gracefully when absent.
-  external: ['cpu-features'],
+  external: ["cpu-features"],
   outfile: bundlePath,
 });
 console.log(`bundle: ${fmtSize(bundlePath)}`);
@@ -148,7 +148,7 @@ console.log(`bundle: ${fmtSize(bundlePath)}`);
 //
 // Do not re-measure from target/. findOam() now prefers an installed oam and
 // flags a build-tree one; see scripts/runtime.mjs for why.
-const wantOam = process.env.CADDY_MCP_RUNTIME === 'oam';
+const wantOam = process.env.CADDY_MCP_RUNTIME === "oam";
 const oam = wantOam ? findOam({ require: true }) : null;
 console.log(
   wantOam
@@ -158,7 +158,7 @@ console.log(
 
 if (oam) {
   rmSync(outExe, { force: true });
-  run(oam.cmd, ['compile', bundlePath, '-o', outExe]);
+  run(oam.cmd, ["compile", bundlePath, "-o", outExe]);
   if (!isWin) chmodSync(outExe, 0o755);
 
   // macOS: same ad-hoc signature the SEA path needs. Apple Silicon SIGKILLs a
@@ -166,22 +166,22 @@ if (oam) {
   // payload the same way postject does. Untested on darwin at authoring time
   // (built on windows-arm64) -- kept best-effort so a failure here is visible
   // rather than silent.
-  if (process.platform === 'darwin') {
-    run('codesign', ['--sign', '-', '--force', '--timestamp=none', outExe]);
-    run(outExe, ['--version']);
+  if (process.platform === "darwin") {
+    run("codesign", ["--sign", "-", "--force", "--timestamp=none", outExe]);
+    run(outExe, ["--version"]);
   }
 
-  console.log('');
+  console.log("");
   console.log(`OK  ${outExe}`);
   console.log(`    ${fmtSize(outExe)}`);
-  console.log('');
-  console.log('Verify with:');
+  console.log("");
+  console.log("Verify with:");
   console.log(`    "${outExe}" --version`);
   process.exit(0);
 }
 
 // 2. Generate the SEA blob from sea-config.json.
-run(process.execPath, ['--experimental-sea-config', 'sea-config.json']);
+run(process.execPath, ["--experimental-sea-config", "sea-config.json"]);
 console.log(`blob:   ${fmtSize(blobPath)}`);
 
 // 3. Copy the running node binary as the carrier.
@@ -197,11 +197,11 @@ if (!isWin) chmodSync(outExe, 0o755);
 // Best-effort: an already-unsigned carrier makes `--remove-signature` exit
 // non-zero, which must NOT abort the build -- the --force re-sign is what
 // actually matters.
-if (process.platform === 'darwin') {
+if (process.platform === "darwin") {
   try {
-    run('codesign', ['--remove-signature', outExe]);
+    run("codesign", ["--remove-signature", outExe]);
   } catch {
-    console.log('(carrier had no signature to remove -- continuing)');
+    console.log("(carrier had no signature to remove -- continuing)");
   }
 }
 
@@ -209,11 +209,11 @@ if (process.platform === 'darwin') {
 //    CLI: locating npx-cli.js off the node binary is Windows-only (Unix keeps
 //    npm under ../lib/node_modules, not ./node_modules), and npx-on-demand
 //    adds a network dependency to every CI build. The API is cross-platform.
-await inject(outExe, 'NODE_SEA_BLOB', readFileSync(blobPath), {
-  sentinelFuse: 'NODE_SEA_FUSE_fce680ab2cc467b6e072b8b5df1996b2',
-  machoSegmentName: process.platform === 'darwin' ? 'NODE_SEA' : undefined,
+await inject(outExe, "NODE_SEA_BLOB", readFileSync(blobPath), {
+  sentinelFuse: "NODE_SEA_FUSE_fce680ab2cc467b6e072b8b5df1996b2",
+  machoSegmentName: process.platform === "darwin" ? "NODE_SEA" : undefined,
 });
-console.log('injection done');
+console.log("injection done");
 
 // 5. macOS: ad-hoc re-sign AFTER injection. Apple Silicon refuses to exec a
 //    Mach-O with no/invalid signature ("killed: 9"); `--sign -` is the free
@@ -221,21 +221,21 @@ console.log('injection done');
 //    Homebrew TAP (a formula), whose curl fetch sets no com.apple.quarantine,
 //    so Gatekeeper never blocks it -- ad-hoc is sufficient. `--force` replaces
 //    any residual signature; `--timestamp=none` keeps it offline/reproducible.
-if (process.platform === 'darwin') {
-  run('codesign', ['--sign', '-', '--force', '--timestamp=none', outExe]);
-  run('codesign', ['--verify', '--verbose', outExe]);
+if (process.platform === "darwin") {
+  run("codesign", ["--sign", "-", "--force", "--timestamp=none", outExe]);
+  run("codesign", ["--verify", "--verbose", outExe]);
   // --verify proves the signature is intact, NOT that the binary launches.
   // arm64 SIGKILLs a bad-sig Mach-O only at exec, so actually run it -- this
   // is the real check the whole remove/re-sign dance defends. (CI also smoke-
   // tests, but a standalone `node scripts/build-binary.mjs` on a Mac should
   // catch a non-launching binary too.)
-  run(outExe, ['--version']);
+  run(outExe, ["--version"]);
 }
 
-console.log('');
+console.log("");
 console.log(`OK  ${outExe}`);
 console.log(`    ${fmtSize(outExe)}`);
-console.log('');
-console.log('Verify with:');
+console.log("");
+console.log("Verify with:");
 console.log(`    "${outExe}" --version`);
 console.log(`    "${outExe}" doctor --json`);
