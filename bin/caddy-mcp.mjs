@@ -180,7 +180,7 @@ function sandboxFlags() {
     }
   }
 
-  const env = ["CADDY_ADMIN_URL","CADDY_API_TOKEN","CADDY_LOAD_TIMEOUT","CADDY_MAX_RETRIES","CADDY_TIMEOUT"];
+  const env = ["CADDY_ADMIN_URL", "CADDY_API_TOKEN", "CADDY_LOAD_TIMEOUT", "CADDY_MAX_RETRIES", "CADDY_TIMEOUT"];
 
   const flags = ["--permission", netFlag, `--allow-env=${env.join(",")}`];
   return flags;
@@ -276,7 +276,8 @@ if (mode === "node") {
       const { writeSync } = await import("node:fs");
       writeSync(
         2,
-        "caddy-mcp: CADDY_MCP_RUNTIME=oam but no runnable oam binary was found.\n" + shimNote +
+        "caddy-mcp: CADDY_MCP_RUNTIME=oam but no runnable oam binary was found.\n" +
+          shimNote +
           "Install from https://oamjs.org, set OAM_BIN=/path/to/oam, or use CADDY_MCP_RUNTIME=node.\n",
       );
       process.exit(1);
@@ -354,7 +355,6 @@ if (mode === "node") {
     }
 
     if (child) {
-
       // If oam cannot be executed at all (deleted between the stat and the spawn,
       // wrong arch, permission), fall back rather than failing the whole server.
       // `spawned` prevents falling back AFTER the child started, which would

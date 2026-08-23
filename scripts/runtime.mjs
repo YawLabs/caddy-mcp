@@ -39,13 +39,13 @@
 // installed, so a regression can be bisected against the Node toolchain
 // without uninstalling anything.
 
-import { execFileSync } from 'node:child_process';
-import { existsSync } from 'node:fs';
-import { homedir } from 'node:os';
-import { delimiter, join, sep } from 'node:path';
+import { execFileSync } from "node:child_process";
+import { existsSync } from "node:fs";
+import { homedir } from "node:os";
+import { delimiter, join, sep } from "node:path";
 
-const isWin = process.platform === 'win32';
-const exeName = isWin ? 'oam.exe' : 'oam';
+const isWin = process.platform === "win32";
+const exeName = isWin ? "oam.exe" : "oam";
 
 /**
  * The per-user locations oamjs.org's installers write to. Both forms are
@@ -55,9 +55,9 @@ const exeName = isWin ? 'oam.exe' : 'oam';
  */
 function installedCandidates() {
   const home = homedir();
-  const paths = [join(home, '.oam', 'bin', exeName)];
+  const paths = [join(home, ".oam", "bin", exeName)];
   if (isWin) {
-    paths.unshift(join(process.env.LOCALAPPDATA ?? join(home, 'AppData', 'Local'), 'oam', 'bin', exeName));
+    paths.unshift(join(process.env.LOCALAPPDATA ?? join(home, "AppData", "Local"), "oam", "bin", exeName));
   }
   return paths;
 }
@@ -65,11 +65,11 @@ function installedCandidates() {
 /** Absolute paths for `oam` on PATH, so callers see WHERE it came from. */
 function pathCandidates() {
   const found = [];
-  const exts = isWin ? (process.env.PATHEXT ?? '.EXE').split(';').filter(Boolean) : [''];
-  for (const dir of (process.env.PATH ?? '').split(delimiter)) {
+  const exts = isWin ? (process.env.PATHEXT ?? ".EXE").split(";").filter(Boolean) : [""];
+  for (const dir of (process.env.PATH ?? "").split(delimiter)) {
     if (!dir) continue;
-    for (const ext of isWin ? exts : ['']) {
-      const candidate = join(dir, isWin ? `oam${ext.toLowerCase()}` : 'oam');
+    for (const ext of isWin ? exts : [""]) {
+      const candidate = join(dir, isWin ? `oam${ext.toLowerCase()}` : "oam");
       if (existsSync(candidate)) found.push(candidate);
     }
   }
@@ -81,8 +81,8 @@ function pathCandidates() {
  * Those are the binaries a scanner re-examines on every exec.
  */
 export function isBuildTreeBinary(p) {
-  const n = p.replaceAll(sep, '/').toLowerCase();
-  return n.includes('/target/release/') || n.includes('/target/debug/');
+  const n = p.replaceAll(sep, "/").toLowerCase();
+  return n.includes("/target/release/") || n.includes("/target/debug/");
 }
 
 /**
@@ -99,9 +99,9 @@ export function isBuildTreeBinary(p) {
  * artifact depend on workstation state (see the note in build-binary.mjs).
  */
 export function findOam({ require = false } = {}) {
-  if (process.env.CADDY_MCP_RUNTIME === 'node') {
+  if (process.env.CADDY_MCP_RUNTIME === "node") {
     if (require) {
-      throw new Error('CADDY_MCP_RUNTIME=node conflicts with an explicit request for the oam runtime.');
+      throw new Error("CADDY_MCP_RUNTIME=node conflicts with an explicit request for the oam runtime.");
     }
     return null;
   }
@@ -118,9 +118,9 @@ export function findOam({ require = false } = {}) {
   for (const cmd of candidates) {
     if (!existsSync(cmd)) continue;
     try {
-      const out = execFileSync(cmd, ['--version'], {
-        encoding: 'utf-8',
-        stdio: ['ignore', 'pipe', 'ignore'],
+      const out = execFileSync(cmd, ["--version"], {
+        encoding: "utf-8",
+        stdio: ["ignore", "pipe", "ignore"],
       });
       return { cmd, version: out.trim(), fromBuildTree: isBuildTreeBinary(cmd) };
     } catch {
@@ -130,9 +130,9 @@ export function findOam({ require = false } = {}) {
 
   if (require) {
     throw new Error(
-      'CADDY_MCP_RUNTIME=oam was requested but no working oam was found. ' +
-        'Set $OAM_BIN to the executable, put `oam` on PATH, or unset CADDY_MCP_RUNTIME ' +
-        'to build with the Node SEA carrier.',
+      "CADDY_MCP_RUNTIME=oam was requested but no working oam was found. " +
+        "Set $OAM_BIN to the executable, put `oam` on PATH, or unset CADDY_MCP_RUNTIME " +
+        "to build with the Node SEA carrier.",
     );
   }
   return null;
@@ -142,10 +142,10 @@ export function findOam({ require = false } = {}) {
 export function describeRuntime(oam) {
   if (!oam) return `runtime: node ${process.version} (oam not found -- using the Node fallback)`;
   const warning = oam.fromBuildTree
-    ? '\n  WARNING: this oam lives in a cargo target/ directory. Builds are fine, but do NOT' +
-      '\n  take timings from it -- a concurrent cargo build replaces the binary mid-run and' +
-      '\n  fresh bytes are cold, so the number measures the build, not the runtime.' +
-      '\n  Use an installed oam (~/.oam/bin) for anything timing-sensitive.'
-    : '';
+    ? "\n  WARNING: this oam lives in a cargo target/ directory. Builds are fine, but do NOT" +
+      "\n  take timings from it -- a concurrent cargo build replaces the binary mid-run and" +
+      "\n  fresh bytes are cold, so the number measures the build, not the runtime." +
+      "\n  Use an installed oam (~/.oam/bin) for anything timing-sensitive."
+    : "";
   return `runtime: ${oam.version} (${oam.cmd}) -- set CADDY_MCP_RUNTIME=node to force the Node path${warning}`;
 }
