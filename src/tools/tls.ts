@@ -175,12 +175,22 @@ async function safeFallback(label: string, patchRes: ApiResponse, fields: Issuer
     };
   }
 
-  // Branch 2: shape is good — merge into a deep copy and PUT it back so siblings (custom certs,
-  // on_demand, certificate_authorities, additional policies/issuers) are preserved.
+  // Branch 2: shape is good — merge into a deep copy and write it back whole so siblings
+  // (custom certs, on_demand, certificate_authorities, additional policies/issuers) are
+  // preserved. Sibling preservation comes from merging the full object, not from the verb.
+  //
+  // PATCH, not PUT. Caddy's PUT on a non-array key is strictly-create: it returns
+  //   409 {"error":"[/config/apps/tls] key already exists: tls"}
+  // whenever apps/tls is already present -- which is exactly the condition this branch
+  // runs under, so the PUT could never succeed. PATCH requires the key to exist, which it
+  // does here. Verified against Caddy 2.11.4: PUT -> 409, PATCH -> 200 with the issuer
+  // replaced. This mattered little for set_email/set_acme_ca (a configured issuer already
+  // carries those keys, so the PATCH happy path handles them), but a fresh ACME issuer
+  // never carries `profile`, so set_acme_profile reaches this branch on the normal path.
   const merged = mergeIssuerFields(getRes.data, fields);
-  const putRes = await api.configPut("apps/tls", merged);
-  if (putRes.ok) return { kind: "ok" };
-  return { kind: "tool-error", result: bothErrors(label, patchRes, putRes, "PUT") };
+  const mergeRes = await api.configPatch("apps/tls", merged);
+  if (mergeRes.ok) return { kind: "ok" };
+  return { kind: "tool-error", result: bothErrors(label, patchRes, mergeRes, "PATCH apps/tls") };
 }
 
 /**

@@ -1393,6 +1393,70 @@ describe("api", () => {
     });
   });
 
+  describe("request body encoding", () => {
+    async function captureBody(call: (a: typeof import("../api.js")) => Promise<unknown>) {
+      const api = await import("../api.js");
+      let sent: any;
+      globalThis.fetch = vi.fn(async (_url: any, opts: any) => {
+        sent = opts.body;
+        return new Response("{}", { status: 200 });
+      }) as any;
+      await call(api);
+      return sent;
+    }
+
+    // A config write's body is a JSON *value*, so a string has to be
+    // JSON-encoded. Sending it bare made Caddy answer
+    //   500 {"error":"decoding request body: invalid character 'x' ..."}
+    // which broke every string-valued write: caddy_tls set_email /
+    // set_acme_ca / set_acme_profile, and caddy_config_set with a string.
+    it.each([
+      ["configPatch", (a: typeof import("../api.js")) => a.configPatch("apps/tls/.../email", "x@y.test")],
+      ["configPost", (a: typeof import("../api.js")) => a.configPost("apps/tls/.../email", "x@y.test")],
+      ["configPut", (a: typeof import("../api.js")) => a.configPut("apps/tls/.../email", "x@y.test")],
+    ])("%s JSON-encodes a string value", async (_label, call) => {
+      const sent = await captureBody(call);
+      expect(sent).toBe('"x@y.test"');
+      expect(JSON.parse(sent)).toBe("x@y.test");
+    });
+
+    it("configByIdSet JSON-encodes a string value", async () => {
+      const sent = await captureBody((a) => a.configByIdSet("my-id", "some-string", "PATCH"));
+      expect(sent).toBe('"some-string"');
+    });
+
+    it("still JSON-encodes objects", async () => {
+      const sent = await captureBody((a) => a.configPatch("apps/tls", { automation: {} }));
+      expect(JSON.parse(sent)).toEqual({ automation: {} });
+    });
+
+    // The other side of the same switch: /load and /adapt take a raw document,
+    // so a string body must go out untouched. Double-encoding a Caddyfile here
+    // would break both endpoints.
+    it("sends a Caddyfile to /load verbatim, not JSON-encoded", async () => {
+      const caddyfile = ':8080 {\n  respond "hi"\n}\n';
+      const sent = await captureBody((a) => a.loadConfig(caddyfile, "text/caddyfile"));
+      expect(sent).toBe(caddyfile);
+    });
+
+    it("sends a JSON config string to /load verbatim", async () => {
+      const raw = '{"apps":{"http":{}}}';
+      const sent = await captureBody((a) => a.loadConfig(raw, "application/json"));
+      expect(sent).toBe(raw);
+    });
+
+    it("sends the adapt payload verbatim", async () => {
+      const caddyfile = ":8080 {\n}\n";
+      const sent = await captureBody((a) => a.adapt(caddyfile));
+      expect(sent).toBe(caddyfile);
+    });
+
+    it("still JSON-encodes an object passed to /load", async () => {
+      const sent = await captureBody((a) => a.loadConfig({ apps: { http: {} } }, "application/json"));
+      expect(JSON.parse(sent)).toEqual({ apps: { http: {} } });
+    });
+  });
+
   describe("403 origin rejection", () => {
     // This branch is the whole reason requests work against a stock Caddy:
     // Node's fetch always sends Sec-Fetch-Mode, which makes Caddy enforce its

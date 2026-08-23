@@ -252,6 +252,89 @@ describe.skipIf(!RUN)("integration: live Caddy admin API", () => {
     expect(routes.data?.[1]?.handle?.[0]?.status_code).toBe(201);
   });
 
+  // Pins the Caddy write semantics caddy_tls's fallback depends on. The unit
+  // tests for that fallback mock the api module, so they cannot see that Caddy
+  // rejects one of these verbs -- which is exactly how a PUT that could never
+  // succeed survived in the fallback path.
+  //
+  // PUT on a NON-array key is strictly-create: 409 "key already exists".
+  // PATCH on the same key replaces it. If a future Caddy relaxes PUT, this test
+  // fails and the fallback could be simplified; if PATCH ever starts requiring
+  // something else, it fails the other way.
+  it("PUT on an existing object key conflicts; PATCH replaces it", async () => {
+    const loadRes = await api.loadConfig({
+      apps: {
+        tls: { automation: { policies: [{ issuers: [{ module: "acme", email: "a@b.test" }] }] } },
+        http: { servers: { srv0: { listen: [":18893"] } } },
+      },
+    });
+    assertOk(loadRes, "loadConfig with apps/tls");
+
+    const merged = {
+      automation: { policies: [{ issuers: [{ module: "acme", email: "a@b.test", profile: "shortlived" }] }] },
+    };
+
+    const putRes = await api.configPut("apps/tls", merged);
+    expect(putRes.ok).toBe(false);
+    expect(putRes.status).toBe(409);
+    expect(putRes.error).toContain("already exists");
+
+    const patchRes = await api.configPatch("apps/tls", merged);
+    assertOk(patchRes, "configPatch apps/tls");
+
+    const issuer = await api.configGet<{ profile?: unknown }>("apps/tls/automation/policies/0/issuers/0");
+    assertOk(issuer, "configGet issuer");
+    expect(issuer.data?.profile).toBe("shortlived");
+  });
+
+  // The other half of the same story: the sub-path PATCH that caddy_tls tries
+  // FIRST fails on a key the issuer does not carry yet, which is why
+  // set_acme_profile reaches the fallback on the normal path rather than as an
+  // edge case.
+  it("PATCH of an absent issuer sub-key 404s, sending set_acme_profile down the fallback", async () => {
+    const loadRes = await api.loadConfig({
+      apps: {
+        tls: { automation: { policies: [{ issuers: [{ module: "acme", email: "a@b.test" }] }] } },
+        http: { servers: { srv0: { listen: [":18894"] } } },
+      },
+    });
+    assertOk(loadRes, "loadConfig with apps/tls");
+
+    const res = await api.configPatch("apps/tls/automation/policies/0/issuers/0/profile", "shortlived");
+    expect(res.ok).toBe(false);
+    expect(res.status).toBe(404);
+    expect(res.error).toContain("key does not exist");
+  });
+
+  // A config write's body is a JSON value, so a string must be JSON-encoded.
+  // Sending it bare makes Caddy answer 500 "decoding request body: invalid
+  // character ...". Mocked tests cannot see this, which is how every
+  // string-valued write shipped broken.
+  it("writes a string value as JSON rather than a bare body", async () => {
+    const loadRes = await api.loadConfig({
+      apps: {
+        tls: { automation: { policies: [{ issuers: [{ module: "acme", email: "a@b.test" }] }] } },
+        http: { servers: { srv0: { listen: [":18895"] } } },
+      },
+    });
+    assertOk(loadRes, "loadConfig with apps/tls");
+
+    const res = await api.configPatch("apps/tls/automation/policies/0/issuers/0/email", "changed@b.test");
+    assertOk(res, "configPatch string value");
+
+    const issuer = await api.configGet<{ email?: unknown }>("apps/tls/automation/policies/0/issuers/0");
+    assertOk(issuer, "configGet issuer");
+    expect(issuer.data?.email).toBe("changed@b.test");
+  });
+
+  // The opposite side of that switch: /adapt takes a raw document, so a string
+  // body must NOT be JSON-encoded on the way out.
+  it("still sends a Caddyfile to /adapt as a raw document", async () => {
+    const res = await api.adapt<{ result?: unknown }>(':18896 {\n  respond "ok"\n}\n');
+    assertOk(res, "adapt Caddyfile");
+    expect(res.data?.result).toBeDefined();
+  });
+
   it("configByIdGet + Delete works end-to-end", async () => {
     const loadRes = await api.loadConfig({
       apps: {

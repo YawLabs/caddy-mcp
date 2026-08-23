@@ -246,6 +246,7 @@ async function caddyRequest<T = any>(
   body?: unknown,
   contentType?: string,
   timeout?: number,
+  rawStringBody = false,
 ): Promise<ApiResponse<T>> {
   // Checked here rather than in attemptRequest so it bypasses the retry loop:
   // this is a static configuration mistake, and status 0 would otherwise be
@@ -263,13 +264,13 @@ async function caddyRequest<T = any>(
   }
   const maxRetries = getMaxRetries();
   let attempt = 0;
-  let res: ApiResponse<T> = await attemptRequest<T>(method, path, body, contentType, timeout);
+  let res: ApiResponse<T> = await attemptRequest<T>(method, path, body, contentType, timeout, rawStringBody);
   while (isRetryableMethod(method, path) && isTransientFailure(res) && attempt < maxRetries) {
     attempt++;
     const backoff = Math.min(RETRY_BASE_MS * 2 ** (attempt - 1), RETRY_MAX_DELAY_MS);
     const delay = backoff + Math.random() * RETRY_MAX_JITTER_MS;
     await sleep(delay);
-    res = await attemptRequest<T>(method, path, body, contentType, timeout);
+    res = await attemptRequest<T>(method, path, body, contentType, timeout, rawStringBody);
   }
   return res;
 }
@@ -353,6 +354,7 @@ async function attemptRequest<T = any>(
   body?: unknown,
   contentType?: string,
   timeout?: number,
+  rawStringBody = false,
 ): Promise<ApiResponse<T>> {
   const socketPath = getUnixSocketPath();
   const url = `${getBaseUrl()}${path}`;
@@ -369,7 +371,19 @@ async function attemptRequest<T = any>(
       if (cachedEtag) headers["If-Match"] = cachedEtag;
     }
 
-    const serializedBody = hasBody ? (typeof body === "string" ? body : JSON.stringify(body)) : undefined;
+    // Only /load and /adapt take a raw document as the body (a Caddyfile, an
+    // nginx.conf). Everywhere else the body is a JSON *value*, so a string must
+    // be JSON-encoded -- sending it bare makes Caddy reject the request with
+    //   500 {"error":"decoding request body: invalid character 'x' ..."}
+    // which is what every string-valued config write used to do: caddy_tls's
+    // set_email / set_acme_ca / set_acme_profile, and caddy_config_set or
+    // caddy_config_by_id with a string value. Verified against Caddy 2.11.4:
+    // bare -> 500, JSON-encoded -> 200.
+    const serializedBody = hasBody
+      ? rawStringBody && typeof body === "string"
+        ? body
+        : JSON.stringify(body)
+      : undefined;
     const res = socketPath
       ? await sendViaUnixSocket(socketPath, path, method, headers, serializedBody, effectiveTimeout)
       : await sendViaFetch(url, method, headers, serializedBody, effectiveTimeout);
@@ -537,13 +551,13 @@ function getLoadTimeout(): number {
 }
 
 export async function loadConfig(config: unknown, contentType?: string): Promise<ApiResponse> {
-  const res = await caddyRequest("POST", "/load", config, contentType, getLoadTimeout());
+  const res = await caddyRequest("POST", "/load", config, contentType, getLoadTimeout(), true);
   if (res.ok) etagCache.clear();
   return res;
 }
 
 export function adapt<T = any>(config: string, adapter = "caddyfile"): Promise<ApiResponse<T>> {
-  return caddyRequest<T>("POST", "/adapt", config, `text/${adapter}`);
+  return caddyRequest<T>("POST", "/adapt", config, `text/${adapter}`, undefined, true);
 }
 
 export function stop(): Promise<ApiResponse> {

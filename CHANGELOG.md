@@ -53,6 +53,24 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **String values were sent as raw request bodies on every config write.** A config
+  write's body is a JSON *value*, so a string has to be JSON-encoded; caddy-mcp sent it
+  bare and Caddy answered `500 {"error":"decoding request body: invalid character 'x'
+  looking for beginning of value, at offset 1"}`. This broke `caddy_tls set_email` /
+  `set_acme_ca` / `set_acme_profile`, and `caddy_config_set` / `caddy_config_by_id`
+  whenever the value was a string. `POST /load` and `POST /adapt` still send a raw
+  document (a Caddyfile must not be JSON-encoded), so the raw passthrough is now opt-in
+  per call site instead of applying to every string body.
+- **`caddy_tls`'s clobber-safe fallback used `PUT`, which could never succeed.** Caddy's
+  `PUT` on a non-array key is strictly-create and returns `409 "key already exists: tls"`
+  whenever `apps/tls` is present -- exactly the condition the fallback runs under. It now
+  uses `PATCH`, which requires the key to exist. Together with the encoding bug above,
+  `caddy_tls` write actions only ever succeeded against an instance that had no
+  `apps/tls` block at all.
+
+  Both were invisible to the unit tests, which mock the api module and so never see Caddy
+  reject a verb or a body. The live-Caddy integration suite now pins both, and it runs in
+  `release.sh`.
 - A `CADDY_ADMIN_URL` that plainly means "unix socket" but does not parse as one --
   `unix:/run/caddy.sock` (a single slash) or `unix://relative.sock` -- used to fall
   through to the TCP path and report `Cannot connect to Caddy admin API at null`,

@@ -819,6 +819,24 @@ describe("tool handler behavior", () => {
       handler = getToolHandler(mockServer, "caddy_tls");
     });
 
+    /**
+     * Mock configPatch the way real Caddy actually behaves on the fallback
+     * path: a PATCH of the issuer SUB-path 404s when that key is absent, while
+     * a PATCH of the whole apps/tls object succeeds because apps/tls exists.
+     *
+     * Both writes go through configPatch now, so a blanket
+     * `configPatch.mockResolvedValue(err(...))` would fail the merge too and
+     * silently invert what these tests claim to prove.
+     */
+    function subpathPatchFails(subpathError: any = err(404, "key does not exist")) {
+      api.configPatch.mockImplementation(async (path: string) => (path === "apps/tls" ? ok() : subpathError));
+    }
+
+    /** The merge write: the configPatch call targeting apps/tls as a whole. */
+    function mergeCall(): any[] | undefined {
+      return api.configPatch.mock.calls.find((c: any[]) => c[0] === "apps/tls");
+    }
+
     it("uses PATCH when path already exists (no GET, no POST/PUT)", async () => {
       api.configPatch.mockResolvedValue(ok());
 
@@ -866,7 +884,11 @@ describe("tool handler behavior", () => {
     });
 
     // Branch 2: shape OK — deep-merge into existing config and PUT it back.
-    it("PATCH fails + apps/tls exists with expected shape -> PUTs merged config (preserves siblings)", async () => {
+    // PATCH, never PUT. Caddy's PUT on a non-array key is strictly-create and
+    // returns 409 "key already exists: tls" whenever apps/tls is present --
+    // which is precisely the condition this branch runs under. Verified against
+    // a live Caddy 2.11.4.
+    it("PATCH fails + apps/tls exists with expected shape -> PATCHes merged config (preserves siblings)", async () => {
       const existing = {
         automation: {
           policies: [{ issuers: [{ module: "acme", email: "old@example.com" }] }],
@@ -874,20 +896,21 @@ describe("tool handler behavior", () => {
         },
         certificate_authorities: { custom: { name: "internal" } },
       };
-      api.configPatch.mockResolvedValue(err(500, "key does not exist"));
+      subpathPatchFails();
       api.configGet.mockResolvedValue(ok(existing));
-      api.configPut.mockResolvedValue(ok());
 
       const result = await handler({ action: "set_acme_ca", ca: "https://new.example.com/dir" });
 
-      expect(api.configPut).toHaveBeenCalledTimes(1);
-      const [putPath, putBody] = api.configPut.mock.calls[0];
-      expect(putPath).toBe("apps/tls");
+      // The merge must NOT go out as a PUT -- that is the 409.
+      expect(api.configPut).not.toHaveBeenCalled();
+      const call = mergeCall();
+      expect(call, "expected a configPatch to apps/tls").toBeDefined();
+      const mergedBody = (call as any[])[1];
       // Sibling fields preserved
-      expect(putBody.automation.on_demand).toEqual({ rate_limit: { interval: "10s", burst: 5 } });
-      expect(putBody.certificate_authorities).toEqual({ custom: { name: "internal" } });
+      expect(mergedBody.automation.on_demand).toEqual({ rate_limit: { interval: "10s", burst: 5 } });
+      expect(mergedBody.certificate_authorities).toEqual({ custom: { name: "internal" } });
       // Existing email kept, ca added
-      expect(putBody.automation.policies[0].issuers[0]).toEqual({
+      expect(mergedBody.automation.policies[0].issuers[0]).toEqual({
         module: "acme",
         email: "old@example.com",
         ca: "https://new.example.com/dir",
@@ -905,14 +928,13 @@ describe("tool handler behavior", () => {
           policies: [{ issuers: [{ module: "acme", email: "old@example.com", ca: "https://old.example.com" }] }],
         },
       };
-      api.configPatch.mockResolvedValue(err(500, "key does not exist"));
+      subpathPatchFails();
       api.configGet.mockResolvedValue(ok(existing));
-      api.configPut.mockResolvedValue(ok());
 
       await handler({ action: "set_email", email: "new@example.com" });
 
-      const [, putBody] = api.configPut.mock.calls[0];
-      expect(putBody.automation.policies[0].issuers[0]).toEqual({
+      const mergedBody = (mergeCall() as any[])[1];
+      expect(mergedBody.automation.policies[0].issuers[0]).toEqual({
         module: "acme",
         email: "new@example.com",
         ca: "https://old.example.com",
@@ -1010,16 +1032,17 @@ describe("tool handler behavior", () => {
       expect(result.content[0].text).toContain("post-fail");
     });
 
-    it("PATCH fails + shape OK + PUT fails -> surfaces both PATCH and PUT errors", async () => {
+    it("PATCH fails + shape OK + merge write fails -> surfaces both errors", async () => {
+      // Both writes fail here, so a blanket mock is what we actually want.
       api.configPatch.mockResolvedValue(err(500, "patch-fail"));
       api.configGet.mockResolvedValue(ok({ automation: { policies: [{ issuers: [{ module: "acme" }] }] } }));
-      api.configPut.mockResolvedValue(err(500, "put-fail"));
 
       const result = await handler({ action: "set_email", email: "test@example.com" });
 
       expect(result.isError).toBe(true);
       expect(result.content[0].text).toContain("patch-fail");
-      expect(result.content[0].text).toContain("put-fail");
+      expect(result.content[0].text).toContain("PATCH apps/tls fallback");
+      expect(api.configPut).not.toHaveBeenCalled();
     });
 
     it("returns error when email is missing for set_email", async () => {
@@ -1069,20 +1092,23 @@ describe("tool handler behavior", () => {
       expect(result.isError).toBeFalsy();
     });
 
+    // This is the NORMAL path for set_acme_profile, not an edge case: a fresh
+    // ACME issuer carries no `profile` key, so the sub-path PATCH 404s and the
+    // fallback runs every time. Confirmed against a live Caddy 2.11.4.
     it("set_acme_profile merges into an existing issuer without dropping siblings", async () => {
-      api.configPatch.mockResolvedValue(err(500, "key does not exist"));
+      subpathPatchFails();
       api.configGet.mockResolvedValue(
         ok({
           automation: { policies: [{ issuers: [{ module: "acme", email: "keep@example.com" }] }] },
           certificates: { load_files: [{ certificate: "/c.pem" }] },
         }),
       );
-      api.configPut.mockResolvedValue(ok());
 
-      await handler({ action: "set_acme_profile", profile: "shortlived" });
+      const result = await handler({ action: "set_acme_profile", profile: "shortlived" });
 
-      const [path, body] = api.configPut.mock.calls[0];
-      expect(path).toBe("apps/tls");
+      expect(result.isError).toBeFalsy();
+      expect(api.configPut).not.toHaveBeenCalled();
+      const body = (mergeCall() as any[])[1];
       expect(body.automation.policies[0].issuers[0]).toEqual({
         module: "acme",
         email: "keep@example.com",
