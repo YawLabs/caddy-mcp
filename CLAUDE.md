@@ -91,33 +91,3 @@ npm run lint:fix   # Biome auto-fix
 npm run typecheck  # tsc --noEmit
 npm run test:ci    # Build + test
 ```
-
-## Parallel sessions: use a worktree per session
-
-Two agent sessions sharing this checkout collide in two ways that are easy to
-miss and expensive to unpick: one session's `git checkout` moves HEAD under the
-other mid-task, and an untracked work-in-progress file gets swept into the other
-session's `git add`. Both happened here on 2026-08-23.
-
-Give each session its own worktree instead:
-
-```bash
-git worktree add ../caddy-mcp-worktrees/session-c -b session-c main
-cd ../caddy-mcp-worktrees/session-c && npm ci
-git worktree list          # see them all
-git worktree remove ../caddy-mcp-worktrees/session-c
-```
-
-Each worktree has its own HEAD, branch, and working tree, backed by the one
-shared `.git`, so branches and commits are visible everywhere immediately.
-
-**Worktrees must live OUTSIDE this directory** -- `../caddy-mcp-worktrees/`, not
-`.claude/worktrees/`. `vitest.config.ts` sets no `include`, so vitest uses its
-default `**/*.{test,spec}.?(c|m)[jt]s?(x)` glob: a worktree nested anywhere under
-the repo root makes `npm test` in the MAIN checkout discover every worktree's
-copy of the suite. Being in `.gitignore` does not help -- vitest does not consult
-it (`vcs.useIgnoreFile` is unset in `biome.json` too).
-
-Each worktree needs its own `npm ci` (~170 MB). Do not share one `node_modules`
-via a symlink or junction: that reintroduces exactly the shared mutable state the
-worktrees exist to remove.
