@@ -10,3 +10,10 @@ dist-release/
 # npm auth token -- never commit (a project-local .npmrc can be
 # created by tooling and would carry a live automation token)
 .npmrc
+
+# Windows reserved device names. In Git Bash a redirect like `> NUL` or
+# `2>CONOUT$` creates a real FILE here instead of writing to the device, so
+# these turn up as untracked noise after routine tooling runs. Never
+# legitimate content. (Same class: CON, CONIN$, PRN, AUX, COM1-9, LPT1-9.)
+NUL
+CONOUT$
