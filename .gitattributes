@@ -1,0 +1,24 @@
+# Normalize line endings to LF in the repository and in the working tree on
+# every platform.
+#
+# Why this is load-bearing here:
+#
+#   1. Biome's formatter requires LF, and `npm run lint` is this repo's only
+#      quality gate (there is no CI -- release.sh is the gate). On Windows with
+#      the default `core.autocrlf=true`, a fresh clone checks out CRLF and every
+#      source file fails `biome check`, which blocks a release until the working
+#      tree is renormalized by hand.
+#
+#   2. `release.sh`, `.githooks/pre-push`, `bin/caddy-mcp.mjs` and `scripts/*.mjs`
+#      are executed directly. A shell script committed with CRLF fails on
+#      Linux/macOS with `bash\r: command not found`, and a CRLF shebang breaks
+#      the same way.
+#
+#   3. `npm version` and the release manifest sync rewrite package.json,
+#      package-lock.json and server.json using the platform's line endings, so
+#      releases cut on Windows previously committed those three as CRLF while
+#      everything else stayed LF. `text=auto` normalizes on commit, so the
+#      committed form stays LF no matter which platform wrote the file.
+#
+# `text=auto` still lets git detect binary content and leave it untouched.
+* text=auto eol=lf
