@@ -11,6 +11,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [2.4.0] — 2026-08-31
+
 ### Fixed
 - **The first-run path works.** On an instance with no config, Caddy has no `apps`
   key, so config reads fail the path walk instead of returning empty:
