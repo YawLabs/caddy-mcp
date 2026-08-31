@@ -73,6 +73,30 @@ function invalidateRelated(path: string): void {
   }
 }
 
+/**
+ * The admin API base URL, trailing slashes stripped.
+ *
+ * A PATH PREFIX in CADDY_ADMIN_URL is preserved on purpose. An admin endpoint
+ * fronted by a reverse proxy commonly lives under one
+ * (`https://gw.example.com/caddy-admin`), and dropping it would send every
+ * request to the gateway's root. So the request URL is `<base><path>` --
+ * `configGet("apps")` under that base is `/caddy-admin/config/apps`.
+ *
+ * Two places deliberately do NOT see the prefix:
+ *   - the Origin header (getAdminOrigin), because an origin is scheme+host+port
+ *     by definition and that is what Caddy's allowlist compares against;
+ *   - the connect-failure message, which reports the origin so the operator
+ *     reads a host:port and no credentials leak from a query string.
+ * Everything keyed on the path -- the ETag cache, the retry policy -- runs on
+ * the prefix-free path built by the exported helpers, so a prefix cannot change
+ * either. Only URL composition in attemptRequest sees it.
+ *
+ * A query or fragment in CADDY_ADMIN_URL is operator error, not a supported
+ * form: "http://h:2019/p?token=x" composes to "...?token=x/config/", where the
+ * query swallows the path. Left as-is rather than stripped because there is no
+ * legitimate base URL that carries one, and the connect message already hides
+ * the secret; see the characterization test in api.test.ts.
+ */
 function getBaseUrl(): string {
   return (process.env.CADDY_ADMIN_URL || DEFAULT_URL).replace(/\/+$/, "");
 }
@@ -157,6 +181,38 @@ function getHeaders(contentType?: string, overUnixSocket = false): Record<string
 /** Normalize config path — strip leading /config/ or / if present */
 function normalizePath(path: string): string {
   return path.replace(/^\/?(config(\/|$))?/, "");
+}
+
+/**
+ * Percent-encode a path one SEGMENT at a time.
+ *
+ * Caddy config keys are arbitrary strings -- a server named "prod#1", a key
+ * holding a "?" -- but the result is interpolated straight into a request URL,
+ * where "#" opens a fragment and "?" opens a query. Unencoded,
+ * `configDelete("apps/http/servers/prod#1")` sends
+ * `DELETE /config/apps/http/servers/prod`: everything from the "#" never leaves
+ * the client, so it deletes the PARENT server and reports success. Encoding
+ * turns those into %23 / %3F, so the whole key reaches Caddy and a key that
+ * does not exist 404s instead of silently resolving to a different one.
+ *
+ * Per segment rather than whole-string because encodeURIComponent("/") is
+ * "%2F" -- encoding in one shot would destroy the separator and address a
+ * single top-level key whose name happens to contain slashes.
+ *
+ * Safe because Go decodes it back: net/http parses the request target and
+ * Caddy's admin handler routes on r.URL.Path, which holds the DECODED path, so
+ * %23 arrives at the config lookup as "#".
+ *
+ * ORDERING IS LOAD-BEARING: callers run rejectTraversal on the DECODED path
+ * BEFORE encoding. Encoding first would let a caller-supplied "%2e%2e" past the
+ * check and hand Caddy a real ".." segment; checking first means that input is
+ * escaped to "%252e%252e" and lands as a literal key name.
+ */
+function encodePathSegments(path: string): string {
+  return path
+    .split("/")
+    .map((segment) => encodeURIComponent(segment))
+    .join("/");
 }
 
 /** Reject path-traversal segments so config-scoped tools can't reach sibling admin endpoints like /load or /stop. */
@@ -495,35 +551,35 @@ export function configGet<T = any>(path = ""): Promise<ApiResponse<T>> {
   const normalized = normalizePath(path);
   const bad = rejectTraversal(normalized);
   if (bad) return Promise.resolve(bad);
-  return caddyRequest("GET", `/config/${normalized}`);
+  return caddyRequest("GET", `/config/${encodePathSegments(normalized)}`);
 }
 
 export function configPost<T = any>(path: string, value: unknown): Promise<ApiResponse<T>> {
   const normalized = normalizePath(path);
   const bad = rejectTraversal(normalized);
   if (bad) return Promise.resolve(bad);
-  return caddyRequest("POST", `/config/${normalized}`, value);
+  return caddyRequest("POST", `/config/${encodePathSegments(normalized)}`, value);
 }
 
 export function configPut<T = any>(path: string, value: unknown): Promise<ApiResponse<T>> {
   const normalized = normalizePath(path);
   const bad = rejectTraversal(normalized);
   if (bad) return Promise.resolve(bad);
-  return caddyRequest("PUT", `/config/${normalized}`, value);
+  return caddyRequest("PUT", `/config/${encodePathSegments(normalized)}`, value);
 }
 
 export function configPatch<T = any>(path: string, value: unknown): Promise<ApiResponse<T>> {
   const normalized = normalizePath(path);
   const bad = rejectTraversal(normalized);
   if (bad) return Promise.resolve(bad);
-  return caddyRequest("PATCH", `/config/${normalized}`, value);
+  return caddyRequest("PATCH", `/config/${encodePathSegments(normalized)}`, value);
 }
 
 export function configDelete<T = any>(path: string): Promise<ApiResponse<T>> {
   const normalized = normalizePath(path);
   const bad = rejectTraversal(normalized);
   if (bad) return Promise.resolve(bad);
-  return caddyRequest("DELETE", `/config/${normalized}`);
+  return caddyRequest("DELETE", `/config/${encodePathSegments(normalized)}`);
 }
 
 function getRequestTimeout(): number {
@@ -571,13 +627,25 @@ export function getUpstreams(): Promise<ApiResponse> {
 export function getPki(ca = "local"): Promise<ApiResponse> {
   const bad = rejectTraversal(ca);
   if (bad) return Promise.resolve(bad);
-  return caddyRequest("GET", `/pki/ca/${ca}`);
+  return caddyRequest("GET", `/pki/ca/${encodePathSegments(ca)}`);
 }
 
 export function getPkiCertificates(ca = "local"): Promise<ApiResponse> {
   const bad = rejectTraversal(ca);
   if (bad) return Promise.resolve(bad);
-  return caddyRequest("GET", `/pki/ca/${ca}/certificates`);
+  return caddyRequest("GET", `/pki/ca/${encodePathSegments(ca)}/certificates`);
+}
+
+/**
+ * Compose `/id/<id>` or `/id/<id>/<subpath>`, both halves segment-encoded.
+ *
+ * Segment-encoded rather than encodeURIComponent'd whole so a "/" in either
+ * half keeps the separator meaning it has today -- this fix is about "#" and
+ * "?" truncating the URL, not about tightening what counts as one key.
+ */
+function idPath(id: string, subpath: string): string {
+  const encodedId = encodePathSegments(id);
+  return subpath ? `/id/${encodedId}/${encodePathSegments(subpath)}` : `/id/${encodedId}`;
 }
 
 export function configByIdGet<T = any>(id: string, subpath = ""): Promise<ApiResponse<T>> {
@@ -585,7 +653,7 @@ export function configByIdGet<T = any>(id: string, subpath = ""): Promise<ApiRes
   if (badId) return Promise.resolve(badId);
   const bad = rejectTraversal(subpath);
   if (bad) return Promise.resolve(bad);
-  const path = subpath ? `/id/${id}/${subpath}` : `/id/${id}`;
+  const path = idPath(id, subpath);
   return caddyRequest("GET", path);
 }
 
@@ -599,7 +667,7 @@ export function configByIdSet<T = any>(
   if (badId) return Promise.resolve(badId);
   const bad = rejectTraversal(subpath);
   if (bad) return Promise.resolve(bad);
-  const path = subpath ? `/id/${id}/${subpath}` : `/id/${id}`;
+  const path = idPath(id, subpath);
   return caddyRequest(method, path, value);
 }
 
@@ -608,7 +676,7 @@ export function configByIdDelete<T = any>(id: string, subpath = ""): Promise<Api
   if (badId) return Promise.resolve(badId);
   const bad = rejectTraversal(subpath);
   if (bad) return Promise.resolve(bad);
-  const path = subpath ? `/id/${id}/${subpath}` : `/id/${id}`;
+  const path = idPath(id, subpath);
   return caddyRequest("DELETE", path);
 }
 

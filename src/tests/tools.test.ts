@@ -335,6 +335,73 @@ describe("caddy-mcp tools", () => {
     });
   });
 
+  describe("caddy_reverse_proxy `to` bounds", () => {
+    async function getReverseProxySchema() {
+      const calls: any[] = [];
+      const mockServer = {
+        tool: vi.fn((...args: any[]) => calls.push(args)),
+        resource: vi.fn(),
+      };
+      const { registerRouteTools } = await import("../tools/routes.js");
+      registerRouteTools(mockServer as any);
+      return calls.find((c) => c[0] === "caddy_reverse_proxy")?.[2];
+    }
+
+    it("accepts a non-empty list of non-empty upstreams", async () => {
+      const schema = await getReverseProxySchema();
+      expect(() => schema.to.parse(["localhost:3000"])).not.toThrow();
+      expect(() => schema.to.parse(["https://backend.example.com", "https://b.example.com:9443"])).not.toThrow();
+    });
+
+    it("rejects an empty list and empty entries at the schema boundary", async () => {
+      const schema = await getReverseProxySchema();
+      // A reverse_proxy with no upstreams (or a "" upstream) is a route that
+      // 502s every request. The handler refuses these too -- see the runtime
+      // guards in handlers.test.ts -- but rejecting here means a real MCP call
+      // never reaches the handler with them.
+      expect(() => schema.to.parse([])).toThrow();
+      expect(() => schema.to.parse([""])).toThrow();
+      expect(() => schema.to.parse(["localhost:3000", ""])).toThrow();
+    });
+  });
+
+  describe("destructive/idempotent annotations", () => {
+    async function getAnnotations(toolName: string) {
+      const calls: any[] = [];
+      const mockServer = {
+        tool: vi.fn((...args: any[]) => calls.push(args)),
+        resource: vi.fn(),
+      };
+      const { registerConfigTools } = await import("../tools/config.js");
+      const { registerRouteTools } = await import("../tools/routes.js");
+      registerConfigTools(mockServer as any);
+      registerRouteTools(mockServer as any);
+      return calls.find((c) => c[0] === toolName)?.[3];
+    }
+
+    // Both hints describe the TOOL, and a host gates on them before it can see
+    // which action or targeting mode a given call carries -- so the worst case
+    // reachable through the tool is what has to be advertised.
+    it("caddy_config_by_id advertises its delete action as destructive", async () => {
+      // action='delete' removes the identified object and every descendant,
+      // exactly like caddy_config_delete; action='set' with mode='append' is a
+      // POST, so a repeat appends a second copy.
+      expect(await getAnnotations("caddy_config_by_id")).toMatchObject({
+        destructiveHint: true,
+        idempotentHint: false,
+      });
+    });
+
+    it("caddy_remove_route advertises the weaker of its two targeting modes", async () => {
+      // @id removal is idempotent; index removal is not -- Caddy re-packs the
+      // routes array, so index 2 twice removes two different routes.
+      expect(await getAnnotations("caddy_remove_route")).toMatchObject({
+        destructiveHint: true,
+        idempotentHint: false,
+      });
+    });
+  });
+
   describe("caddy_config_set default mode", () => {
     it("defaults to overwrite (PATCH), not append", async () => {
       const calls: any[] = [];

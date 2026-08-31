@@ -49,7 +49,12 @@ function describeServer(rawValue: unknown): string {
       : {};
   const listen: unknown[] = Array.isArray(raw.listen) ? raw.listen : [];
   const routes: unknown[] = Array.isArray(raw.routes) ? raw.routes : [];
-  const hasExplicitTls = !!raw.tls_connection_policies;
+  // An empty tls_connection_policies array configures nothing, so it must read the same
+  // as an absent key: fall through to the listen-port heuristic rather than claim
+  // "enabled". A present-but-non-array value is a malformed config we can't interpret --
+  // keep the old "something is there" reading for it rather than silently calling it off.
+  const tlsPolicies = raw.tls_connection_policies;
+  const hasExplicitTls = Array.isArray(tlsPolicies) ? tlsPolicies.length > 0 : !!tlsPolicies;
   const listensHttps = listen.some((l) => typeof l === "string" && HTTPS_PORT_RE.test(l));
   const tls = hasExplicitTls ? "enabled" : listensHttps ? "auto (HTTPS)" : "off (HTTP only)";
   const listenStr = listen.length > 0 ? listen.map(String).join(", ") : "default";

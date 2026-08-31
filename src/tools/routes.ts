@@ -74,7 +74,10 @@ const ROUTES_SUMMARY_MAX = 500;
  */
 function serializeRoutesCapped(routes: unknown[]): { json: string; shown: number } {
   const parts: string[] = [];
-  let used = 2; // the enclosing "[" and "]"
+  // Fixed overhead of the wrapper: the opening "[", the "\n" that precedes the
+  // closing bracket, and the "]" itself. The "\n" AFTER the "[" is charged to
+  // the first entry below (as its cost of 1), so it is not counted here.
+  let used = 3;
   for (const route of routes) {
     const entry = JSON.stringify(route, null, 2)
       .split("\n")
@@ -166,6 +169,90 @@ function cleanUpstreamAddr(addr: string): string {
 }
 
 /**
+ * Append `port` to an upstream dial address that carries none.
+ *
+ * A Caddy `dial` is a socket address, not a URL: it has no scheme left to
+ * imply a port once cleanUpstreamAddr has stripped one. Writing the bare host
+ * for "https://backend.example.com" would therefore aim the connection at
+ * whatever a portless dial resolves to rather than at 443, so make the port
+ * the caller meant explicit instead of inheriting a default.
+ *
+ * stripPort() doubles as the port DETECTOR here: it returns its input
+ * unchanged exactly when there is nothing it recognizes as a port to strip
+ * (including the bare-IPv6 case documented on it). That bare-IPv6 form has to
+ * be bracketed before a port can be appended -- "::1:443" reads as another
+ * address group, not as host + port.
+ */
+function withDefaultPort(dial: string, port: number): string {
+  if (stripPort(dial) !== dial) return dial;
+  const bareIpv6 = !dial.startsWith("[") && dial.indexOf(":") !== dial.lastIndexOf(":");
+  return bareIpv6 ? `[${dial}]:${port}` : `${dial}:${port}`;
+}
+
+interface UpstreamPlan {
+  /** Dial addresses, scheme stripped and (for TLS upstreams) port-normalized. */
+  dials: string[];
+  /** True when the handler must carry a TLS transport to reach these upstreams. */
+  tls: boolean;
+}
+
+/**
+ * Resolve the `to` list into dial addresses plus whether the reverse_proxy
+ * handler needs a TLS transport.
+ *
+ * The scheme is load-bearing, not decoration. Caddy dials an upstream in the
+ * clear unless the HANDLER also carries `transport: { protocol: "http",
+ * tls: {} }`, so quietly reducing "https://backend" to `{ dial: "backend" }`
+ * is a security downgrade the caller never sees. An https upstream therefore
+ * emits the transport and pins :443 rather than having its scheme normalized
+ * away.
+ *
+ * A list mixing http and https upstreams is REFUSED rather than resolved:
+ * `transport` is a property of the whole handler, not of an individual
+ * upstream, so either choice would silently apply one entry's scheme to the
+ * other's connection. Splitting them into two routes -- or hand-writing the
+ * handler with caddy_add_route -- keeps that decision with the caller.
+ */
+function planUpstreams(to: string[]): UpstreamPlan | { error: string } {
+  if (to.length === 0) {
+    return { error: `"to" must list at least one upstream address (e.g. ["localhost:3000"]).` };
+  }
+  const dials: string[] = [];
+  let secure = 0;
+  let plain = 0;
+  for (const raw of to) {
+    // Trim for the same reason `from` is trimmed: surrounding whitespace would
+    // otherwise become part of the dial address.
+    const trimmed = raw.trim();
+    // Case-sensitive, matching cleanUpstreamAddr's strip -- a scheme this test
+    // recognizes must be one the strip also removes, or the "scheme" would
+    // survive into the dial address.
+    const isTls = trimmed.startsWith("https://");
+    const dial = cleanUpstreamAddr(trimmed);
+    if (dial.length === 0) {
+      return {
+        error:
+          `upstream ${JSON.stringify(raw)} has no address to dial. Each "to" entry needs a host ` +
+          `and port (e.g. "localhost:3000", "https://backend.example.com:8443").`,
+      };
+    }
+    if (isTls) secure++;
+    else plain++;
+    dials.push(isTls ? withDefaultPort(dial, 443) : dial);
+  }
+  if (secure > 0 && plain > 0) {
+    return {
+      error:
+        `"to" mixes https:// and non-https upstreams. Caddy's TLS transport applies to the whole ` +
+        `reverse_proxy handler, not per-upstream, so one scheme would be silently forced on the ` +
+        `other's connection. Split them into two routes, or build the handler explicitly with ` +
+        `caddy_add_route.`,
+    };
+  }
+  return { dials, tls: secure > 0 };
+}
+
+/**
  * Detect Caddy's "parent path does not exist" failure mode for a config write.
  *
  * Caddy returns this when writing to a path whose parent (e.g.
@@ -226,6 +313,39 @@ function serverNotFoundError(srv: string, op = "operation") {
   };
 }
 
+/**
+ * A read of `apps/http/servers/<srv>` that came back as a JSON `null`.
+ *
+ * Deliberately NOT serverNotFoundError, and deliberately not worded as "does not
+ * exist". Caddy answers an UNKNOWN server with HTTP 200 and a body of literal
+ * `null` -- not a 404 -- and it answers a server whose config IS null with byte
+ * identical output. Verified against Caddy 2.11.4:
+ *   GET /config/apps/http/servers/typo    -> 200 null   (no such key)
+ *   GET /config/apps/http/servers/nulled  -> 200 null   (key present, value null)
+ * Nothing downstream can separate the two, so this names both causes rather than
+ * picking one. Asserting the likelier cause here is the mistake that shipped in
+ * 1.2.5 and had to be deprecated: a confident message pointing at the wrong thing
+ * is worse than an honest ambiguous one.
+ *
+ * An empty OBJECT is a different answer and must not land here -- `{}` is a real,
+ * routeless server, which the summary path renders as "no routes configured".
+ */
+function serverNullError(srv: string) {
+  return {
+    isError: true,
+    content: [
+      {
+        type: "text" as const,
+        text:
+          `Error: Server "${srv}" is not configured, or its config is null -- Caddy returns the same ` +
+          `response (HTTP 200 with a body of null) for both, so they cannot be told apart from here. ` +
+          `Use caddy_list_servers to see which servers exist, or create this one with caddy_load or ` +
+          `caddy_config_set at path 'apps/http/servers/${srv}' with at minimum: { "listen": [":443"] }`,
+      },
+    ],
+  };
+}
+
 export function registerRouteTools(server: McpServer) {
   server.tool(
     "caddy_reverse_proxy",
@@ -233,13 +353,19 @@ export function registerRouteTools(server: McpServer) {
       "When `id` is OMITTED the route is appended to the server's routes array — calling the tool twice with the same args produces TWO duplicate routes (non-idempotent). " +
       "When `id` is SUPPLIED the route is written via PATCH under that @id, so repeat calls REPLACE in place (idempotent). " +
       "Strongly recommended: supply a stable `id` for any route managed from automation or production tooling. " +
-      "Note: @ids are config-global in Caddy (NOT route-scoped). If `id` collides with an @id used by a non-route object (TLS issuer, server, etc.) the call refuses with an error rather than clobbering it. Once an @id is registered to a route under one server, subsequent calls update that route in place regardless of the `server` argument.",
+      "Note: @ids are config-global in Caddy (NOT route-scoped). If `id` collides with an @id used by a non-route object (TLS issuer, server, etc.) the call refuses with an error rather than clobbering it. Once an @id is registered to a route under one server, subsequent calls update that route in place regardless of the `server` argument. " +
+      "Upstream scheme is honored: an `https://` upstream gets a TLS transport and defaults to port 443, anything else is dialed in the clear. A `to` list that MIXES https:// and non-https entries is refused — the TLS transport applies to the whole handler, not per-upstream — so split those into two routes or use caddy_add_route.",
     {
       from: z
         .string()
         .min(1)
         .describe("Domain, path, or domain/path to match (e.g., 'api.local', '/api/*', 'app.local/ws')"),
-      to: z.array(z.string()).describe("Upstream addresses (e.g., ['localhost:3000', 'localhost:3001'])"),
+      to: z
+        .array(z.string().min(1))
+        .min(1)
+        .describe(
+          "Upstream addresses, at least one (e.g., ['localhost:3000', 'localhost:3001']). An 'https://' prefix dials the upstream over TLS (port 443 unless one is given); http:// and bare addresses are dialed in the clear. Do not mix https:// and non-https entries in one call.",
+        ),
       server: z
         .string()
         .regex(/^[\w-]{1,128}$/)
@@ -275,15 +401,27 @@ export function registerRouteTools(server: McpServer) {
           ],
         };
       }
-      const cleanedTo = to.map(cleanUpstreamAddr);
+      const plan = planUpstreams(to);
+      if ("error" in plan) {
+        return {
+          isError: true,
+          content: [{ type: "text" as const, text: `Error: ${plan.error}` }],
+        };
+      }
+      const cleanedTo = plan.dials;
+      const proxyHandler: Record<string, unknown> = {
+        handler: "reverse_proxy",
+        upstreams: cleanedTo.map((addr) => ({ dial: addr })),
+      };
+      // Only set on the TLS path so a plain-http route keeps the exact handler
+      // shape it has always had -- `transport` present-but-empty is not the
+      // same config as `transport` absent.
+      if (plan.tls) {
+        proxyHandler.transport = { protocol: "http", tls: {} };
+      }
       const route: Record<string, unknown> = {
         match: [match],
-        handle: [
-          {
-            handler: "reverse_proxy",
-            upstreams: cleanedTo.map((addr) => ({ dial: addr })),
-          },
-        ],
+        handle: [proxyHandler],
         terminal: true,
       };
       if (id) {
@@ -424,6 +562,18 @@ export function registerRouteTools(server: McpServer) {
     async ({ server: srv }) => {
       const serverRes = await api.configGet<CaddyServerConfig>(`apps/http/servers/${srv}`);
       if (!serverRes.ok) return formatResult(serverRes);
+
+      // A `null` body is a 200, so the guard above never catches it. Without this
+      // check the `|| {}` below collapses null into an empty config and an unknown
+      // server renders as `Server "typo" (listen: default) -- no routes configured`
+      // with no isError flag: the operator is told a server they believe is live
+      // has no routes, which invites them to overwrite it. `undefined` (an empty
+      // response body) is folded in here too -- it carries no more information than
+      // null does. Anything else, INCLUDING `{}`, is a real server and falls
+      // through: `{}` is a legitimately routeless server, not a missing one.
+      if (serverRes.data === null || serverRes.data === undefined) {
+        return serverNullError(srv);
+      }
 
       const serverConfig = serverRes.data || {};
       const routes: unknown[] = Array.isArray(serverConfig.routes) ? serverConfig.routes : [];
@@ -581,7 +731,9 @@ export function registerRouteTools(server: McpServer) {
 
   server.tool(
     "caddy_remove_route",
-    "Remove a route. Target by @id (preferred — stable across reorderings) or by array index on a specific server. Index-based removal is a two-step read-then-delete and can race against concurrent edits; prefer @id when possible.",
+    "Remove a route. Target by @id (preferred — stable across reorderings) or by array index on a specific server. Index-based removal is a two-step read-then-delete and can race against concurrent edits; prefer @id when possible. " +
+      "Only the @id mode is idempotent: a repeat call cannot remove a different route, it just reports the id as gone. The index mode is NOT — Caddy re-packs the routes array after a removal, so calling with index 2 twice removes TWO DIFFERENT routes. " +
+      "@ids are config-global in Caddy (NOT route-scoped): if `id` resolves to a non-route object (TLS issuer, server, etc.) the call refuses rather than deleting it.",
     {
       id: z
         .string()
@@ -602,7 +754,12 @@ export function registerRouteTools(server: McpServer) {
         .describe("Caddy server name when using index (default: srv0). Ignored when id is provided."),
       confirm: z.boolean().optional().default(false).describe("Must be true to actually remove the route (safety)"),
     },
-    { readOnlyHint: false, destructiveHint: true, idempotentHint: true, openWorldHint: false },
+    // idempotentHint is false because the hint covers the TOOL, and hosts gate
+    // on it before they can see which targeting mode a given call carries. The
+    // @id path is idempotent; the index path is not -- Caddy re-packs the
+    // routes array on removal, so a repeated index deletes a different route
+    // each time. The weaker of the two has to win.
+    { readOnlyHint: false, destructiveHint: true, idempotentHint: false, openWorldHint: false },
     async ({ id, index, server: srv, confirm }) => {
       if (!id && index === undefined) {
         return {
@@ -623,6 +780,35 @@ export function registerRouteTools(server: McpServer) {
         };
       }
       if (id) {
+        // GET before DELETE, mirroring caddy_reverse_proxy's guard on the write
+        // path. @ids are config-global in Caddy, not route-scoped, so
+        // DELETE /id/<id> will happily remove a TLS issuer, a server block, or
+        // a nested handler that happens to share the id -- and a delete, unlike
+        // a botched write, has nothing left to inspect afterwards.
+        const existing = await api.configByIdGet(id);
+        // Keep the two failure modes distinct: an @id that does not resolve AT
+        // ALL is a different problem from one that resolves to the wrong kind
+        // of object, and only the caller can tell which one they meant. Surface
+        // the API response verbatim rather than translating it into the
+        // wrong-shape refusal below.
+        if (!existing.ok) return formatResult(existing);
+        if (!isRouteShape(existing.data)) {
+          return {
+            isError: true,
+            content: [
+              {
+                type: "text" as const,
+                text:
+                  `Error: @id "${id}" resolves to a non-route config object ` +
+                  `(no top-level "handle" array). @ids are config-global in Caddy, not ` +
+                  `route-scoped -- refusing to delete it as a route. Inspect it with ` +
+                  `caddy_config_by_id { id: "${id}", action: "get" }, and if you did mean to ` +
+                  `remove that object, delete it deliberately with ` +
+                  `caddy_config_by_id { id: "${id}", action: "delete", confirm: true }.`,
+              },
+            ],
+          };
+        }
         const res = await api.configByIdDelete(id);
         if (res.ok) return { content: [{ type: "text" as const, text: `Route @id="${id}" removed.` }] };
         return formatResult(res);

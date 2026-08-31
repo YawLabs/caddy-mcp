@@ -1,6 +1,9 @@
 import { beforeAll, beforeEach, describe, expect, it } from "vitest";
 import type { ApiResponse } from "../api.js";
 import * as api from "../api.js";
+import { registerAdaptTools } from "../tools/adapt.js";
+import { registerOperationalTools } from "../tools/operational.js";
+import { registerRouteTools } from "../tools/routes.js";
 
 const RUN = process.env.CADDY_MCP_INTEGRATION === "1";
 
@@ -400,5 +403,128 @@ describe.skipIf(!RUN)("integration: live Caddy admin API", () => {
 
     const getAfter = await api.configByIdGet("integration-route");
     expect(getAfter.ok).toBe(false);
+  });
+
+  // Tool handlers, not the api module. Each case below turns on a response
+  // shape only a real Caddy produces -- a failed path traversal, a server
+  // object with no keys, an adapter syntax error -- so the mocked suite in
+  // tools.test.ts (which feeds hand-built 200s) can never reach them.
+  describe("tool handlers against live Caddy", () => {
+    type ToolResult = { isError?: boolean; content: Array<{ type: string; text: string }> };
+
+    /**
+     * Register a tool module against a stand-in server and return one tool's
+     * handler (argument 5 of server.tool), the same way tools.test.ts does.
+     *
+     * Calling the handler directly bypasses zod, so every argument has to be
+     * passed explicitly -- schema defaults like server="srv0" do not apply.
+     */
+    function getHandler(register: (server: any) => void, name: string) {
+      const calls: any[][] = [];
+      register({ tool: (...args: any[]) => calls.push(args), resource: () => {} });
+      const handler = calls.find((c) => c[0] === name)?.[4];
+      if (typeof handler !== "function") throw new Error(`tool ${name} was not registered`);
+      return handler as (args: Record<string, unknown>) => Promise<ToolResult>;
+    }
+
+    // A server GET that fails must be surfaced verbatim rather than falling
+    // through to the summary path. On an instance carrying no apps/http at all,
+    // Caddy answers 400 "invalid traversal path" -- if that guard regressed the
+    // tool would print "no routes configured" for a server it never read,
+    // telling an operator a live server is empty and inviting an overwrite.
+    //
+    // This covers the GET-FAILS path -- reachable only while apps/http/servers is
+    // absent entirely, which makes Caddy reject the traversal. The far more common
+    // mistyped-name case takes the null path pinned in the next test.
+    it("caddy_list_routes surfaces a failed server GET rather than reporting an empty server", async () => {
+      const handler = getHandler(registerRouteTools, "caddy_list_routes");
+      const result = await handler({ server: "does-not-exist" });
+      expect(result.isError).toBe(true);
+      expect(result.content[0].text).toContain("invalid traversal path");
+      expect(result.content[0].text).not.toContain("no routes configured");
+    });
+
+    // The live half of the null-body bug. Only a real Caddy produces this shape,
+    // which is why it went unnoticed: every mocked fixture returned a populated
+    // 200, so no test ever saw an unknown server answered with `200 null`.
+    it("caddy_list_routes errors on a mistyped server name once servers exist", async () => {
+      const loaded = await loadAndSettle({
+        apps: { http: { servers: { real: { listen: [":18871"], routes: [] } } } },
+      });
+      assertOk(loaded, "loadConfig one real server");
+
+      // Confirm the premise against this Caddy rather than trusting the note:
+      // an unknown key really is 200 + null, not a 404.
+      const probe = await api.configGet("apps/http/servers/typo");
+      expect(probe.ok).toBe(true);
+      expect(probe.data).toBeNull();
+
+      const handler = getHandler(registerRouteTools, "caddy_list_routes");
+      const result = await handler({ server: "typo" });
+      expect(result.isError).toBe(true);
+      expect(result.content[0].text).toContain("is not configured, or its config is null");
+      expect(result.content[0].text).not.toContain("no routes configured");
+
+      // The real neighbour must still list normally -- the guard keys on the
+      // response body, not on the name.
+      const good = await handler({ server: "real" });
+      expect(good.isError).toBeFalsy();
+      expect(good.content[0].text).toContain("no routes configured");
+    });
+
+    // 2.11.4 accepts a server object with no keys at all, and that is exactly
+    // the shape serverNotFoundError tells operators to create. Without the
+    // Array.isArray guards, routes.length would throw on undefined.
+    it("caddy_list_routes reports a keyless or empty server instead of crashing", async () => {
+      const noKeys = await loadAndSettle({ apps: { http: { servers: { srv0: {} } } } });
+      assertOk(noKeys, "loadConfig keyless server");
+
+      const handler = getHandler(registerRouteTools, "caddy_list_routes");
+      const bare = await handler({ server: "srv0" });
+      expect(bare.isError).toBeFalsy();
+      expect(bare.content[0].text).toContain("Server srv0 (listen: default)");
+      expect(bare.content[0].text).toContain("no routes configured");
+
+      // Present-but-empty listen/routes take the same path: an empty listen
+      // array still renders as "default", not as a trailing "listen: ".
+      const empty = await loadAndSettle({ apps: { http: { servers: { srv0: { listen: [], routes: [] } } } } });
+      assertOk(empty, "loadConfig empty listen and routes");
+
+      const emptied = await handler({ server: "srv0" });
+      expect(emptied.isError).toBeFalsy();
+      expect(emptied.content[0].text).toContain("Server srv0 (listen: default)");
+      expect(emptied.content[0].text).toContain("no routes configured");
+    });
+
+    // On an instance with no apps/http, GET /config/apps/http/servers is a 400,
+    // not an empty object -- so caddy_list_servers reaches formatResult and
+    // never gets to say "No HTTP servers configured". Every mocked test feeds
+    // an ok({...}), so no test has seen what a bare Caddy actually answers.
+    it("caddy_list_servers surfaces the empty-instance failure rather than 'No HTTP servers configured'", async () => {
+      const handler = getHandler(registerOperationalTools, "caddy_list_servers");
+      const result = await handler({});
+      expect(result.isError).toBe(true);
+      expect(result.content[0].text).toContain("invalid traversal path");
+      expect(result.content[0].text).not.toContain("No HTTP servers configured");
+    });
+
+    // An adapter failure has to come back as an error result. If this guard
+    // regressed, a typo'd Caddyfile would render as "OK (no output)" -- the
+    // undefined `result` field of an error body -- and an operator would
+    // believe it converted cleanly and go on to load it.
+    it("caddy_adapt reports an adapter failure as an error, not a clean conversion", async () => {
+      const handler = getHandler(registerAdaptTools, "caddy_adapt");
+
+      const malformed = await handler({ config: "this is not { a valid", adapter: "caddyfile" });
+      expect(malformed.isError).toBe(true);
+      expect(malformed.content[0].text).toContain("syntax error");
+      expect(malformed.content[0].text).not.toContain("OK (no output)");
+
+      // Same for an adapter this Caddy build does not carry: the schema accepts
+      // the name, only the server can reject it.
+      const unknownAdapter = await handler({ config: "server {}", adapter: "nginx" });
+      expect(unknownAdapter.isError).toBe(true);
+      expect(unknownAdapter.content[0].text).toContain("unrecognized config adapter");
+    });
   });
 });

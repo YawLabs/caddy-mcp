@@ -195,13 +195,24 @@ export function registerConfigTools(server: McpServer) {
       const current = await api.configGet();
       const res = await api.loadConfig(snap.config, "application/json");
       if (!res.ok) return formatResult(res);
-      if (current.ok && isSnapshotableConfig(current.data)) {
+      const capturedRollforward = current.ok && isSnapshotableConfig(current.data);
+      if (capturedRollforward) {
         saveSnapshot(current.data, "caddy_revert");
       }
       const when = new Date(snap.timestamp).toISOString();
+      // Say so when the safety net was skipped. The load is what decides success,
+      // so a failed pre-revert read does NOT make this a failed revert -- but it
+      // does mean the config that was just replaced went unrecorded and this revert
+      // cannot itself be reverted. Reporting a bare success would hide that at
+      // exactly the moment it matters, and the read fails for an ordinary reason:
+      // Caddy restarts its admin listener on every /load, so a revert issued during
+      // that window loses the roll-forward snapshot while everything else succeeds.
+      const note = capturedRollforward
+        ? ""
+        : " Warning: the pre-revert config could not be read, so no roll-forward snapshot was captured -- this revert cannot be undone with caddy_revert.";
       return {
         content: [
-          { type: "text" as const, text: `Reverted to snapshot [${index}] (${when}, trigger=${snap.trigger}).` },
+          { type: "text" as const, text: `Reverted to snapshot [${index}] (${when}, trigger=${snap.trigger}).${note}` },
         ],
       };
     },
@@ -231,7 +242,13 @@ export function registerConfigTools(server: McpServer) {
         .default(false)
         .describe("Must be true to actually delete (only enforced for action='delete')"),
     },
-    { readOnlyHint: false, destructiveHint: false, idempotentHint: false, openWorldHint: false },
+    // destructiveHint is keyed to the worst thing this tool can do, not the
+    // default action: action='delete' removes the identified object and every
+    // descendant, exactly like caddy_config_delete. Hosts gate on the hint
+    // before they can see which action the call carries.
+    // idempotentHint stays false for the same reason -- action='set' with
+    // mode='append' is a POST, so a repeated call appends a second copy.
+    { readOnlyHint: false, destructiveHint: true, idempotentHint: false, openWorldHint: false },
     async ({ id, action, value, subpath, mode, confirm }) => {
       if (action === "get") {
         return formatResult(await api.configByIdGet(id, subpath));
@@ -261,7 +278,14 @@ export function registerConfigTools(server: McpServer) {
         }
         return formatResult(await api.configByIdDelete(id, subpath));
       }
-      return { isError: true, content: [{ type: "text" as const, text: `Unknown action: ${action}` }] };
+      // Not live error handling: the three branches above cover every member of
+      // the `action` enum, so `action` is `never` here. The assignment is the
+      // exhaustiveness check -- adding a fourth action to the enum without a
+      // branch for it fails to compile on this line rather than silently
+      // falling through. The return only exists because TypeScript requires a
+      // terminal one.
+      const unhandled: never = action;
+      return { isError: true, content: [{ type: "text" as const, text: `Unknown action: ${String(unhandled)}` }] };
     },
   );
 }

@@ -1,6 +1,18 @@
 import type { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
+import type { ApiResponse } from "./api.js";
 import * as api from "./api.js";
 import { applyMetricsControls, METRICS_DEFAULT_MAX_LINES } from "./tools/operational.js";
+
+/**
+ * Error body for a failed resource read. Mirrors the tool-side fallback in
+ * format.ts: `error` is optional on ApiResponse, and only the failure paths
+ * api.ts builds itself are guaranteed to fill it -- so interpolating it bare
+ * renders the literal string "Error: undefined" to the client. Falling back to
+ * the status code at least tells the caller what the server said.
+ */
+function errorText(res: ApiResponse): string {
+  return `Error: ${res.error || `HTTP ${res.status}`}`;
+}
 
 export function registerResources(server: McpServer) {
   server.resource("caddy-config", "caddy://config", { description: "Current Caddy JSON configuration" }, async () => {
@@ -10,7 +22,7 @@ export function registerResources(server: McpServer) {
         {
           uri: "caddy://config",
           mimeType: res.ok ? "application/json" : "text/plain",
-          text: res.ok ? JSON.stringify(res.data ?? {}, null, 2) : `Error: ${res.error}`,
+          text: res.ok ? JSON.stringify(res.data ?? {}, null, 2) : errorText(res),
         },
       ],
     };
@@ -27,7 +39,7 @@ export function registerResources(server: McpServer) {
           {
             uri: "caddy://upstreams",
             mimeType: res.ok ? "application/json" : "text/plain",
-            text: res.ok ? JSON.stringify(res.data ?? {}, null, 2) : `Error: ${res.error}`,
+            text: res.ok ? JSON.stringify(res.data ?? {}, null, 2) : errorText(res),
           },
         ],
       };
@@ -49,7 +61,7 @@ export function registerResources(server: McpServer) {
             {
               uri: "caddy://metrics",
               mimeType: "text/plain",
-              text: `Error: ${res.error}`,
+              text: errorText(res),
             },
           ],
         };
@@ -78,7 +90,7 @@ export function registerResources(server: McpServer) {
           {
             uri: "caddy://servers",
             mimeType: res.ok ? "application/json" : "text/plain",
-            text: res.ok ? JSON.stringify(res.data ?? {}, null, 2) : `Error: ${res.error}`,
+            text: res.ok ? JSON.stringify(res.data ?? {}, null, 2) : errorText(res),
           },
         ],
       };

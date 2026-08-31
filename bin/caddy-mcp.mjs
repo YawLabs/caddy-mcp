@@ -32,11 +32,25 @@
  * `CADDY_MCP_SANDBOX=1` runs the server under oam's permission model.
  *
  * The admin API endpoint is DERIVED from CADDY_ADMIN_URL (default
- * http://127.0.0.1:2019), host and port both pinned -- grants are prefix-matched,
- * so a bare host would also admit every other port on it. Filesystem AND
- * child-process both stay denied: this server drives Caddy entirely over its
- * admin HTTP API and never shells out to the `caddy` binary (the only
- * execFileSync calls in the repo are in src/tests/).
+ * http://localhost:2019 -- byte-identical to DEFAULT_URL in src/api.ts, see
+ * sandboxFlags). For a TCP endpoint the grant is the HOST, deliberately WITHOUT
+ * a port: oam checks `fetch` against the bare hostname and sockets against
+ * "host:port", and grants are prefix-matched, so pinning the port denies every
+ * fetch -- and fetch is the transport api.ts uses for everything but a unix
+ * socket. Granting the host therefore also admits its other ports; that is the
+ * cost of the check having no port to match against.
+ *
+ * A unix-socket CADDY_ADMIN_URL gets NO net grant, which DENIES the category
+ * outright -- it is not an oversight that it looks narrower than the TCP case.
+ * oam ships no unix socket transport, so the socket dial cannot work under the
+ * sandbox regardless; the alternative was a bare `--allow-net`, which grants
+ * every host on the network. See sandboxFlags for the mechanism.
+ *
+ * Child-process stays denied: this server drives Caddy entirely over its admin
+ * HTTP API and never shells out to the `caddy` binary (the only execFileSync
+ * calls in the repo are in src/tests/). Filesystem stays denied too, EXCEPT when
+ * CADDY_MCP_SNAPSHOT_DIR is set: snapshot persistence is the one feature that
+ * touches disk, so that directory -- and nothing else -- is granted read+write.
  *
  * Opt-in, not default: a denied environment variable is ABSENT from process.env
  * rather than throwing, so an under-granted CADDY_API_TOKEN reads as
@@ -111,6 +125,14 @@ function findOam() {
   // the full PATHEXT list would hand back a path this launcher cannot execute.
   // Discovery has to agree with execution. A skipped shim is still reported --
   // see findOamShim.
+  //
+  // scripts/runtime.mjs carries its OWN findOam that DOES walk the full PATHEXT.
+  // That is a deliberate difference, not drift: it probes each candidate with
+  // execFileSync before returning it, so a shim it cannot run is dropped anyway
+  // and a wider walk only ever finds more. This one is stat-only on the hot
+  // launch path -- no probe to filter with -- so whatever it returns it must be
+  // able to spawn. Same question, different constraint; change one and re-read
+  // the other.
   for (const dir of (process.env.PATH ?? "").split(delimiter)) {
     if (!dir) continue;
     const candidate = join(dir, exe);
@@ -164,25 +186,118 @@ function sandboxFlags() {
   if (process.env.CADDY_MCP_SANDBOX !== "1") return [];
 
   // Derived, not hardcoded: the only endpoint this server may reach is the one
-  // it was configured to reach. Grants are prefix-matched against "host:port"
-  // for sockets, so host alone would also admit any other port on that host --
-  // pin both. A DSN we cannot parse falls back to a bare grant rather than a
-  // broken one, because a wrong narrow grant fails at connect time.
-  const dsn = process.env.CADDY_ADMIN_URL ?? "http://127.0.0.1:2019";
-  let netFlag = "--allow-net";
-  if (dsn) {
+  // it was configured to reach. A DSN we cannot parse falls back to a bare grant
+  // rather than a broken one, because a wrong narrow grant fails at connect time.
+  //
+  // The default MUST stay byte-identical to DEFAULT_URL in src/api.ts. The grant
+  // and the dial are matched as TEXT, so "127.0.0.1" here against an api.ts that
+  // dials "localhost" denies every request while both files look right on their
+  // own. Change one, change the other.
+  //
+  // Empty and whitespace-only are treated as UNSET, which is what api.ts does:
+  // it reads the variable with `||`, so "" already falls through to DEFAULT_URL
+  // there. `??` would keep "" here, skip the parse, and leave the bare
+  // `--allow-net` below -- a wide-open sandbox produced by a shell exporting an
+  // empty variable, which is a shape shells produce easily.
+  const dsn = process.env.CADDY_ADMIN_URL?.trim() || "http://localhost:2019";
+
+  // A unix-socket admin endpoint gets NO net grant at all -- checked before the
+  // URL parse, because it is the one input that would otherwise produce the
+  // WIDEST grant instead of the narrowest.
+  //
+  // `new URL("unix:///run/caddy.sock").hostname` is "", so the `if (u.hostname)`
+  // below is false and netFlag would stay the bare `--allow-net`; Caddy's own
+  // spelling (`unix//run/caddy.sock`) throws ERR_INVALID_URL and reaches the
+  // catch for the same result. Either way the most hardened admin config --
+  // Caddy recommends the socket precisely because filesystem permissions beat a
+  // loopback port -- would switch the sandbox on and hand over the whole network.
+  // That is the same wide-open-by-accident shape the empty-string case above
+  // guards against, reached by a different route.
+  //
+  // Omitting the flag DENIES the category (oam reads an absent --allow-net as
+  // false, a bare one as "*"), and denial costs nothing here: oam has no unix
+  // socket transport at all, so api.ts's node:http `socketPath` dial cannot work
+  // under oam whether the grant is open or closed. Verified against oam 0.9.0 --
+  // bare grant lets an unrelated host through, omitted grant denies it.
+  //
+  // This mirrors getMalformedUnixUrl's predicate in src/api.ts, NOT the stricter
+  // getUnixSocketPath -- deliberately, and the difference is the whole point.
+  //
+  // getUnixSocketPath accepts only the two WELL-FORMED spellings; matching it
+  // here would leave the malformed ones ("unix:/one-slash", "unix://relative",
+  // "unix://", or any uppercase spelling, which getUnixSocketPath rejects for
+  // case) falling through to the parse, where they yield an empty hostname and
+  // the bare `--allow-net` -- fully open, for input that plainly meant a socket.
+  //
+  // Denying the category for those costs nothing: api.ts routes exactly this set
+  // to getMalformedUnixUrl, which fails the request up front with a message
+  // naming the spelling error, so no request is ever attempted. Matching the
+  // broad predicate is what makes the header's claim true for EVERY unix-ish
+  // input rather than just the two tidy ones.
+  //
+  // `[:/]` after "unix" rather than a bare "unix" prefix, so a real TCP host like
+  // "http://unix.example.com:2019" is not swept up -- the same care api.ts takes.
+  const isUnixDsn = /^unix[:/]/i.test(dsn);
+
+  let netFlag = isUnixDsn ? null : "--allow-net";
+  if (!isUnixDsn) {
     try {
       const u = new URL(dsn);
-      if (u.hostname) netFlag = `--allow-net=${u.hostname}:${u.port || 2019}`;
+      // HOST ONLY, no port, deliberately. Grants are prefix-matched against the
+      // resource string, and the resource `fetch` presents is the bare hostname
+      // ("localhost") while sockets present "host:port". "localhost" does not
+      // start with "localhost:2019", so pinning the port denies every fetch --
+      // and fetch is how api.ts talks to a TCP admin endpoint. Granting the host
+      // alone also admits the other ports on that host; that is the cost of the
+      // check having no port to match against, not an oversight here.
+      if (u.hostname) netFlag = `--allow-net=${u.hostname}`;
     } catch {
-      // Unparseable CADDY_ADMIN_URL: leave the grant open. The server will fail on
-      // its own connection error, which names the real problem.
+      // Genuinely unparseable CADDY_ADMIN_URL (not the unix forms -- those are
+      // handled above): leave the grant open. The server will fail on its own
+      // connection error, which names the real problem.
     }
   }
 
-  const env = ["CADDY_ADMIN_URL", "CADDY_API_TOKEN", "CADDY_LOAD_TIMEOUT", "CADDY_MAX_RETRIES", "CADDY_TIMEOUT"];
+  // Every variable the shipped bundle reads (`grep process.env src/`), including
+  // CADDY_MCP_SNAPSHOT_DIR in src/snapshots.ts. Omitting one is not a denial the
+  // operator can see: the variable is simply ABSENT, so the feature reads as
+  // "not configured" and degrades silently.
+  const env = [
+    "CADDY_ADMIN_URL",
+    "CADDY_API_TOKEN",
+    "CADDY_LOAD_TIMEOUT",
+    "CADDY_MAX_RETRIES",
+    "CADDY_MCP_SNAPSHOT_DIR",
+    "CADDY_TIMEOUT",
+  ];
 
-  const flags = ["--permission", netFlag, `--allow-env=${env.join(",")}`];
+  // netFlag is null for a unix DSN -- an OMITTED --allow-net is what denies the
+  // category, so it must not survive as a stray "null" argv entry.
+  const flags = ["--permission", netFlag, `--allow-env=${env.join(",")}`].filter(Boolean);
+
+  // The filesystem grant exists only when snapshot persistence is switched on,
+  // and only for the directory it points at. Granting the variable without the
+  // directory would just move the silent failure: src/snapshots.ts swallows its
+  // own I/O errors and degrades to the in-memory ring, so `caddy_revert` would
+  // quietly stop surviving a restart -- the thing the operator turned the
+  // variable on to get.
+  //
+  // TWO spellings, because grants are matched as plain string PREFIXES against
+  // whatever path each call passes: snapshots.ts hands the raw variable to
+  // readdirSync/mkdirSync but builds per-file paths with path.join, which
+  // normalizes ("./snaps" -> "snaps"). The raw form alone then misses the files;
+  // the normalized form alone misses the directory listing.
+  //
+  // Two consequences worth naming rather than discovering: a prefix also admits
+  // a sibling path that merely starts with the same string ("/var/snap" grants
+  // "/var/snapshots-elsewhere"), and oam splits the list on commas with no
+  // escape, so a directory whose path contains a comma cannot be granted here.
+  const snapshotDir = process.env.CADDY_MCP_SNAPSHOT_DIR?.trim();
+  if (snapshotDir) {
+    const forms = [...new Set([snapshotDir, join(snapshotDir, ".")])].join(",");
+    flags.push(`--allow-fs-read=${forms}`, `--allow-fs-write=${forms}`);
+  }
+
   return flags;
 }
 
