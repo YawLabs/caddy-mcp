@@ -116,6 +116,35 @@ describe("api", () => {
     expect(res.error).toContain("CADDY_API_TOKEN");
   });
 
+  // ORDERING IS THE POINT: the empty-body check runs BEFORE the 403 origin-allowlist branch below, so a
+  // bodiless 403 -- what an auth proxy fronting the admin API returns -- is diagnosed as a token problem
+  // and never reaches the Origin explanation. A 403 that DOES name an origin still gets it (see the "403
+  // origin rejection" block). Swapping the two branches, or widening the hint, sends the operator after
+  // the wrong cause with nothing going red.
+  it("hints at CADDY_API_TOKEN on an empty-body 403 and does not reach the Origin explanation", async () => {
+    const api = await import("../api.js");
+    globalThis.fetch = vi.fn(async () => new Response("", { status: 403 })) as any;
+
+    const res = await api.configGet();
+    expect(res.ok).toBe(false);
+    expect(res.status).toBe(403);
+    expect(res.error).toBe("HTTP 403 -- check CADDY_API_TOKEN");
+    expect(res.error).not.toContain("Origin");
+    expect(res.error).not.toContain("admin.origins");
+  });
+
+  it("gives a bare HTTP 404 on an empty body, with no token hint", async () => {
+    // Only 401/403 earn the hint. A bodiless 404 means the config path is absent, not that auth failed --
+    // pointing that operator at CADDY_API_TOKEN would be a wrong-cause chase.
+    const api = await import("../api.js");
+    globalThis.fetch = vi.fn(async () => new Response("", { status: 404 })) as any;
+
+    const res = await api.configGet("apps/http/servers/nope");
+    expect(res.ok).toBe(false);
+    expect(res.status).toBe(404);
+    expect(res.error).toBe("HTTP 404");
+  });
+
   it("does not add the token hint when the error body is non-empty", async () => {
     const api = await import("../api.js");
     globalThis.fetch = vi.fn(async () => new Response("forbidden by policy", { status: 403 })) as any;
@@ -1233,6 +1262,96 @@ describe("api", () => {
     });
   });
 
+  // A path prefix in CADDY_ADMIN_URL is PRESERVED on the wire -- intended, so
+  // an admin endpoint behind a path-prefixed reverse proxy is reachable. The
+  // only thing pinned before was the connect-error message (tools.test.ts),
+  // which strips to the origin; the request URL itself was unpinned, so the
+  // prefix could have been dropped without a single test going red.
+  describe("path-prefixed CADDY_ADMIN_URL", () => {
+    async function captureUrl(call: (a: typeof import("../api.js")) => Promise<unknown>) {
+      const api = await import("../api.js");
+      let raw = "";
+      globalThis.fetch = vi.fn(async (url: any) => {
+        raw = String(url);
+        return new Response("{}", { status: 200 });
+      }) as any;
+      await call(api);
+      return raw;
+    }
+
+    it("prepends the prefix to the request path", async () => {
+      process.env.CADDY_ADMIN_URL = "http://caddy.local:2019/caddy-admin";
+      const raw = await captureUrl((a) => a.configGet("apps"));
+      expect(raw).toBe("http://caddy.local:2019/caddy-admin/config/apps");
+    });
+
+    it("strips a trailing slash from the prefix rather than doubling it", async () => {
+      process.env.CADDY_ADMIN_URL = "http://caddy.local:2019/caddy-admin/";
+      const raw = await captureUrl((a) => a.configGet("apps"));
+      expect(raw).toBe("http://caddy.local:2019/caddy-admin/config/apps");
+    });
+
+    it("sends the bare origin as Origin, without the prefix", async () => {
+      // Caddy's admin allowlist compares scheme+host+port; an Origin carrying a
+      // path is not an origin and would never match.
+      process.env.CADDY_ADMIN_URL = "http://caddy.local:2019/caddy-admin";
+      const api = await import("../api.js");
+      let headers: any = {};
+      globalThis.fetch = vi.fn(async (_url: any, opts: any) => {
+        headers = opts.headers;
+        return new Response("{}", { status: 200 });
+      }) as any;
+
+      await api.configGet("apps");
+      expect(headers.Origin).toBe("http://caddy.local:2019");
+    });
+
+    it("keys the retry policy on the prefix-free path", async () => {
+      // POST /config/<path> is non-idempotent and must not retry. The policy
+      // reads the path the exported helpers build, which never carries the
+      // prefix -- if the prefix ever leaked into it, the startsWith("/config/")
+      // check would miss and a failed append would be replayed.
+      process.env.CADDY_ADMIN_URL = "http://caddy.local:2019/caddy-admin";
+      process.env.CADDY_MAX_RETRIES = "3";
+      const api = await import("../api.js");
+      let calls = 0;
+      globalThis.fetch = vi.fn(async () => {
+        calls++;
+        return new Response("boom", { status: 500 });
+      }) as any;
+
+      const res = await api.configPost("apps/http/servers/srv0/routes", {});
+      expect(res.ok).toBe(false);
+      expect(calls).toBe(1);
+    });
+
+    it("reports only the origin when the connection fails under a prefix", async () => {
+      process.env.CADDY_ADMIN_URL = "http://caddy.local:2019/caddy-admin";
+      const api = await import("../api.js");
+      globalThis.fetch = vi.fn(async () => {
+        throw new TypeError("fetch failed");
+      }) as any;
+
+      const res = await api.configGet("apps");
+      expect(res.error).toContain("http://caddy.local:2019");
+      expect(res.error).not.toContain("/caddy-admin");
+    });
+
+    it("lets a query string in CADDY_ADMIN_URL swallow the request path", async () => {
+      // Characterization, not an endorsement: a query in the base URL is
+      // operator error (no legitimate admin base URL carries one), and it
+      // corrupts every request -- the path lands inside the query. Pinned so
+      // that stripping it later is a deliberate change rather than a silent
+      // one. The surface that mattered is already handled: the connect-error
+      // message reports the origin only, so the token does not leak (see
+      // tools.test.ts).
+      process.env.CADDY_ADMIN_URL = "http://caddy.local:2019/some/path?token=secret";
+      const url = new URL(await captureUrl((a) => a.configGet("apps")));
+      expect(url.pathname).toBe("/some/path");
+      expect(url.search).toBe("?token=secret/config/apps");
+    });
+  });
+
   describe("ETag cache bounds", () => {
     it("evicts the oldest entry once the cache exceeds 256 paths", async () => {
       // An agent walking a large config issues hundreds of distinct GETs in one
@@ -1390,6 +1509,124 @@ describe("api", () => {
       expect(res.ok).toBe(false);
       expect(res.error).toContain("'..'");
       expect(called).toBe(0);
+    });
+  });
+
+  // Config keys are arbitrary strings, but they are interpolated into a URL.
+  // Before segment-encoding, a "#" or "?" in a key silently truncated the
+  // request path at the client: caddy_config_delete on
+  // "apps/http/servers/prod#1" sent DELETE /config/apps/http/servers/prod --
+  // it deleted the PARENT server and reported success. Nothing in the schema
+  // stops that either; config_get/set/delete take a bare string.
+  describe("config path percent-encoding", () => {
+    async function captureUrl(call: (a: typeof import("../api.js")) => Promise<unknown>) {
+      const api = await import("../api.js");
+      let raw = "";
+      globalThis.fetch = vi.fn(async (url: any) => {
+        raw = String(url);
+        return new Response("{}", { status: 200 });
+      }) as any;
+      await call(api);
+      return new URL(raw);
+    }
+
+    const hashKeyVerbs: Array<[string, (a: typeof import("../api.js")) => Promise<unknown>]> = [
+      ["configGet", (a) => a.configGet("apps/http/servers/prod#1")],
+      ["configPost", (a) => a.configPost("apps/http/servers/prod#1", {})],
+      ["configPut", (a) => a.configPut("apps/http/servers/prod#1", {})],
+      ["configPatch", (a) => a.configPatch("apps/http/servers/prod#1", {})],
+      ["configDelete", (a) => a.configDelete("apps/http/servers/prod#1")],
+    ];
+
+    it.each(hashKeyVerbs)("%s keeps a '#' key in the path instead of addressing its parent", async (_name, call) => {
+      const url = await captureUrl(call);
+      expect(url.pathname).toBe("/config/apps/http/servers/prod%231");
+      // The tell for the old bug: the remainder ended up here, not on the wire.
+      expect(url.hash).toBe("");
+    });
+
+    it("encodes '?' so a key cannot open a query string", async () => {
+      const url = await captureUrl((a) => a.configGet("apps/http/servers/a?b"));
+      expect(url.pathname).toBe("/config/apps/http/servers/a%3Fb");
+      expect(url.search).toBe("");
+    });
+
+    it("keeps '/' as the segment separator", async () => {
+      // Whole-string encodeURIComponent would send %2F here and address one
+      // top-level key whose name contains slashes.
+      const url = await captureUrl((a) => a.configGet("apps/http/servers/srv0"));
+      expect(url.pathname).toBe("/config/apps/http/servers/srv0");
+    });
+
+    it("still produces exactly /config/ for the root path", async () => {
+      const url = await captureUrl((a) => a.configGet(""));
+      expect(url.pathname).toBe("/config/");
+    });
+
+    it("leaves unreserved characters alone, including '..' inside a segment", async () => {
+      const url = await captureUrl((a) => a.configGet("apps/http/servers/my..name"));
+      expect(url.pathname).toBe("/config/apps/http/servers/my..name");
+    });
+
+    it("rejects '..' before encoding, and escapes a pre-encoded '%2e%2e' rather than decoding it", async () => {
+      // Order is load-bearing. rejectTraversal runs on the DECODED path, so a
+      // literal ".." never reaches fetch; and because encoding comes after,
+      // caller-supplied "%2e%2e" is escaped to %252e%252e -- Caddy decodes that
+      // back to the literal text "%2e%2e", never to a real ".." segment.
+      const api = await import("../api.js");
+      let called = 0;
+      let raw = "";
+      globalThis.fetch = vi.fn(async (url: any) => {
+        called++;
+        raw = String(url);
+        return new Response("{}", { status: 200 });
+      }) as any;
+
+      const rejected = await api.configGet("apps/../stop");
+      expect(rejected.ok).toBe(false);
+      expect(called).toBe(0);
+
+      await api.configGet("apps/%2e%2e/stop");
+      expect(new URL(raw).pathname).toBe("/config/apps/%252e%252e/stop");
+    });
+
+    it("encodes both the id and the subpath of an /id/ path", async () => {
+      expect((await captureUrl((a) => a.configByIdGet("route#1"))).pathname).toBe("/id/route%231");
+      expect((await captureUrl((a) => a.configByIdGet("route#1", "handle?x"))).pathname).toBe(
+        "/id/route%231/handle%3Fx",
+      );
+      expect((await captureUrl((a) => a.configByIdSet("route#1", {}, "PATCH", "handle?x"))).pathname).toBe(
+        "/id/route%231/handle%3Fx",
+      );
+      expect((await captureUrl((a) => a.configByIdDelete("route#1", "handle?x"))).pathname).toBe(
+        "/id/route%231/handle%3Fx",
+      );
+    });
+
+    it("encodes the CA id on both PKI endpoints", async () => {
+      expect((await captureUrl((a) => a.getPki("ca#1"))).pathname).toBe("/pki/ca/ca%231");
+      expect((await captureUrl((a) => a.getPkiCertificates("ca#1"))).pathname).toBe("/pki/ca/ca%231/certificates");
+    });
+
+    it("keys the ETag cache on the encoded path, so a read/write pair on a '#' key still sends If-Match", async () => {
+      // The cache key is the composed path. Encoding on one side only would
+      // silently drop optimistic concurrency for exactly these keys.
+      const api = await import("../api.js");
+      const calls: Array<{ method: string; ifMatch: string | null }> = [];
+      globalThis.fetch = vi.fn(async (_url: any, opts: any) => {
+        const method = opts?.method ?? "GET";
+        calls.push({ method, ifMatch: opts?.headers?.["If-Match"] ?? null });
+        if (method === "GET") {
+          return new Response("{}", { status: 200, headers: { ETag: "encoded-key-etag" } });
+        }
+        return new Response("", { status: 200 });
+      }) as any;
+
+      await api.configGet("encode-probe/prod#1");
+      await api.configPatch("encode-probe/prod#1", { listen: [":443"] });
+
+      expect(calls[1]?.method).toBe("PATCH");
+      expect(calls[1]?.ifMatch).toBe("encoded-key-etag");
     });
   });
 

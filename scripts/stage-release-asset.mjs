@@ -1,11 +1,18 @@
 #!/usr/bin/env node
 // Stage the host-built SEA binary as a named release asset + sha256 sidecar.
 //
-// build-binary.mjs emits bin/<platform>-<arch>/yaw-mcp(.exe) (host-native --
-// Node SEA cannot cross-compile, so each CI matrix leg builds its own). This
-// renames that to the public asset name the Scoop/Homebrew manifests point at
-// (yaw-mcp-<platform>-<arch>[.exe]) and writes a `<asset>.sha256` sidecar in
-// sha256sum format (`<hex>  <asset>`) that Scoop's autoupdate `hash.url` reads.
+// build-binary.mjs emits bin/<platform>-<arch>/caddy-mcp(.exe) -- both scripts
+// derive that name from package.json's first `bin` key rather than hardcoding
+// it, which is what keeps them copy-paste generic across @yawlabs/* servers.
+// This renames it to the public asset name the Scoop/Homebrew manifests point
+// at (caddy-mcp-<platform>-<arch>[.exe]) and writes a `<asset>.sha256` sidecar
+// in sha256sum format (`<hex>  <asset>`) that Scoop's autoupdate `hash.url`
+// reads.
+//
+// The build is host-native (Node SEA cannot cross-compile), so every platform
+// you ship needs its own run of build-binary.mjs + this script. There is no CI
+// matrix doing that here -- this repo has no .github/workflows at all, so it is
+// a manual per-host step (see update-manifests.mjs for the full release chain).
 //
 // Pure stdlib; writes only to dist-release/. Run after build-binary.mjs:
 //   node scripts/stage-release-asset.mjs
@@ -44,7 +51,9 @@ writeFileSync(outSha, `${hex}  ${assetName}\n`);
 
 console.log(`asset:  ${outAsset}`);
 console.log(`sha256: ${hex}`);
-// Surfaced as a step output in CI (GITHUB_OUTPUT) for downstream jobs.
+// A no-op in this repo, which has no workflows: kept because this script is
+// copy-pasted into @yawlabs/* siblings that DO run it under Actions, where a
+// downstream job reads the asset name and hash as step outputs.
 if (process.env.GITHUB_OUTPUT) {
   writeFileSync(process.env.GITHUB_OUTPUT, `asset=${assetName}\nsha256=${hex}\n`, { flag: "a" });
 }

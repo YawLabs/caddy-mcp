@@ -1,5 +1,5 @@
 #!/usr/bin/env node
-// Build a self-contained single-file binary of the @yawlabs/mcp sidecar.
+// Build a self-contained single-file binary of the @yawlabs/caddy-mcp server.
 //
 // Strategy: esbuild bundles src/index.ts + ALL its dependencies (including
 // the externals tsup leaves out -- @modelcontextprotocol/sdk and undici)
@@ -13,8 +13,12 @@
 // Deno-compatible in principle (clean ESM, no native addons), but the node:
 // builtin imports in the bundle are bare (`fs`, not `node:fs`), which Deno
 // rejects without a compat shim. Node SEA needs no such rewrite and ships with
-// the Node already on the box, so it is the zero-friction path here. See
-// BINARY_DISTRIBUTION.md for the deno/bun fallbacks.
+// the Node already on the box, so it is the zero-friction path here.
+//
+// The deno paragraph above is the whole of what this repo records about
+// alternative carriers. An earlier revision of this comment referred the reader
+// to a BINARY_DISTRIBUTION.md for the deno/bun fallbacks; no such file exists
+// in this repo, or anywhere in its history.
 //
 // This script ONLY reads node_modules (via esbuild's resolver) and writes to
 // build-tmp/ and bin/<platform>-<arch>/. It does NOT mutate package.json,
@@ -236,6 +240,9 @@ console.log("");
 console.log(`OK  ${outExe}`);
 console.log(`    ${fmtSize(outExe)}`);
 console.log("");
+// `--version` is the ONLY safe probe to print here. src/index.ts special-cases
+// --version/-V and falls through to startServer() for every other argv, so any
+// invented subcommand (this line used to suggest `doctor --json`) does not
+// error -- it starts the stdio server and HANGS waiting on stdin.
 console.log("Verify with:");
 console.log(`    "${outExe}" --version`);
-console.log(`    "${outExe}" doctor --json`);

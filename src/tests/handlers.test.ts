@@ -1,24 +1,38 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import type { ApiResponse } from "../api.js";
 
-// Mock the api module — all tests control responses via these mocks
-vi.mock("../api.js", () => ({
-  configGet: vi.fn(),
-  configPost: vi.fn(),
-  configPut: vi.fn(),
-  configPatch: vi.fn(),
-  configDelete: vi.fn(),
-  loadConfig: vi.fn(),
-  adapt: vi.fn(),
-  stop: vi.fn(),
-  getUpstreams: vi.fn(),
-  getPki: vi.fn(),
-  getPkiCertificates: vi.fn(),
-  configByIdGet: vi.fn(),
-  configByIdSet: vi.fn(),
-  configByIdDelete: vi.fn(),
-  getMetrics: vi.fn(),
-}));
+// Mock the api module — all tests control responses via these mocks.
+//
+// Every REQUEST function is a vi.fn(); `isMissingConfigPath` deliberately is not.
+// It is a pure predicate over a response body, not I/O, so a stub would mean these
+// tests assert against a second copy of the marker matching instead of the one
+// production runs -- and the two could drift without anything failing. Take the
+// real implementation via importOriginal.
+//
+// The mock is WHOLESALE, so any export added to src/api.ts must be added here too:
+// an omission surfaces as "No <name> export is defined on the ../api.js mock" from
+// every test that touches the module, not as a targeted failure.
+vi.mock("../api.js", async (importOriginal) => {
+  const actual = (await importOriginal()) as typeof import("../api.js");
+  return {
+    configGet: vi.fn(),
+    configPost: vi.fn(),
+    configPut: vi.fn(),
+    configPatch: vi.fn(),
+    configDelete: vi.fn(),
+    loadConfig: vi.fn(),
+    adapt: vi.fn(),
+    stop: vi.fn(),
+    getUpstreams: vi.fn(),
+    getPki: vi.fn(),
+    getPkiCertificates: vi.fn(),
+    configByIdGet: vi.fn(),
+    configByIdSet: vi.fn(),
+    configByIdDelete: vi.fn(),
+    getMetrics: vi.fn(),
+    isMissingConfigPath: actual.isMissingConfigPath,
+  };
+});
 
 function ok<T>(data?: T): ApiResponse<T> {
   return { ok: true, status: 200, data };
@@ -82,6 +96,125 @@ describe("tool handler behavior", () => {
       expect(routeArg.handle[0].upstreams[0].dial).toBe("localhost:3000");
     });
 
+    it("an https:// upstream gets a TLS transport and defaults to port 443", async () => {
+      // The scheme is load-bearing: Caddy dials in the clear unless the HANDLER
+      // carries transport.tls, so reducing "https://backend" to { dial:
+      // "backend" } would silently downgrade the hop to the upstream. And once
+      // the scheme is stripped a dial is a socket address with nothing left to
+      // imply 443, so the port the caller meant has to be written out.
+      api.configPost.mockResolvedValue(ok());
+
+      await handler({ from: "api.local", to: ["https://backend.example.com"], server: "srv0" });
+
+      const routeArg = api.configPost.mock.calls[0][1];
+      expect(routeArg.handle[0]).toEqual({
+        handler: "reverse_proxy",
+        upstreams: [{ dial: "backend.example.com:443" }],
+        transport: { protocol: "http", tls: {} },
+      });
+    });
+
+    it("keeps an explicit port on an https:// upstream", async () => {
+      api.configPost.mockResolvedValue(ok());
+
+      await handler({ from: "api.local", to: ["https://backend.example.com:8443"], server: "srv0" });
+
+      const routeArg = api.configPost.mock.calls[0][1];
+      expect(routeArg.handle[0].upstreams).toEqual([{ dial: "backend.example.com:8443" }]);
+      expect(routeArg.handle[0].transport).toEqual({ protocol: "http", tls: {} });
+    });
+
+    it("brackets a bare IPv6 https:// upstream before appending the port", async () => {
+      // "::1:443" would parse as another address group, not host + port, so the
+      // literal has to be bracketed first. An already-bracketed one is left as
+      // written.
+      api.configPost.mockResolvedValue(ok());
+
+      await handler({ from: "api.local", to: ["https://::1"], server: "srv0" });
+      await handler({ from: "api.local", to: ["https://[::1]"], server: "srv0" });
+      await handler({ from: "api.local", to: ["https://[::1]:8443"], server: "srv0" });
+
+      const dials = api.configPost.mock.calls.map((c: any[]) => c[1].handle[0].upstreams[0].dial);
+      expect(dials).toEqual(["[::1]:443", "[::1]:443", "[::1]:8443"]);
+    });
+
+    it("carries one transport for a list of https:// upstreams", async () => {
+      api.configPost.mockResolvedValue(ok());
+
+      await handler({
+        from: "api.local",
+        to: ["https://a.example.com", "https://b.example.com:9443"],
+        server: "srv0",
+      });
+
+      const routeArg = api.configPost.mock.calls[0][1];
+      expect(routeArg.handle[0].upstreams).toEqual([{ dial: "a.example.com:443" }, { dial: "b.example.com:9443" }]);
+      expect(routeArg.handle[0].transport).toEqual({ protocol: "http", tls: {} });
+    });
+
+    it.each([
+      ["localhost:3000"],
+      ["http://localhost:3000"],
+    ])("omits `transport` entirely for a non-https upstream (%s)", async (upstream) => {
+      // `transport` present-but-empty is not the same config as `transport`
+      // absent, so the plain-http route must keep the exact handler shape it
+      // has always had rather than gaining an empty key.
+      api.configPost.mockResolvedValue(ok());
+
+      await handler({ from: "api.local", to: [upstream], server: "srv0" });
+
+      const handleArg = api.configPost.mock.calls[0][1].handle[0];
+      expect("transport" in handleArg).toBe(false);
+    });
+
+    it("refuses a `to` list that mixes https:// and non-https upstreams", async () => {
+      // transport is a property of the whole handler, not of one upstream, so
+      // either resolution would silently apply one entry's scheme to the
+      // other's connection. That decision stays with the caller.
+      const result = await handler({
+        from: "api.local",
+        to: ["https://secure.example.com", "localhost:3000"],
+        server: "srv0",
+      });
+
+      expect(api.configPost).not.toHaveBeenCalled();
+      expect(result.isError).toBe(true);
+      expect(result.content[0].text).toContain("mixes https:// and non-https");
+      expect(result.content[0].text).toContain("caddy_add_route");
+    });
+
+    it("refuses an empty `to` array rather than writing an upstream-less proxy", async () => {
+      // The zod schema rejects this before a real MCP call reaches the handler
+      // (see tools.test.ts), but the handler is also called directly here and
+      // by anything that bypasses validation -- a reverse_proxy with zero
+      // upstreams is a route that 502s every request.
+      const result = await handler({ from: "api.local", to: [], server: "srv0" });
+
+      expect(api.configPost).not.toHaveBeenCalled();
+      expect(result.isError).toBe(true);
+      expect(result.content[0].text).toContain("at least one upstream");
+    });
+
+    it.each(["   ", "\t", "http://", "https://"])("refuses `to`=[%j] -- no address left to dial", async (upstream) => {
+      // Each of these survives z.string().min(1) but cleans to an empty dial:
+      // whitespace-only, or a bare scheme with no authority. Writing { dial:
+      // "" } produces a route Caddy accepts and can never proxy.
+      const result = await handler({ from: "api.local", to: [upstream], server: "srv0" });
+
+      expect(api.configPost).not.toHaveBeenCalled();
+      expect(result.isError).toBe(true);
+      expect(result.content[0].text).toContain("no address to dial");
+    });
+
+    it("trims surrounding whitespace on upstreams, matching how `from` is trimmed", async () => {
+      api.configPost.mockResolvedValue(ok());
+
+      await handler({ from: "api.local", to: ["  https://backend.example.com:8443  "], server: "srv0" });
+
+      const routeArg = api.configPost.mock.calls[0][1];
+      expect(routeArg.handle[0].upstreams).toEqual([{ dial: "backend.example.com:8443" }]);
+    });
+
     it.each([
       "https://",
       " ",
@@ -128,6 +261,40 @@ describe("tool handler behavior", () => {
 
       expect(result.isError).toBe(true);
       expect(result.content[0].text).toContain('Server "srv99" does not exist');
+    });
+
+    it("treats a traversal failure as server-not-found -- the shape live Caddy sends", async () => {
+      // The marker that actually matters, and the one that was missing. Verified
+      // on 2.11.4: POST to a missing server's routes answers HTTP 500 with
+      // {"error":"invalid traversal path at: config/apps/http/servers/srv99/routes"}
+      // -- no 404, and no "key does not exist". Matching only the older markers
+      // made serverNotFoundError unreachable for its own headline case, so the
+      // operator got a raw Go error instead of the recipe for creating the server.
+      api.configPost.mockResolvedValue(
+        err(500, '{"error":"invalid traversal path at: config/apps/http/servers/srv99/routes"}'),
+      );
+
+      const result = await handler({ from: "app.local", to: ["localhost:3000"], server: "srv99" });
+
+      expect(result.isError).toBe(true);
+      expect(result.content[0].text).toContain('Server "srv99" does not exist');
+    });
+
+    it("gives create-it advice that actually works", async () => {
+      // Every clause here was live-verified, and the ORIGINAL advice failed on two
+      // of them: mode "append" (POST) creates the key while the default
+      // "overwrite" (PATCH) answers "key does not exist", and "routes": [] must be
+      // present or the first route POST dies with "cannot unmarshal object into
+      // ... RouteList" -- POST creates a missing routes key as an object, not an
+      // array. Advice that does not work is worse than no advice: it costs the
+      // operator a round of debugging before they distrust it.
+      api.configPost.mockResolvedValue(err(404, "Not Found"));
+
+      const text = (await handler({ from: "app.local", to: ["localhost:3000"], server: "srv99" })).content[0].text;
+
+      expect(text).toContain('"routes": []');
+      expect(text).toContain('mode: "append"');
+      expect(text).toContain("caddy_load");
     });
 
     it("surfaces an ordinary validation failure verbatim, NOT as server-not-found", async () => {
@@ -364,6 +531,25 @@ describe("tool handler behavior", () => {
       expect(result.content[0].text).toContain("key does not exist");
       expect(result.content[0].text).not.toContain("does not exist. Use caddy_list_servers");
     });
+
+    it("first-create via id: POST failing for a non-parent reason surfaces verbatim", async () => {
+      // The GET 404 confirms the @id is absent, so the POST runs -- but a 400
+      // "duplicate ID" is a validation failure, not a missing server. Widening
+      // the parent-missing translation to swallow it would repeat the v1.2.5
+      // bug on this exact code path: a (status + body) shape that could come
+      // from more than one cause got translated, and the caller was sent to fix
+      // the wrong thing.
+      api.configByIdGet.mockResolvedValue(err(404, "unknown object ID"));
+      api.configPost.mockResolvedValue(
+        err(400, "duplicate ID 'some-id' found at apps/http/servers/srv0/routes/0 and .../routes/1"),
+      );
+
+      const result = await handler({ from: "api.local", to: ["localhost:3000"], server: "srv0", id: "some-id" });
+
+      expect(result.isError).toBe(true);
+      expect(result.content[0].text).toContain("duplicate ID 'some-id'");
+      expect(result.content[0].text).not.toContain("does not exist. Use caddy_list_servers");
+    });
   });
 
   // ─── caddy_add_route ──────────────────────────────────────────────────
@@ -507,6 +693,59 @@ describe("tool handler behavior", () => {
 
       const result = await handler({ server: "srv0" });
 
+      expect(result.content[0].text).toContain("no routes configured");
+    });
+
+    it.each([
+      ["a null body (unknown server, or a server whose config is null)", null],
+      ["an empty body", undefined],
+    ])("errors on %s rather than reporting an empty server", async (_label, body) => {
+      // Caddy answers an UNKNOWN server with 200 and a body of literal `null`,
+      // not a 404 -- verified against 2.11.4. So res.ok is true and the !ok guard
+      // never fires; before this check, `data || {}` collapsed null into an empty
+      // config and the tool cheerfully reported
+      //   Server "typo" (listen: default) -- no routes configured
+      // with no isError, telling an operator a live-looking server is empty and
+      // inviting them to overwrite it.
+      api.configGet.mockResolvedValue(ok(body));
+
+      const result = await handler({ server: "typo" });
+
+      expect(result.isError).toBe(true);
+      expect(result.content[0].text).not.toContain("no routes configured");
+      // Both causes named, neither asserted: the two are byte-identical on the
+      // wire, and naming the likelier one is the 1.2.5 mistake.
+      expect(result.content[0].text).toContain("is not configured, or its config is null");
+      expect(result.content[0].text).toContain("caddy_list_servers");
+    });
+
+    it("answers a config-less instance with the create-it recipe, not a Go error", async () => {
+      // A traversal failure means a segment ABOVE the server name is missing, so
+      // this is the FIRST-RUN state: no apps/http tree at all. Verified on 2.11.4:
+      // HTTP 400 {"error":"invalid traversal path at: config/apps/http"}.
+      // Unlike the ambiguous null body, this one is decisive -- no parent chain
+      // means no server -- so asserting non-existence here is honest.
+      api.configGet.mockResolvedValue(err(400, '{"error":"invalid traversal path at: config/apps/http"}'));
+
+      const result = await handler({ server: "srv0" });
+
+      expect(result.isError).toBe(true);
+      expect(result.content[0].text).toContain('Server "srv0" does not exist');
+      expect(result.content[0].text).toContain("caddy_load");
+      // The raw Go error must not be what the operator reads.
+      expect(result.content[0].text).not.toContain("invalid traversal path");
+    });
+
+    it("still renders a routeless server that really exists", async () => {
+      // The boundary the null check must not cross: `{}` is a REAL server with no
+      // routes yet -- exactly what caddy_config_set creates -- and Caddy returns
+      // it as an empty object, distinguishable from the null above. It must keep
+      // rendering as a normal empty listing, not as the not-configured error.
+      api.configGet.mockResolvedValue(ok({}));
+
+      const result = await handler({ server: "srv0" });
+
+      expect(result.isError).toBeFalsy();
       expect(result.content[0].text).toContain("no routes configured");
     });
 
@@ -805,6 +1044,17 @@ describe("tool handler behavior", () => {
       expect(result.isError).toBe(true);
       expect(result.content[0].text).toContain("value is required");
     });
+
+    it("names the sub-path in the delete refusal when one was supplied", async () => {
+      // A subpath delete removes only part of the identified object, so the
+      // refusal has to say WHICH part -- naming the @id alone reads as though
+      // the whole route were about to go, which is a different consent.
+      const result = await handler({ id: "my-route", action: "delete", subpath: "handle/0" });
+
+      expect(result.isError).toBe(true);
+      expect(result.content[0].text).toContain('@id="my-route" subpath "handle/0"');
+      expect(api.configByIdDelete).not.toHaveBeenCalled();
+    });
   });
 
   // ─── caddy_tls (PATCH happy-path + safe-fallback branches) ────────────
@@ -1004,6 +1254,63 @@ describe("tool handler behavior", () => {
       expect(api.configPut).not.toHaveBeenCalled();
       expect(result.isError).toBe(true);
       expect(result.content[0].text).toContain("issuers[0]");
+    });
+
+    // Branch 3b: shape is fine, but the issuer sitting at policies[0].issuers[0]
+    // is not an ACME one. `email` / `ca` / `profile` are fields of the acme
+    // issuer module only, so merging them in writes a foreign key. `internal`
+    // (Caddy's local CA) is the dangerous case rather than a hypothetical: it
+    // carries its OWN `ca` key naming a PKI CA id, so set_acme_ca would quietly
+    // repoint the local CA at an ACME directory URL.
+    it.each([
+      ["set_email", { email: "test@example.com" }],
+      ["set_acme_ca", { ca: "https://acme.example.com/dir" }],
+      ["set_acme_profile", { profile: "shortlived" }],
+    ])("PATCH fails + issuers[0] is a non-ACME issuer -> %s refuses without writing", async (action, args) => {
+      subpathPatchFails();
+      api.configGet.mockResolvedValue(
+        ok({ automation: { policies: [{ issuers: [{ module: "internal", ca: "local" }] }] } }),
+      );
+
+      const result = await handler({ action, ...(args as Record<string, string>) });
+
+      // No write of any kind: not the whole-object merge PATCH, not a create.
+      expect(mergeCall()).toBeUndefined();
+      expect(api.configPost).not.toHaveBeenCalled();
+      expect(api.configPut).not.toHaveBeenCalled();
+      expect(result.isError).toBe(true);
+      expect(result.content[0].text).toContain("Refusing to write an ACME field onto a non-ACME issuer");
+      // The message names what was actually found, so the caller can tell a
+      // wrong-issuer refusal from the wrong-shape one above.
+      expect(result.content[0].text).toContain('module is "internal", not "acme"');
+      expect(result.content[0].text).toContain("caddy_config_set");
+    });
+
+    it("PATCH fails + issuers[0] carries no module key -> refuses, reporting it as absent", async () => {
+      // An issuer with no `module` is not implicitly acme -- Caddy needs the key
+      // to know which module to load -- so this refuses too, and says "absent"
+      // rather than quoting a value that isn't there.
+      subpathPatchFails();
+      api.configGet.mockResolvedValue(ok({ automation: { policies: [{ issuers: [{ email: "old@example.com" }] }] } }));
+
+      const result = await handler({ action: "set_email", email: "test@example.com" });
+
+      expect(mergeCall()).toBeUndefined();
+      expect(result.isError).toBe(true);
+      expect(result.content[0].text).toContain('module is absent, not "acme"');
+    });
+
+    it("still merges when the issuer IS acme (the module guard does not block the happy path)", async () => {
+      // Counterpart to the refusals above: the guard must reject non-ACME
+      // issuers WITHOUT costing the ordinary merge, which is the path
+      // set_acme_profile takes on every fresh issuer.
+      subpathPatchFails();
+      api.configGet.mockResolvedValue(ok({ automation: { policies: [{ issuers: [{ module: "acme" }] }] } }));
+
+      const result = await handler({ action: "set_acme_profile", profile: "shortlived" });
+
+      expect(result.isError).toBeFalsy();
+      expect(mergeCall()?.[1].automation.policies[0].issuers[0]).toEqual({ module: "acme", profile: "shortlived" });
     });
 
     // Failure paths through bothErrors.
@@ -1317,6 +1624,47 @@ describe("tool handler behavior", () => {
       expect(result.content[0].text).toContain("TLS: enabled");
     });
 
+    it.each([
+      [":443", "auto (HTTPS)"],
+      [":80", "off (HTTP only)"],
+    ])("an EMPTY tls_connection_policies falls through to the listen heuristic (%s -> %s)", async (port, expected) => {
+      // `tls_connection_policies: []` configures nothing, so it has to read the
+      // same as an absent key. Reporting "enabled" off the key's mere presence
+      // told the caller TLS was explicitly configured when the array was empty.
+      api.configGet.mockResolvedValue(
+        ok({
+          apps: {
+            http: {
+              servers: { srv0: { listen: [port], routes: [], tls_connection_policies: [] } },
+            },
+          },
+        }),
+      );
+
+      const result = await handler({});
+      expect(result.content[0].text).toContain(`TLS: ${expected}`);
+      expect(result.content[0].text).not.toContain("TLS: enabled");
+    });
+
+    it("keeps the 'enabled' reading for a present-but-non-array tls_connection_policies", async () => {
+      // Deliberately NOT folded into the empty-array case: a non-array value is
+      // a malformed config we cannot interpret, and "something is configured
+      // here" is the safer summary than silently calling it off. Pinned so a
+      // future tightening of the empty-array fix is a deliberate change.
+      api.configGet.mockResolvedValue(
+        ok({
+          apps: {
+            http: {
+              servers: { srv0: { listen: [":80"], routes: [], tls_connection_policies: { alpn: ["h2"] } } },
+            },
+          },
+        }),
+      );
+
+      const result = await handler({});
+      expect(result.content[0].text).toContain("TLS: enabled");
+    });
+
     it("shows ACME email when present at policies[0].issuers[0].email", async () => {
       api.configGet.mockResolvedValue(
         ok({
@@ -1359,6 +1707,33 @@ describe("tool handler behavior", () => {
       expect(text).not.toContain("second@example.com");
       expect(text).not.toContain("other-policy@example.com");
     });
+
+    it("renders a NULL config body as running with no servers", async () => {
+      // A running Caddy 2.11.4 that has never been configured answers
+      // GET /config/ with a literal `null`, which api.ts parses to data: null.
+      // The sibling tests pass {} and { apps: {} }, so neither exercises the
+      // nullish fallback that keeps this from dereferencing null.
+      api.configGet.mockResolvedValue(ok(null));
+
+      const result = await handler({});
+
+      expect(result.isError).toBeFalsy();
+      expect(result.content[0].text).toContain("Caddy is running");
+      expect(result.content[0].text).toContain("No HTTP servers configured");
+    });
+
+    it("does not throw when policies[0] is null", async () => {
+      // Reachable on a live instance despite looking impossible: loading
+      // {"apps":{"tls":{"automation":{"policies":[null]}}}} panics Caddy inside
+      // (*AutomationPolicy).Provision, but the raw config is ALREADY swapped in
+      // by then -- so the next GET /config/ really does return policies: [null].
+      api.configGet.mockResolvedValue(ok({ apps: { tls: { automation: { policies: [null] } } } }));
+
+      const result = await handler({});
+
+      expect(result.isError).toBeFalsy();
+      expect(result.content[0].text).not.toContain("ACME email");
+    });
   });
 
   // ─── caddy_list_servers ───────────────────────────────────────────────
@@ -1388,12 +1763,57 @@ describe("tool handler behavior", () => {
       expect(text).toContain("api: 1 route(s), listen: :8080");
     });
 
+    it("reads an empty tls_connection_policies off the listen port here too", async () => {
+      // caddy_status and caddy_list_servers share describeServer, so the empty-
+      // array fix has to show up on both surfaces -- this is the second one.
+      api.configGet.mockResolvedValue(
+        ok({
+          srv0: { listen: [":443"], routes: [], tls_connection_policies: [] },
+          plain: { listen: [":80"], routes: [], tls_connection_policies: [] },
+        }),
+      );
+
+      const text = (await handler({})).content[0].text;
+
+      expect(text).toContain("srv0: 0 route(s), listen: :443, TLS: auto (HTTPS)");
+      expect(text).toContain("plain: 0 route(s), listen: :80, TLS: off (HTTP only)");
+    });
+
     it("shows message when no servers configured", async () => {
       api.configGet.mockResolvedValue(ok({}));
 
       const result = await handler({});
 
       expect(result.content[0].text).toContain("No HTTP servers configured");
+    });
+
+    it("says the same thing on a config-less instance, which answers with an error", async () => {
+      // The empty state a first-time operator actually hits. A Caddy with no
+      // config has no `apps` key, so this read fails the path walk instead of
+      // returning {} -- verified on 2.11.4: HTTP 400 {"error":"invalid traversal
+      // path at: config/apps/http"}. Surfacing that raw made the tool whose whole
+      // job is "tell me what servers exist" answer a fresh instance with a Go
+      // internal error. The path is a fixed literal, so every way the walk can
+      // fail means no HTTP servers are configured and nothing else.
+      api.configGet.mockResolvedValue(err(400, '{"error":"invalid traversal path at: config/apps/http"}'));
+
+      const result = await handler({});
+
+      expect(result.isError).toBeFalsy();
+      expect(result.content[0].text).toBe("No HTTP servers configured");
+    });
+
+    it("still surfaces a genuine read failure rather than claiming emptiness", async () => {
+      // The boundary: only a TRAVERSAL failure means "empty". An unreachable
+      // Caddy or an auth rejection must not be laundered into "no servers", which
+      // would tell an operator their production config had vanished.
+      api.configGet.mockResolvedValue(err(0, "Cannot connect to Caddy admin API at http://localhost:2019"));
+
+      const result = await handler({});
+
+      expect(result.isError).toBe(true);
+      expect(result.content[0].text).toContain("Cannot connect");
+      expect(result.content[0].text).not.toContain("No HTTP servers configured");
     });
 
     it("renders a malformed server entry instead of throwing", async () => {
@@ -1416,6 +1836,18 @@ describe("tool handler behavior", () => {
       expect(text).toContain("broken: 0 route(s), listen: default");
       expect(text).toContain("alsoBroken: 0 route(s), listen: default");
       expect(text).toContain("arrayish: 0 route(s), listen: default");
+    });
+
+    it("reports no servers when the servers key resolves to NULL", async () => {
+      // Verified against a live Caddy 2.11.4: with {"apps":{"http":{}}} loaded,
+      // GET /config/apps/http/servers answers 200 null -- not 400, not {} -- so
+      // the `?? {}` fallback sits on an ordinary path, not a defensive one.
+      api.configGet.mockResolvedValue(ok(null));
+
+      const result = await handler({});
+
+      expect(result.isError).toBeFalsy();
+      expect(result.content[0].text).toContain("No HTTP servers configured");
     });
   });
 
@@ -1620,6 +2052,18 @@ describe("tool handler behavior", () => {
       const text = result.content[0].text;
 
       expect(text).not.toContain("# EOF");
+    });
+
+    it("emits OK rather than the literal string 'undefined' for a body-less metrics response", async () => {
+      // api.ts yields data: undefined for any empty 200, and String(undefined)
+      // would put the word "undefined" in front of the caller as though it were
+      // the metrics text.
+      api.getMetrics.mockResolvedValue(ok(undefined));
+
+      const result = await handler({});
+
+      expect(result.isError).toBeFalsy();
+      expect(result.content[0].text).toBe("OK");
     });
   });
 
@@ -1917,6 +2361,99 @@ describe("tool handler behavior", () => {
       }
       expect(listSnapshots()).toHaveLength(0);
     });
+
+    it("save surfaces the API error when the pre-save read fails", async () => {
+      // An unreachable or erroring admin API is a different problem from a
+      // malformed config body. Reporting "not a JSON object" for a 503 would
+      // send the caller off to inspect a config they never managed to read.
+      const { listSnapshots } = await import("../snapshots.js");
+      api.configGet.mockResolvedValue(err(503, "down"));
+
+      const result = await handler({ action: "save", index: 0, confirm: false });
+
+      expect(result.isError).toBe(true);
+      expect(result.content[0].text).toContain("down");
+      expect(result.content[0].text).not.toContain("empty or not a JSON object");
+      expect(listSnapshots()).toHaveLength(0);
+    });
+
+    it("apply succeeds when the PRE-revert read fails, pushing no rollback-forward snapshot", async () => {
+      // Realistic rather than defensive: Caddy restarts its admin listener on
+      // every /load, so the read that precedes a revert can legitimately fail.
+      // The load is what decides success, and a config that was never read
+      // cannot be pushed as a rollback-forward target -- so the ring still
+      // holds exactly the one snapshot the operator was reverting to.
+      const { saveSnapshot, listSnapshots } = await import("../snapshots.js");
+      const target = { apps: { intended: true } };
+      saveSnapshot(target, "caddy_load");
+
+      api.configGet.mockResolvedValue(err(0, "fetch failed"));
+      api.loadConfig.mockResolvedValue(ok());
+
+      const result = await handler({ action: "apply", index: 0, confirm: true });
+
+      expect(result.isError).toBeFalsy();
+      expect(result.content[0].text).toContain("Reverted to snapshot [0]");
+      // The success message must SAY the safety net was skipped. Reporting a
+      // bare success here would leave the operator believing they can undo this
+      // revert, at the one moment they cannot -- the config just replaced went
+      // unrecorded, so there is nothing to go back to.
+      expect(result.content[0].text).toContain("no roll-forward snapshot was captured");
+      expect(result.content[0].text).toContain("cannot be rolled back to the config it replaced");
+      // The READ FAILED here, so the warning must say so -- and must not use the
+      // wording reserved for a read that succeeded with a non-object body.
+      expect(result.content[0].text).toContain("could not be read");
+      expect(result.content[0].text).not.toContain("empty or not a JSON object");
+      const snaps = listSnapshots();
+      expect(snaps).toHaveLength(1);
+      expect(snaps[0].trigger).toBe("caddy_load");
+      expect(snaps[0].config).toEqual(target);
+    });
+
+    it.each([
+      ["a null body", null],
+      ["a bare string", "not-a-config"],
+      ["an array", []],
+    ])("blames the body, not the admin API, when the pre-revert read returns %s", async (_label, body) => {
+      // The snapshot is skipped for TWO distinguishable reasons and the warning
+      // must not conflate them. Here the read SUCCEEDED -- Caddy answers a
+      // config-less instance with HTTP 200 and a literal `null` -- so claiming it
+      // "could not be read" would send the operator chasing a connectivity or
+      // admin-listener fault that does not exist. Naming a cause the signal does
+      // not support is the mistake that got 1.2.5 deprecated.
+      const { saveSnapshot, listSnapshots } = await import("../snapshots.js");
+      saveSnapshot({ apps: { intended: true } }, "caddy_load");
+
+      api.configGet.mockResolvedValue(ok(body));
+      api.loadConfig.mockResolvedValue(ok());
+
+      const result = await handler({ action: "apply", index: 0, confirm: true });
+
+      expect(result.isError).toBeFalsy();
+      expect(result.content[0].text).toContain("Reverted to snapshot [0]");
+      expect(result.content[0].text).toContain("empty or not a JSON object");
+      expect(result.content[0].text).not.toContain("could not be read");
+      // Still no roll-forward snapshot -- only the wording differs.
+      expect(listSnapshots()).toHaveLength(1);
+      expect(listSnapshots()[0].trigger).toBe("caddy_load");
+    });
+
+    it("does not warn about the roll-forward snapshot when it was captured", async () => {
+      // The other half of the pair: on the ordinary path the warning must be
+      // ABSENT, or it becomes noise operators learn to scroll past.
+      const { saveSnapshot, listSnapshots } = await import("../snapshots.js");
+      saveSnapshot({ apps: { intended: true } }, "caddy_load");
+
+      api.configGet.mockResolvedValue(ok({ apps: { current: true } }));
+      api.loadConfig.mockResolvedValue(ok());
+
+      const result = await handler({ action: "apply", index: 0, confirm: true });
+
+      expect(result.isError).toBeFalsy();
+      expect(result.content[0].text).toContain("Reverted to snapshot [0]");
+      expect(result.content[0].text).not.toContain("Warning");
+      expect(listSnapshots()[0].trigger).toBe("caddy_revert");
+    });
   });
 
   // ─── caddy_remove_route ───────────────────────────────────────────────
@@ -1945,11 +2482,53 @@ describe("tool handler behavior", () => {
     });
 
     it("deletes by @id when id is given", async () => {
+      // The @id path is now GET-then-DELETE, not a bare DELETE: the tool reads
+      // the object first and only removes it once it is route-shaped (top-level
+      // `handle` array). @ids are config-global in Caddy, so without that read a
+      // colliding id from another subsystem would be deleted as if it were a
+      // route -- and a delete, unlike a botched write, leaves nothing to inspect.
+      api.configByIdGet.mockResolvedValue(
+        ok({ "@id": "api-v2", match: [{ host: ["api.local"] }], handle: [{ handler: "reverse_proxy" }] }),
+      );
       api.configByIdDelete.mockResolvedValue(ok({}));
       const result = await handler({ id: "api-v2", confirm: true });
+      expect(api.configByIdGet).toHaveBeenCalledWith("api-v2");
       expect(result.isError).toBeFalsy();
       expect(api.configByIdDelete).toHaveBeenCalledWith("api-v2");
       expect(result.content[0].text).toContain('@id="api-v2"');
+    });
+
+    it("refuses to delete when @id resolves to a non-route object", async () => {
+      // Same collision the write path guards, with worse consequences: the id
+      // resolves to an @id'd TLS issuer, and deleting it would take the
+      // instance's ACME configuration with it. Refuse, and name the deliberate
+      // way to remove it if that is genuinely what the caller meant.
+      api.configByIdGet.mockResolvedValue(ok({ "@id": "api-v2", module: "acme", email: "ops@example.com" }));
+
+      const result = await handler({ id: "api-v2", confirm: true });
+
+      expect(api.configByIdGet).toHaveBeenCalledWith("api-v2");
+      expect(api.configByIdDelete).not.toHaveBeenCalled();
+      expect(result.isError).toBe(true);
+      expect(result.content[0].text).toContain("non-route config object");
+      expect(result.content[0].text).toContain("config-global");
+      expect(result.content[0].text).toContain("caddy_config_by_id");
+    });
+
+    it("surfaces a failing @id GET verbatim instead of the wrong-shape refusal", async () => {
+      // An @id that does not resolve AT ALL is a different problem from one that
+      // resolves to the wrong kind of object, and only the caller can tell which
+      // they meant. The API's own error has to survive: translating a 404 into
+      // "resolves to a non-route config object" would describe an object that
+      // isn't there.
+      api.configByIdGet.mockResolvedValue(err(404, "unknown object ID 'ghost-route'"));
+
+      const result = await handler({ id: "ghost-route", confirm: true });
+
+      expect(api.configByIdDelete).not.toHaveBeenCalled();
+      expect(result.isError).toBe(true);
+      expect(result.content[0].text).toContain("unknown object ID 'ghost-route'");
+      expect(result.content[0].text).not.toContain("non-route config object");
     });
 
     it("rejects out-of-range index", async () => {
@@ -1971,6 +2550,20 @@ describe("tool handler behavior", () => {
       const result = await handler({ index: 1, server: "srv0", confirm: true });
       expect(result.isError).toBeFalsy();
       expect(api.configDelete).toHaveBeenCalledWith("apps/http/servers/srv0/routes/1");
+    });
+
+    it("names an INDEX target in the confirm=false refusal", async () => {
+      // The refusal test above passes an id, so only the @id half of the target
+      // ternary ever ran. Index is the mode that is NOT idempotent -- Caddy
+      // re-packs the routes array after a removal -- so its refusal has to name
+      // both the index and the server the caller is about to act on.
+      const result = await handler({ index: 3, server: "srv1", confirm: false });
+
+      expect(result.isError).toBe(true);
+      expect(result.content[0].text).toContain('Refusing to remove route 3 on server "srv1"');
+      // Nothing may be read or deleted before the caller confirms.
+      expect(api.configGet).not.toHaveBeenCalled();
+      expect(api.configDelete).not.toHaveBeenCalled();
     });
   });
 
@@ -2158,9 +2751,13 @@ describe("tool handler behavior", () => {
     });
 
     it("surfaces the api error verbatim when by-@id delete fails after confirm", async () => {
+      // The shape guard has to pass for the DELETE to be reached at all, so the
+      // GET returns a real route here -- this test is about the delete itself
+      // failing (concurrency, transport, validation), not about the guard.
+      api.configByIdGet.mockResolvedValue(ok({ "@id": "doomed-route", match: [], handle: [] }));
       api.configByIdDelete.mockResolvedValue(err(500, "id-delete-failed"));
-      const result = await handler({ id: "missing-route", confirm: true });
-      expect(api.configByIdDelete).toHaveBeenCalledWith("missing-route");
+      const result = await handler({ id: "doomed-route", confirm: true });
+      expect(api.configByIdDelete).toHaveBeenCalledWith("doomed-route");
       expect(result.isError).toBe(true);
       expect(result.content[0].text).toContain("id-delete-failed");
     });
@@ -2295,6 +2892,73 @@ describe("tool handler behavior", () => {
       expect(text).toContain("error(503)");
       expect(text).toContain("encode");
       expect(text).toContain("headers");
+    });
+
+    it("renders a null entry INSIDE a route's match array as catch-all", async () => {
+      // `match: [null]` passes caddy validate 2.11.4, so a live config can hold
+      // one. Reading .host off it throws inside the summary loop, and that throw
+      // takes the listing for every OTHER route on the server down with it.
+      // Sibling tests cover a null ROUTE and a non-array match, never this.
+      api.configGet.mockResolvedValue(
+        ok({
+          listen: [":443"],
+          routes: [{ match: [null], handle: [{ handler: "static_response", status_code: 200 }] }],
+        }),
+      );
+
+      const result = await handler({ server: "srv0" });
+
+      expect(result.isError).toBeFalsy();
+      expect(result.content[0].text).toContain("catch-all → static_response(200)");
+    });
+
+    it.each([[{}], [{ max_requests: 5 }]])("renders %j as ? inside reverse_proxy(...)", async (upstream) => {
+      // An upstream is only required to be an object -- Caddy fills `dial` when
+      // adapting a Caddyfile, but a hand-written JSON config can omit it. The
+      // placeholder keeps the summary line a summary line instead of dumping
+      // the raw object into it.
+      // Deliberately NOT covered: upstreams: [null]. That panics Caddy at
+      // provision, so the admin API can never serve the shape the sibling
+      // branch guards -- it is genuinely unreachable.
+      api.configGet.mockResolvedValue(
+        ok({
+          listen: [":443"],
+          routes: [{ match: [{ host: ["a.local"] }], handle: [{ handler: "reverse_proxy", upstreams: [upstream] }] }],
+        }),
+      );
+
+      expect((await handler({ server: "srv0" })).content[0].text).toContain("reverse_proxy(?)");
+    });
+
+    it.each([
+      [{ handler: "file_server", root: "/var/www" }, "file_server(/var/www)"],
+      [{ handler: "file_server" }, "file_server(.)"],
+    ])("renders %j as %s", async (handle, expected) => {
+      // Every other handler arm has a formatter test; file_server had none,
+      // which left the most common static-site route unpinned. A root-less
+      // file_server is the ordinary shape, not a malformed one -- Caddy
+      // defaults the root to the working directory.
+      api.configGet.mockResolvedValue(
+        ok({ listen: [":80"], routes: [{ match: [{ path: ["/static"] }], handle: [handle] }] }),
+      );
+
+      expect((await handler({ server: "srv0" })).content[0].text).toContain(expected);
+    });
+
+    it.each([
+      [{ handler: "rewrite", strip_path_prefix: "/api" }, "rewrite(...)"],
+      [{ handler: "authentication" }, "auth(...)"],
+      [{ handler: "error", status_code: "{http.error.status_code}" }, "error(...)"],
+    ])("falls back to a placeholder for %j", async (handle, expected) => {
+      // All three pass caddy validate 2.11.4, so none is hypothetical. The
+      // `error` one is the non-obvious case: status_code arrives as a JSON
+      // STRING (a Caddy WeakString holding a placeholder), which is exactly why
+      // that arm tests typeof === "number" rather than mere presence.
+      api.configGet.mockResolvedValue(
+        ok({ listen: [":443"], routes: [{ match: [{ path: ["/x"] }], handle: [handle] }] }),
+      );
+
+      expect((await handler({ server: "srv0" })).content[0].text).toContain(expected);
     });
   });
 
@@ -2714,6 +3378,25 @@ describe("tool handler behavior", () => {
       result = await handler();
       expect(result.contents[0].mimeType).toBe("text/plain");
       expect(result.contents[0].text).toMatch(/^Error: /);
+    });
+
+    it.each([
+      ["caddy-config", "configGet"],
+      ["caddy-upstreams", "getUpstreams"],
+      ["caddy-servers", "configGet"],
+      ["caddy-metrics", "getMetrics"],
+    ])("%s: falls back to the status code when the failure carries no error text", async (resource, method) => {
+      // `error` is optional on ApiResponse -- only the failure paths api.ts
+      // builds itself are guaranteed to fill it, so a body-less non-2xx can
+      // arrive without one. Interpolating it bare rendered the literal string
+      // "Error: undefined" to the client, which says nothing; the status at
+      // least reports what the server answered.
+      (api as any)[method].mockResolvedValueOnce({ ok: false, status: 503 });
+      const handler = await getResourceHandler(resource);
+      const result = await handler();
+
+      expect(result.contents[0].mimeType).toBe("text/plain");
+      expect(result.contents[0].text).toBe("Error: HTTP 503");
     });
   });
 });

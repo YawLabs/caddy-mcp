@@ -53,6 +53,7 @@
   "devDependencies": {
     "@biomejs/biome": "~2.4.11",
     "@types/node": "^26.0.0",
+    "esbuild": "^0.28.1",
     "postject": "^1.0.0-alpha.6",
     "tsup": "^8.4.0",
     "typescript": "^7.0.2",

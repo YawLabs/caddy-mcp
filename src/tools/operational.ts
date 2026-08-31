@@ -49,7 +49,12 @@ function describeServer(rawValue: unknown): string {
       : {};
   const listen: unknown[] = Array.isArray(raw.listen) ? raw.listen : [];
   const routes: unknown[] = Array.isArray(raw.routes) ? raw.routes : [];
-  const hasExplicitTls = !!raw.tls_connection_policies;
+  // An empty tls_connection_policies array configures nothing, so it must read the same
+  // as an absent key: fall through to the listen-port heuristic rather than claim
+  // "enabled". A present-but-non-array value is a malformed config we can't interpret --
+  // keep the old "something is there" reading for it rather than silently calling it off.
+  const tlsPolicies = raw.tls_connection_policies;
+  const hasExplicitTls = Array.isArray(tlsPolicies) ? tlsPolicies.length > 0 : !!tlsPolicies;
   const listensHttps = listen.some((l) => typeof l === "string" && HTTPS_PORT_RE.test(l));
   const tls = hasExplicitTls ? "enabled" : listensHttps ? "auto (HTTPS)" : "off (HTTP only)";
   const listenStr = listen.length > 0 ? listen.map(String).join(", ") : "default";
@@ -182,6 +187,19 @@ export function registerOperationalTools(server: McpServer) {
     { readOnlyHint: true, destructiveHint: false, idempotentHint: true, openWorldHint: false },
     async () => {
       const res = await api.configGet<Record<string, CaddyServerSummary>>("apps/http/servers");
+      // A config-less Caddy has no `apps` key at all, so this read fails the path
+      // walk rather than returning an empty object: 2.11.4 answers HTTP 400
+      // {"error":"invalid traversal path at: config/apps/http"}. Surfacing that raw
+      // made the tool whose entire job is "tell me what servers exist" answer a
+      // fresh instance with a Go internal error instead of the obvious truth.
+      //
+      // The path is a fixed literal, so every way this walk can fail -- missing
+      // apps, http, or servers -- means the same thing and only that thing: no HTTP
+      // servers are configured. That makes the friendly answer honest here rather
+      // than a guess. caddy_status already reports it this way for the same state.
+      if (api.isMissingConfigPath(res)) {
+        return { content: [{ type: "text" as const, text: "No HTTP servers configured" }] };
+      }
       if (!res.ok) return formatResult(res);
 
       const servers = res.data ?? {};

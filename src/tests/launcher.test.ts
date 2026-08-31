@@ -39,10 +39,15 @@ interface RunResult {
  * Run the launcher to completion. `onStderr` can fire a signal once the child
  * announces itself -- signalling before the child is up would test the wrong
  * thing.
+ *
+ * An `undefined` value REMOVES a variable. The child's env starts from
+ * process.env, and Node's spawn skips keys whose value is undefined, so this is
+ * how a case asserts "genuinely unset" instead of inheriting whatever the
+ * machine running the suite happens to export.
  */
 function runLauncher(
   args: string[],
-  env: Record<string, string>,
+  env: Record<string, string | undefined>,
   onStderr?: (chunk: string, child: ReturnType<typeof spawn>) => void,
 ): Promise<RunResult> {
   return new Promise((resolve) => {
@@ -130,6 +135,32 @@ describe.skipIf(!existsSync(DIST_CLI))("launcher: runtime selection", () => {
 });
 
 /**
+ * Answering `--version` is MANDATORY for any stand-in oam.
+ *
+ * Before spawning, the launcher runs a synchronous `execFileSync(oam,
+ * ["--version"])` and requires >= OAM_MIN (0.9.0). A fake that ignores the
+ * probe does not merely fail the gate -- if it blocks, execFileSync blocks the
+ * launcher forever, and if it answers unparseably the launcher silently falls
+ * back to Node, so the test would measure the fallback path while appearing to
+ * exercise the oam one.
+ *
+ * Shared by both POSIX-gated blocks below. The fakes are bash scripts, which is
+ * also why those blocks skip on Windows: Node cannot spawn a .cmd/.bat without
+ * `shell: true`, the same constraint that keeps the launcher's own discovery to
+ * `.exe`.
+ */
+const VERSION_PROBE = ['if [ "$1" = "--version" ]; then echo "oam 0.9.0"; exit 0; fi'];
+
+/** Write an executable stand-in oam into a fresh temp dir; returns its path. */
+function writeFake(body: string): string {
+  const dir = mkdtempSync(join(tmpdir(), "caddy-mcp-fake-oam-"));
+  const file = join(dir, "oam");
+  writeFileSync(file, body, "utf-8");
+  chmodSync(file, 0o755);
+  return file;
+}
+
+/**
  * Signal forwarding and escalation.
  *
  * POSIX only, deliberately: there are no POSIX signals on Windows, where
@@ -138,18 +169,6 @@ describe.skipIf(!existsSync(DIST_CLI))("launcher: runtime selection", () => {
  * to the whole process group -- behavior this harness cannot drive.
  */
 describe.skipIf(isWin || !existsSync(DIST_CLI))("launcher: signal handling", () => {
-  /**
-   * Answering `--version` is MANDATORY for any stand-in oam.
-   *
-   * Before spawning, the launcher runs a synchronous `execFileSync(oam,
-   * ["--version"])` and requires >= OAM_MIN (0.9.0). A fake that ignores the
-   * probe does not merely fail the gate -- if it blocks, execFileSync blocks
-   * the launcher forever, and if it answers unparseably the launcher silently
-   * falls back to Node, so the test would measure the fallback path while
-   * appearing to exercise signal forwarding.
-   */
-  const VERSION_PROBE = ['if [ "$1" = "--version" ]; then echo "oam 0.9.0"; exit 0; fi'];
-
   const GRACEFUL = [
     "#!/bin/bash",
     ...VERSION_PROBE,
@@ -171,14 +190,6 @@ describe.skipIf(isWin || !existsSync(DIST_CLI))("launcher: signal handling", () 
 
   /** An oam that satisfies discovery but is older than the launcher's floor. */
   const TOO_OLD = ["#!/bin/bash", 'echo "oam 0.8.9"', "exit 0", ""].join("\n");
-
-  function writeFake(body: string): string {
-    const dir = mkdtempSync(join(tmpdir(), "caddy-mcp-fake-oam-"));
-    const file = join(dir, "oam");
-    writeFileSync(file, body, "utf-8");
-    chmodSync(file, 0o755);
-    return file;
-  }
 
   /** A stand-in oam that either shuts down cleanly on a signal or ignores it. */
   function fakeOam(kind: "graceful" | "wedged"): string {
@@ -235,5 +246,311 @@ describe.skipIf(isWin || !existsSync(DIST_CLI))("launcher: signal handling", () 
     const res = await runWithSignals(fakeOam("graceful"), 3);
     expect(res.stderr).toContain("CHILD: cleanup ran");
     expect(res.code).toBe(0);
+  }, 30000);
+});
+
+/**
+ * `CADDY_MCP_SANDBOX=1` grant derivation.
+ *
+ * sandboxFlags() is module-scope inside an executable script, so there is
+ * nothing to import: the seam is the same stand-in oam the block above uses,
+ * told to echo the argv it was handed. That argv IS the contract -- every grant
+ * fails CLOSED, so a wrong one shows up as a connection error or a feature that
+ * quietly does nothing, never as a complaint from the launcher.
+ *
+ * POSIX only for the same reason as the signal block: the fake is a bash script.
+ */
+describe.skipIf(isWin || !existsSync(DIST_CLI))("launcher: sandbox grants", () => {
+  /** A stand-in oam that reports the argv it was given, one entry per line. */
+  const ECHO_ARGV = ["#!/bin/bash", ...VERSION_PROBE, 'for a in "$@"; do echo "ARGV: $a" >&2; done', "exit 0", ""].join(
+    "\n",
+  );
+
+  /**
+   * The argv the launcher handed oam, in order.
+   *
+   * CADDY_MCP_RUNTIME=oam so a fake that somehow fails discovery is a loud
+   * failure rather than a silent fallback to Node, which would report no flags
+   * at all and pass every "did not grant X" assertion for the wrong reason.
+   * The two derived variables are cleared first: the suite must not read
+   * differently on a machine that exports its own CADDY_ADMIN_URL.
+   */
+  async function argvFor(env: Record<string, string | undefined>): Promise<string[]> {
+    const res = await runLauncher([], {
+      OAM_BIN: writeFake(ECHO_ARGV),
+      CADDY_MCP_RUNTIME: "oam",
+      CADDY_MCP_SANDBOX: "1",
+      CADDY_ADMIN_URL: undefined,
+      CADDY_MCP_SNAPSHOT_DIR: undefined,
+      ...env,
+    });
+    expect(res.code, res.stderr).toBe(0);
+    return res.stderr
+      .split("\n")
+      .filter((line) => line.startsWith("ARGV: "))
+      .map((line) => line.slice("ARGV: ".length));
+  }
+
+  /** The value of a single `--flag=value` grant, or undefined when absent. */
+  function grant(argv: string[], flag: string): string | undefined {
+    return argv.find((a) => a.startsWith(`${flag}=`))?.slice(flag.length + 1);
+  }
+
+  it("grants the endpoint api.ts actually dials", async () => {
+    const argv = await argvFor({});
+    // src/api.ts declares DEFAULT_URL = "http://localhost:2019". The grant and
+    // the dial are matched as TEXT, so a launcher defaulting to 127.0.0.1 while
+    // the server dials localhost denies every request out of the box -- with
+    // both files reading correctly on their own.
+    expect(grant(argv, "--allow-net")).toBe("localhost");
+    // Process-level flags belong BEFORE the subcommand: `oam run --permission`
+    // is rejected outright.
+    expect(argv.indexOf("--permission")).toBe(0);
+    expect(argv[argv.indexOf("run") + 1]).toBe(DIST_CLI);
+  }, 30000);
+
+  it("derives the grant from CADDY_ADMIN_URL, host only", async () => {
+    const argv = await argvFor({ CADDY_ADMIN_URL: "http://caddy.internal:9000" });
+    // Host WITHOUT the port. oam presents the bare hostname to the net check for
+    // `fetch` and "host:port" only for sockets, and grants are prefix-matched --
+    // "caddy.internal" does not start with "caddy.internal:9000", so pinning the
+    // port denies every request api.ts makes over TCP.
+    expect(grant(argv, "--allow-net")).toBe("caddy.internal");
+  }, 30000);
+
+  for (const [label, value] of [
+    ["empty", ""],
+    ["whitespace-only", "   "],
+  ]) {
+    it(`treats an ${label} CADDY_ADMIN_URL as unset, not as "grant everything"`, async () => {
+      const argv = await argvFor({ CADDY_ADMIN_URL: value });
+      expect(grant(argv, "--allow-net")).toBe("localhost");
+      // The regression: `??` keeps "" (only null/undefined fall through), the
+      // URL parse is skipped, and the BARE --allow-net grants every host on the
+      // network -- a sandbox switched on and silently doing nothing. api.ts
+      // reads the same variable with `||`, so "" already means "use the
+      // default" there; the launcher has to agree.
+      expect(argv).not.toContain("--allow-net");
+    }, 30000);
+  }
+
+  for (const [label, value] of [
+    ["URL form", "unix:///var/run/caddy-admin.sock"],
+    ["Caddy network-address form", "unix//var/run/caddy-admin.sock"],
+    // The MALFORMED spellings matter as much as the tidy two, and for a
+    // counter-intuitive reason: each one parses (or throws) into an empty
+    // hostname, so a check matching only the well-formed pair would hand these
+    // the BARE --allow-net -- the widest possible grant, for input that plainly
+    // meant a socket. src/api.ts fails all of them up front in
+    // getMalformedUnixUrl, so denying the net category costs nothing.
+    ["single slash after unix:", "unix:/run/caddy-admin.sock"],
+    ["relative path", "unix://relative.sock"],
+    ["bare scheme", "unix://"],
+    // getUnixSocketPath is case-SENSITIVE and rejects this, but
+    // getMalformedUnixUrl's /^unix[:/]/i accepts it -- so the launcher has to
+    // follow the case-insensitive one or uppercase falls through to wide open.
+    ["uppercase scheme", "UNIX:///var/run/caddy-admin.sock"],
+  ]) {
+    it(`emits NO net grant for a unix-socket CADDY_ADMIN_URL (${label})`, async () => {
+      const argv = await argvFor({ CADDY_ADMIN_URL: value });
+      // The same wide-open shape the empty-string case above guards, reached by
+      // a different route: `new URL("unix:///...").hostname` is "" (and the
+      // Caddy spelling throws outright), so the host check fell through and left
+      // the BARE --allow-net -- every host on the network, handed out for the
+      // MOST hardened admin config Caddy recommends.
+      //
+      // An OMITTED --allow-net is what denies the category (oam reads absent as
+      // false, bare as "*"), so assert absence, not a narrower value.
+      expect(argv.filter((a) => a.startsWith("--allow-net"))).toEqual([]);
+      // The sandbox must still be on -- absence of the flag has to mean "denied",
+      // not "we never got as far as building flags".
+      expect(argv).toContain("--permission");
+    }, 30000);
+  }
+
+  it("does not mistake a TCP host merely starting with 'unix' for a socket", async () => {
+    // The false positive the unix check has to avoid; src/api.ts guards the same
+    // case in getMalformedUnixUrl by matching "unix:" / "unix/" rather than a
+    // bare "unix" prefix.
+    const argv = await argvFor({ CADDY_ADMIN_URL: "http://unix.example.com:2019" });
+    expect(grant(argv, "--allow-net")).toBe("unix.example.com");
+  }, 30000);
+
+  it("grants every environment variable the shipped bundle reads", async () => {
+    const argv = await argvFor({});
+    // Keep in step with `grep -rn process.env src/` outside src/tests.
+    expect(grant(argv, "--allow-env")?.split(",")).toEqual([
+      "CADDY_ADMIN_URL",
+      "CADDY_API_TOKEN",
+      "CADDY_LOAD_TIMEOUT",
+      "CADDY_MAX_RETRIES",
+      "CADDY_MCP_SNAPSHOT_DIR",
+      "CADDY_TIMEOUT",
+    ]);
+    // CADDY_MCP_SNAPSHOT_DIR is the one that was missing. A denied variable is
+    // ABSENT from process.env rather than throwing, so src/snapshots.ts read it
+    // as "not configured": caddy_revert degraded to memory-only and neither
+    // process said anything.
+  }, 30000);
+
+  it("leaves the filesystem denied when snapshot persistence is off", async () => {
+    const argv = await argvFor({});
+    expect(argv.filter((a) => a.startsWith("--allow-fs"))).toEqual([]);
+  }, 30000);
+
+  it("grants exactly the snapshot directory when persistence is on", async () => {
+    // A path, not a real directory: the grant is derived textually and the
+    // launcher never stats it. An absolute path is already normalized, so the
+    // two spellings collapse to one entry (see the relative case below).
+    const dir = join(tmpdir(), "caddy-mcp-snapshots");
+    const argv = await argvFor({ CADDY_MCP_SNAPSHOT_DIR: dir });
+    // Read AND write: snapshots.ts writes each snapshot and reads the directory
+    // back to rehydrate the ring on the next start. Granting the variable
+    // without the directory only moves the silent failure -- persist() swallows
+    // its own I/O errors and falls back to the in-memory ring.
+    expect(grant(argv, "--allow-fs-read")).toBe(dir);
+    expect(grant(argv, "--allow-fs-write")).toBe(dir);
+  }, 30000);
+
+  it("grants both spellings of a relative snapshot directory", async () => {
+    // Grants are plain string PREFIXES matched against the path each call
+    // passes. snapshots.ts hands the raw variable to readdirSync/mkdirSync but
+    // builds per-file paths with path.join, which normalizes "./snaps" to
+    // "snaps" -- so the raw form alone misses the files and the normalized form
+    // alone misses the directory listing.
+    const argv = await argvFor({ CADDY_MCP_SNAPSHOT_DIR: "./snaps" });
+    expect(grant(argv, "--allow-fs-read")).toBe("./snaps,snaps");
+    expect(grant(argv, "--allow-fs-write")).toBe("./snaps,snaps");
+  }, 30000);
+
+  it("emits no permission flags at all unless CADDY_MCP_SANDBOX=1", async () => {
+    const argv = await argvFor({ CADDY_MCP_SANDBOX: undefined });
+    expect(argv[0]).toBe("run");
+    expect(argv.some((a) => a === "--permission" || a.startsWith("--allow-"))).toBe(false);
+  }, 30000);
+});
+
+/**
+ * The version gate's TWO causes, and the AUTO half of both.
+ *
+ * An unparseable `--version` and an old one land in the SAME branch, but the
+ * launcher deliberately splits their detail and their remedy: a null version is
+ * not "old", and the branch's own comment warns that telling that user to `oam
+ * self-update` "sends them after the one cause it definitely is not". Only the
+ * too-old + CADDY_MCP_RUNTIME=oam corner was pinned, which left the header's
+ * promise -- "An older oam is not an error: the launcher falls back to Node and
+ * says so on stderr" -- with no test at all.
+ *
+ * POSIX only for the same reason as the blocks above: the fakes are bash scripts.
+ */
+describe.skipIf(isWin || !existsSync(DIST_CLI))("launcher: version gate fallback", () => {
+  /** An oam that satisfies discovery but is older than the launcher's floor. */
+  const TOO_OLD = ["#!/bin/bash", 'echo "oam 0.8.9"', "exit 0", ""].join("\n");
+
+  /**
+   * An oam that runs cleanly and answers with something the launcher's
+   * `(\d+)\.(\d+)\.(\d+)` cannot read, so oamVersion returns null. Stands in for
+   * the causes a test cannot construct portably -- wrong arch, a non-oam binary
+   * on OAM_BIN, a file deleted between the stat and the probe.
+   */
+  const UNREADABLE = ["#!/bin/bash", 'echo "not a version"', "exit 0", ""].join("\n");
+
+  it("falls back to Node when the discovered oam is too old", async () => {
+    // CADDY_MCP_RUNTIME REMOVED, not set to "auto": auto is the default and the
+    // mode every install actually runs in, so the documented fallback has to
+    // hold without the variable being present at all.
+    const res = await runLauncher(["--version"], {
+      CADDY_MCP_RUNTIME: undefined,
+      OAM_BIN: writeFake(TOO_OLD),
+    });
+    expect(res.code, res.stderr).toBe(0);
+    // Exit 0 alone would also pass on a launcher that started nothing. The
+    // version on stdout is what proves the Node fallback actually SERVED.
+    expect(res.stdout.trim()).toMatch(/^caddy-mcp \d+\.\d+\.\d+/);
+    // Naming the version found is the point of the notice: a silent downgrade is
+    // how someone keeps running an oam they meant to update.
+    expect(res.stderr).toContain("0.8.9");
+    expect(res.stderr).toContain("older than 0.9.0");
+    expect(res.stderr).toContain("using Node instead");
+  }, 30000);
+
+  it("falls back to Node when oam does not report a readable version", async () => {
+    const res = await runLauncher(["--version"], {
+      CADDY_MCP_RUNTIME: "auto",
+      OAM_BIN: writeFake(UNREADABLE),
+    });
+    expect(res.code, res.stderr).toBe(0);
+    expect(res.stdout.trim()).toMatch(/^caddy-mcp \d+\.\d+\.\d+/);
+    // The other half of the split: this diagnostic must NOT claim a version it
+    // never read, because "older than 0.9.0" would send the operator to
+    // self-update a binary that never ran.
+    expect(res.stderr).toContain("could not be run, or did not report a version");
+    expect(res.stderr).toContain("using Node instead");
+    expect(res.stderr).not.toContain("self-update");
+  }, 30000);
+
+  it("names the unreadable-binary remedy, not self-update, under CADDY_MCP_RUNTIME=oam", async () => {
+    // The loud counterpart of the case above, and where the two remedies are
+    // actually printed -- auto says only "using Node instead".
+    const res = await runLauncher(["--version"], {
+      CADDY_MCP_RUNTIME: "oam",
+      OAM_BIN: writeFake(UNREADABLE),
+    });
+    expect(res.code).toBe(1);
+    expect(res.stderr).toContain("could not be run, or did not report a version this launcher understands");
+    expect(res.stderr).toContain("Check that it is an executable oam binary");
+    // The regression that would matter: `oam self-update` cannot fix a binary
+    // that never ran, so offering it costs the operator the real cause.
+    expect(res.stderr).not.toContain("self-update");
+  }, 30000);
+});
+
+/**
+ * Spawn failure AFTER a passing version probe.
+ *
+ * The window the launcher's own comment names: discovery is stat-only and the
+ * probe is a separate process, so an oam can satisfy both and still be
+ * unexecutable a moment later. spawn reports that asynchronously via 'error',
+ * never as a throw, and auto mode has to degrade to Node -- an escaping 'error'
+ * would take the server down for every host whose oam went missing.
+ *
+ * The fake DELETES ITSELF during the probe, which is one of the causes that
+ * comment lists. Deletion rather than chmod because a running bash holds its own
+ * open fd (so the script finishes normally) while the launcher's next use of that
+ * path fails with ENOENT, and unlink behaves the same on every filesystem the
+ * suite might run on -- the exec bit does not.
+ *
+ * POSIX only, like the blocks above: the fake is a bash script.
+ */
+describe.skipIf(isWin || !existsSync(DIST_CLI))("launcher: spawn failure fallback", () => {
+  /**
+   * Answers `--version` with a supported version, then vanishes. The "CHILD: up"
+   * line is never reached: it exists so a spawn that unexpectedly SUCCEEDS is
+   * visible as a failed assertion rather than passing for the wrong reason.
+   */
+  const VANISHING = ["#!/bin/bash", 'rm -f "$0"', ...VERSION_PROBE, 'echo "CHILD: up" >&2', "exit 0", ""].join("\n");
+
+  it("falls back to Node when a version-passing oam cannot be spawned", async () => {
+    const res = await runLauncher(["--version"], {
+      CADDY_MCP_RUNTIME: "auto",
+      OAM_BIN: writeFake(VANISHING),
+    });
+    expect(res.code, res.stderr).toBe(0);
+    expect(res.stdout.trim()).toMatch(/^caddy-mcp \d+\.\d+\.\d+/);
+    // Proves the version came from the in-process fallback rather than from an
+    // oam that turned out to be runnable after all.
+    expect(res.stderr).not.toContain("CHILD: up");
+  }, 30000);
+
+  it("fails loudly on an unspawnable oam under CADDY_MCP_RUNTIME=oam", async () => {
+    // Same failure, opposite contract: explicitly demanding oam must not quietly
+    // run a different runtime than the operator asked for.
+    const res = await runLauncher(["--version"], {
+      CADDY_MCP_RUNTIME: "oam",
+      OAM_BIN: writeFake(VANISHING),
+    });
+    expect(res.code).toBe(1);
+    expect(res.stderr).toContain("failed to launch oam");
+    expect(res.stdout).toBe("");
   }, 30000);
 });

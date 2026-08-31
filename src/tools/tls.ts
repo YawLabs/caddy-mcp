@@ -101,6 +101,41 @@ function validateIssuerShape(tls: Record<string, unknown>): string | null {
   return null;
 }
 
+/** The issuer module that `email` / `ca` / `profile` actually belong to. */
+const ACME_ISSUER_MODULE = "acme";
+
+/**
+ * Confirm policies[0].issuers[0] is an ACME issuer before merging ACME fields into it.
+ * Returns null when it is, or a message naming the module actually found.
+ *
+ * Structure is not enough: `{ "module": "internal" }` (Caddy's local CA) passes
+ * validateIssuerShape and is an entirely ordinary config, yet carries none of these
+ * fields. Writing `email` or `profile` onto it produces a config Caddy rejects on
+ * load, and `ca` is worse -- `internal` has its own `ca` key naming a PKI CA id
+ * ("local"), so set_acme_ca would silently repoint it at an ACME directory URL.
+ *
+ * Only the merge path needs this guard. The PATCH-first path in setIssuerField cannot
+ * introduce a foreign field, because Caddy's PATCH requires the key to already exist at
+ * the target path (see safeFallback below) -- it can only overwrite a field the issuer
+ * already carries. And buildTlsConfig writes `module: "acme"` itself, so the
+ * absent-apps/tls branch is ACME by construction.
+ *
+ * Caller must have run validateIssuerShape first: the path is assumed present.
+ */
+function validateIssuerModule(tls: Record<string, unknown>): string | null {
+  // Same cast as mergeIssuerFields -- the path is shape-checked before we get here.
+  const automation = tls.automation as { policies: Array<{ issuers: Array<Record<string, unknown>> }> };
+  const found = automation.policies[0].issuers[0].module;
+  if (found === ACME_ISSUER_MODULE) return null;
+  const describe = found === undefined ? "absent" : JSON.stringify(found);
+  return (
+    `Refusing to write an ACME field onto a non-ACME issuer: ` +
+    `apps/tls.automation.policies[0].issuers[0].module is ${describe}, not "${ACME_ISSUER_MODULE}". ` +
+    `email/ca/profile are fields of the acme issuer module only. Use caddy_config_set with an explicit ` +
+    `path to edit this issuer, or point this tool at a config whose first policy uses an acme issuer.`
+  );
+}
+
 /**
  * Outcome of the safe fallback after a PATCH failure.
  *  - kind="ok": the fallback succeeded; caller emits the standard success message.
@@ -111,10 +146,32 @@ type FallbackOutcome =
   | { kind: "tool-error"; result: { isError: true; content: Array<{ type: "text"; text: string }> } };
 
 /**
+ * Build the "PATCH failed and the fallback will not proceed" result. All three refusal
+ * branches below share the same two-line preamble; only the trailing reason differs.
+ */
+function refuseFallback(label: string, patchRes: ApiResponse, detail: string): FallbackOutcome {
+  return {
+    kind: "tool-error",
+    result: {
+      isError: true,
+      content: [
+        {
+          type: "text",
+          text:
+            `Error: Failed to set ${label}.\n` +
+            `  PATCH attempt: ${patchRes.error || `HTTP ${patchRes.status}`}\n` +
+            `  ${detail}`,
+        },
+      ],
+    },
+  };
+}
+
+/**
  * Run the safe fallback after a PATCH failure: GET apps/tls, then either
  *  - POST a fresh apps/tls (when none exists),
  *  - merge into existing config and PUT it back (preserves siblings), or
- *  - refuse with a shape-specific error (do not clobber).
+ *  - refuse: a shape-specific error (do not clobber), or a non-ACME issuer module.
  */
 async function safeFallback(label: string, patchRes: ApiResponse, fields: IssuerFields): Promise<FallbackOutcome> {
   const getRes = await api.configGet<unknown>("apps/tls");
@@ -135,44 +192,31 @@ async function safeFallback(label: string, patchRes: ApiResponse, fields: Issuer
 
   // GET succeeded with a value — must be an object to be a usable apps/tls config.
   if (!isPlainObject(getRes.data)) {
-    return {
-      kind: "tool-error",
-      result: {
-        isError: true,
-        content: [
-          {
-            type: "text" as const,
-            text:
-              `Error: Failed to set ${label}.\n` +
-              `  PATCH attempt: ${patchRes.error || `HTTP ${patchRes.status}`}\n` +
-              `  Refusing to clobber existing apps/tls: GET returned a non-object value. ` +
-              `Use caddy_config_set with an explicit path to update it safely.`,
-          },
-        ],
-      },
-    };
+    return refuseFallback(
+      label,
+      patchRes,
+      `Refusing to clobber existing apps/tls: GET returned a non-object value. ` +
+        `Use caddy_config_set with an explicit path to update it safely.`,
+    );
   }
 
   // Branch 3: existing apps/tls but the issuer sub-path we'd merge into is missing/wrong.
   const shapeError = validateIssuerShape(getRes.data);
   if (shapeError) {
-    return {
-      kind: "tool-error",
-      result: {
-        isError: true,
-        content: [
-          {
-            type: "text" as const,
-            text:
-              `Error: Failed to set ${label}.\n` +
-              `  PATCH attempt: ${patchRes.error || `HTTP ${patchRes.status}`}\n` +
-              `  Refusing to clobber existing apps/tls: ${shapeError}. ` +
-              `Use caddy_config_set with an explicit path (e.g. apps/tls/automation/policies) ` +
-              `to update it safely.`,
-          },
-        ],
-      },
-    };
+    return refuseFallback(
+      label,
+      patchRes,
+      `Refusing to clobber existing apps/tls: ${shapeError}. ` +
+        `Use caddy_config_set with an explicit path (e.g. apps/tls/automation/policies) ` +
+        `to update it safely.`,
+    );
+  }
+
+  // Branch 3b: the path exists, but the issuer sitting there is not an ACME one, so
+  // `email`/`ca`/`profile` are not its fields. Refuse rather than write a foreign key.
+  const moduleError = validateIssuerModule(getRes.data);
+  if (moduleError) {
+    return refuseFallback(label, patchRes, moduleError);
   }
 
   // Branch 2: shape is good — merge into a deep copy and write it back whole so siblings
@@ -201,6 +245,10 @@ async function safeFallback(label: string, patchRes: ApiResponse, fields: Issuer
  * Shared by set_email / set_acme_ca / set_acme_profile so all three keep
  * identical clobber-safety semantics -- the fallback is the delicate part, and
  * three hand-copied versions of it would drift.
+ *
+ * The PATCH here needs no issuer-module guard: it only succeeds when the key already
+ * exists on that issuer, so it can overwrite an ACME field but never add one. The
+ * fallback's merge path is the one that can, and it checks (see validateIssuerModule).
  */
 async function setIssuerField(field: keyof IssuerFields, value: string, label: string) {
   const patchRes = await api.configPatch(`apps/tls/automation/policies/0/issuers/0/${field}`, value);
@@ -220,8 +268,9 @@ export function registerTlsTools(server: McpServer) {
     "Get or configure TLS/HTTPS settings. Actions: 'status' shows current TLS config, 'set_email' sets the ACME email, " +
       "'set_acme_ca' sets the ACME CA URL, 'set_acme_profile' sets the ACME profile (Caddy 2.10+), " +
       "'ech_status' reads the Encrypted ClientHello config (Caddy 2.10+, read-only here). " +
-      "Works on both fresh and existing Caddy instances. Writes target policies[0].issuers[0] only -- " +
-      "on a multi-policy TLS config, edit the intended policy with caddy_config_set instead.",
+      "Works on both fresh and existing Caddy instances. Writes target policies[0].issuers[0] only, and only " +
+      "when that issuer's module is 'acme' -- on a multi-policy TLS config, or one whose first issuer is " +
+      "'internal' (Caddy's local CA), edit the intended issuer with caddy_config_set instead.",
     {
       action: z
         .enum(["status", "set_email", "set_acme_ca", "set_acme_profile", "ech_status"])
@@ -277,7 +326,13 @@ export function registerTlsTools(server: McpServer) {
         if (!profile) return missingArgError("profile is required for set_acme_profile action");
         return setIssuerField("profile", profile, "ACME profile");
       }
-      return { isError: true, content: [{ type: "text" as const, text: `Unknown action: ${action}` }] };
+      // Unreachable, and deliberately not live error handling: zod rejects any value
+      // outside the enum before this handler runs, and every member is handled above.
+      // TypeScript still demands a terminal return, so this one doubles as an
+      // exhaustiveness assertion -- add a member to the action enum without a branch for
+      // it and the assignment to `never` stops compiling, here, at the omission.
+      const unhandled: never = action;
+      return { isError: true, content: [{ type: "text" as const, text: `Unknown action: ${String(unhandled)}` }] };
     },
   );
 }

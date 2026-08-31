@@ -11,6 +11,97 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+- **The first-run path works.** On an instance with no config, Caddy has no `apps`
+  key, so config reads fail the path walk instead of returning empty:
+  `caddy_list_servers` answered a fresh instance with
+  `{"error":"invalid traversal path at: config/apps/http"}` — a Go internal error
+  from the tool whose entire job is to say what exists. It now reports `No HTTP
+  servers configured`, matching `caddy_status` on the same state, and
+  `caddy_list_routes` returns the create-it recipe. A traversal failure is
+  decisive — no parent chain means no server — so asserting non-existence is honest
+  here, unlike the ambiguous null body, which keeps its both-causes wording.
+- **The "server does not exist" advice now works if you follow it.** It said to
+  create the server with `{ "listen": [":443"] }`, which omits two things the
+  follower needs: `mode: "append"`, because the default `overwrite` is a PATCH that
+  fails with `key does not exist`; and `"routes": []`, because a POST creates a
+  missing `routes` key as an *object*, so the very next call died with
+  `cannot unmarshal object into ... RouteList`. A live test now follows the advice
+  verbatim and adds a route to what it produces.
+- **`serverNotFoundError` was unreachable from all three of its call sites.**
+  `isParentMissing` matched only `404` / `key does not exist`, but a POST under a
+  missing server answers HTTP 500 `invalid traversal path` — a shape no mocked
+  fixture had ever produced — so the raw Go error reached the caller instead of the
+  recipe. Both markers are matched now.
+- **`caddy_config_delete` no longer advertises itself as idempotent.** Its own
+  documented example path ends in an array index, and Caddy re-packs the array
+  after a delete, so a repeat removes a different route. `caddy_remove_route`
+  already carried this correction for the byte-identical underlying request.
+- **Config paths are percent-encoded per segment.** A `#` or `?` in a config key
+  truncated the request URL, because both are URL syntax rather than path text:
+  `caddy_config_delete { path: "apps/http/servers/prod#1" }` sent
+  `/config/apps/http/servers/prod` and deleted the PARENT server, reporting HTTP
+  200 success. Reproduced against Caddy 2.11.4 and fixed by encoding each segment
+  (so `/` keeps its separator meaning) — the raw path deleted `prod`, the encoded
+  path deletes exactly `prod#1`. Traversal rejection still runs on the decoded
+  form, so a literal `..` is still refused and a supplied `%2e%2e` is escaped
+  rather than decoded into one.
+- **`caddy_list_routes` reported an unknown server as an empty one.** Caddy answers
+  a server name it does not know with HTTP 200 and a body of literal `null`, not a
+  404, so the failure guard never fired and the null collapsed into an empty
+  config: a mistyped name rendered as `no routes configured` with no error flag,
+  telling an operator a live-looking server was empty and inviting them to
+  overwrite it. It now errors, naming both possible causes — an absent key and a
+  key whose value is `null` are byte-identical on the wire, and both are reachable.
+- **`caddy_remove_route` could delete a non-route object by `@id`.** `@id`s are
+  config-global in Caddy, so a removal targeting an id shared by a TLS issuer or a
+  server block deleted that object instead. It now reads the object first and
+  refuses anything without a top-level `handle` array, matching the guard
+  `caddy_reverse_proxy` already applied on the write path.
+- **`https://` upstreams are no longer silently downgraded to plaintext.** The
+  scheme was stripped, so `to: ["https://backend"]` dialed port 80 in the clear.
+- **`caddy_tls` refuses to write ACME fields onto a non-ACME issuer.** A config
+  whose first issuer is `internal` (Caddy's local CA — an ordinary setup) accepted
+  `email`/`profile` keys it has no use for, and `set_acme_ca` would silently
+  repoint that issuer's own `ca` field at an ACME directory URL.
+- **`CADDY_MCP_SANDBOX=1` denied every request.** Three separate faults: the
+  launcher's default endpoint did not match the one `src/api.ts` dials; the grant
+  pinned a port, which the `fetch` permission check never matches; and
+  `CADDY_MCP_SNAPSHOT_DIR` was absent from the environment allowlist, so snapshot
+  persistence degraded to memory-only with no diagnostic. A unix-socket admin URL
+  additionally produced a BARE `--allow-net`, granting the whole network for the
+  most hardened admin configuration Caddy recommends; it now emits no net grant at
+  all, which is what denies the category.
+- **An empty `tls_connection_policies` array no longer reports `TLS: enabled`.** It
+  configures nothing, so it now reads the same as an absent key.
+- **Resource reads no longer render `Error: undefined`** when a failure carries no
+  error text; they fall back to the status code the way tool results already did.
+
+### Changed
+- **`caddy_revert apply` says so when no roll-forward snapshot was captured.** If
+  the pre-revert read fails — which happens for an ordinary reason, since Caddy
+  restarts its admin listener on every `/load` — the revert still succeeds, but the
+  config it replaced went unrecorded and the revert cannot itself be undone. That
+  now appears in the result instead of a bare success message.
+- **Corrected two MCP tool hints.** `caddy_config_by_id` declares
+  `destructiveHint: true` (it has a `delete` action), and `caddy_remove_route`
+  declares `idempotentHint: false` (true for `@id`, false for index removal, where
+  Caddy re-packs the array so a repeated index removes a different route).
+- **`caddy_reverse_proxy` rejects an empty `to` array and blank upstream entries**
+  rather than writing a proxy with no upstreams or a `dial` of `""`.
+
+### Added
+- **Roughly 60 tests**, covering the fixes above plus the branches a coverage pass
+  found unpinned: the `caddy_list_routes` formatter arms (a null matcher, a
+  `dial`-less upstream, `file_server`, and the `rewrite`/`authentication`/`error`
+  placeholders — all of which already handled these shapes correctly, but had no
+  test saying so, and each sits one careless edit away from throwing on a config
+  Caddy accepts), the launcher's version-gate and spawn-failure fallbacks, and the
+  empty-body error branch in `src/api.ts`. Four run against a live Caddy, where the
+  mocked suite cannot see what the admin API actually returns.
+- **`esbuild` is declared in `devDependencies`.** `scripts/build-binary.mjs`
+  imports it directly but it resolved only as a transitive install.
+
 ## [2.3.2] — 2026-08-23
 
 ### Changed
