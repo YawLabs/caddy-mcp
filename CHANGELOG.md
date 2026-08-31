@@ -69,10 +69,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **Roughly 60 tests**, covering the fixes above plus the branches a coverage pass
   found unpinned: the `caddy_list_routes` formatter arms (a null matcher, a
   `dial`-less upstream, `file_server`, and the `rewrite`/`authentication`/`error`
-  placeholders — each of which threw or misreported on an ordinary Caddy config),
-  the launcher's version-gate and spawn-failure fallbacks, and the empty-body error
-  branch in `src/api.ts`. Four run against a live Caddy, where the mocked suite
-  cannot see what the admin API actually returns.
+  placeholders — all of which already handled these shapes correctly, but had no
+  test saying so, and each sits one careless edit away from throwing on a config
+  Caddy accepts), the launcher's version-gate and spawn-failure fallbacks, and the
+  empty-body error branch in `src/api.ts`. Four run against a live Caddy, where the
+  mocked suite cannot see what the admin API actually returns.
 - **`esbuild` is declared in `devDependencies`.** `scripts/build-binary.mjs`
   imports it directly but it resolved only as a transitive install.
 
