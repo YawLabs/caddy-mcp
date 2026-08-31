@@ -187,6 +187,19 @@ export function registerOperationalTools(server: McpServer) {
     { readOnlyHint: true, destructiveHint: false, idempotentHint: true, openWorldHint: false },
     async () => {
       const res = await api.configGet<Record<string, CaddyServerSummary>>("apps/http/servers");
+      // A config-less Caddy has no `apps` key at all, so this read fails the path
+      // walk rather than returning an empty object: 2.11.4 answers HTTP 400
+      // {"error":"invalid traversal path at: config/apps/http"}. Surfacing that raw
+      // made the tool whose entire job is "tell me what servers exist" answer a
+      // fresh instance with a Go internal error instead of the obvious truth.
+      //
+      // The path is a fixed literal, so every way this walk can fail -- missing
+      // apps, http, or servers -- means the same thing and only that thing: no HTTP
+      // servers are configured. That makes the friendly answer honest here rather
+      // than a guess. caddy_status already reports it this way for the same state.
+      if (api.isMissingConfigPath(res)) {
+        return { content: [{ type: "text" as const, text: "No HTTP servers configured" }] };
+      }
       if (!res.ok) return formatResult(res);
 
       const servers = res.data ?? {};

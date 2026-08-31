@@ -239,6 +239,29 @@ function isTransientFailure(res: ApiResponse): boolean {
   return false;
 }
 
+/**
+ * Caddy's "a segment of this config path does not exist" failure.
+ *
+ * Caddy walks a config path one segment at a time and reports the first segment it
+ * cannot enter as `invalid traversal path at: <path>`. The STATUS varies with the
+ * verb -- 400 on a GET, 500 on a POST, both observed on 2.11.4 -- so the body is
+ * the only signal that holds across call sites.
+ *
+ * DISTINCT from `404 key does not exist`, which Caddy emits when the object exists
+ * but the named sub-key does not (a PATCH of an absent issuer field, say). Both
+ * mean "what you named is not there", so a caller translating a missing parent
+ * usually wants both markers; matching only the 404 form leaves the traversal case
+ * falling through as a raw Go error.
+ *
+ * Exported because two tools need it and they live in different modules: the route
+ * tools translate it into "that server does not exist", and caddy_list_servers
+ * reads it as "no HTTP servers are configured at all".
+ */
+export function isMissingConfigPath(res: Pick<ApiResponse, "ok" | "error">): boolean {
+  if (res.ok) return false;
+  return (res.error ?? "").toLowerCase().includes("invalid traversal path");
+}
+
 /** Matches a trailing array index, e.g. ".../routes/0" -- the shape Caddy PUT inserts at. */
 const ARRAY_INDEX_TAIL_RE = /\/\d+$/;
 

@@ -1,24 +1,38 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import type { ApiResponse } from "../api.js";
 
-// Mock the api module — all tests control responses via these mocks
-vi.mock("../api.js", () => ({
-  configGet: vi.fn(),
-  configPost: vi.fn(),
-  configPut: vi.fn(),
-  configPatch: vi.fn(),
-  configDelete: vi.fn(),
-  loadConfig: vi.fn(),
-  adapt: vi.fn(),
-  stop: vi.fn(),
-  getUpstreams: vi.fn(),
-  getPki: vi.fn(),
-  getPkiCertificates: vi.fn(),
-  configByIdGet: vi.fn(),
-  configByIdSet: vi.fn(),
-  configByIdDelete: vi.fn(),
-  getMetrics: vi.fn(),
-}));
+// Mock the api module — all tests control responses via these mocks.
+//
+// Every REQUEST function is a vi.fn(); `isMissingConfigPath` deliberately is not.
+// It is a pure predicate over a response body, not I/O, so a stub would mean these
+// tests assert against a second copy of the marker matching instead of the one
+// production runs -- and the two could drift without anything failing. Take the
+// real implementation via importOriginal.
+//
+// The mock is WHOLESALE, so any export added to src/api.ts must be added here too:
+// an omission surfaces as "No <name> export is defined on the ../api.js mock" from
+// every test that touches the module, not as a targeted failure.
+vi.mock("../api.js", async (importOriginal) => {
+  const actual = (await importOriginal()) as typeof import("../api.js");
+  return {
+    configGet: vi.fn(),
+    configPost: vi.fn(),
+    configPut: vi.fn(),
+    configPatch: vi.fn(),
+    configDelete: vi.fn(),
+    loadConfig: vi.fn(),
+    adapt: vi.fn(),
+    stop: vi.fn(),
+    getUpstreams: vi.fn(),
+    getPki: vi.fn(),
+    getPkiCertificates: vi.fn(),
+    configByIdGet: vi.fn(),
+    configByIdSet: vi.fn(),
+    configByIdDelete: vi.fn(),
+    getMetrics: vi.fn(),
+    isMissingConfigPath: actual.isMissingConfigPath,
+  };
+});
 
 function ok<T>(data?: T): ApiResponse<T> {
   return { ok: true, status: 200, data };
@@ -247,6 +261,40 @@ describe("tool handler behavior", () => {
 
       expect(result.isError).toBe(true);
       expect(result.content[0].text).toContain('Server "srv99" does not exist');
+    });
+
+    it("treats a traversal failure as server-not-found -- the shape live Caddy sends", async () => {
+      // The marker that actually matters, and the one that was missing. Verified
+      // on 2.11.4: POST to a missing server's routes answers HTTP 500 with
+      // {"error":"invalid traversal path at: config/apps/http/servers/srv99/routes"}
+      // -- no 404, and no "key does not exist". Matching only the older markers
+      // made serverNotFoundError unreachable for its own headline case, so the
+      // operator got a raw Go error instead of the recipe for creating the server.
+      api.configPost.mockResolvedValue(
+        err(500, '{"error":"invalid traversal path at: config/apps/http/servers/srv99/routes"}'),
+      );
+
+      const result = await handler({ from: "app.local", to: ["localhost:3000"], server: "srv99" });
+
+      expect(result.isError).toBe(true);
+      expect(result.content[0].text).toContain('Server "srv99" does not exist');
+    });
+
+    it("gives create-it advice that actually works", async () => {
+      // Every clause here was live-verified, and the ORIGINAL advice failed on two
+      // of them: mode "append" (POST) creates the key while the default
+      // "overwrite" (PATCH) answers "key does not exist", and "routes": [] must be
+      // present or the first route POST dies with "cannot unmarshal object into
+      // ... RouteList" -- POST creates a missing routes key as an object, not an
+      // array. Advice that does not work is worse than no advice: it costs the
+      // operator a round of debugging before they distrust it.
+      api.configPost.mockResolvedValue(err(404, "Not Found"));
+
+      const text = (await handler({ from: "app.local", to: ["localhost:3000"], server: "srv99" })).content[0].text;
+
+      expect(text).toContain('"routes": []');
+      expect(text).toContain('mode: "append"');
+      expect(text).toContain("caddy_load");
     });
 
     it("surfaces an ordinary validation failure verbatim, NOT as server-not-found", async () => {
@@ -669,6 +717,23 @@ describe("tool handler behavior", () => {
       // wire, and naming the likelier one is the 1.2.5 mistake.
       expect(result.content[0].text).toContain("is not configured, or its config is null");
       expect(result.content[0].text).toContain("caddy_list_servers");
+    });
+
+    it("answers a config-less instance with the create-it recipe, not a Go error", async () => {
+      // A traversal failure means a segment ABOVE the server name is missing, so
+      // this is the FIRST-RUN state: no apps/http tree at all. Verified on 2.11.4:
+      // HTTP 400 {"error":"invalid traversal path at: config/apps/http"}.
+      // Unlike the ambiguous null body, this one is decisive -- no parent chain
+      // means no server -- so asserting non-existence here is honest.
+      api.configGet.mockResolvedValue(err(400, '{"error":"invalid traversal path at: config/apps/http"}'));
+
+      const result = await handler({ server: "srv0" });
+
+      expect(result.isError).toBe(true);
+      expect(result.content[0].text).toContain('Server "srv0" does not exist');
+      expect(result.content[0].text).toContain("caddy_load");
+      // The raw Go error must not be what the operator reads.
+      expect(result.content[0].text).not.toContain("invalid traversal path");
     });
 
     it("still renders a routeless server that really exists", async () => {
@@ -1720,6 +1785,35 @@ describe("tool handler behavior", () => {
       const result = await handler({});
 
       expect(result.content[0].text).toContain("No HTTP servers configured");
+    });
+
+    it("says the same thing on a config-less instance, which answers with an error", async () => {
+      // The empty state a first-time operator actually hits. A Caddy with no
+      // config has no `apps` key, so this read fails the path walk instead of
+      // returning {} -- verified on 2.11.4: HTTP 400 {"error":"invalid traversal
+      // path at: config/apps/http"}. Surfacing that raw made the tool whose whole
+      // job is "tell me what servers exist" answer a fresh instance with a Go
+      // internal error. The path is a fixed literal, so every way the walk can
+      // fail means no HTTP servers are configured and nothing else.
+      api.configGet.mockResolvedValue(err(400, '{"error":"invalid traversal path at: config/apps/http"}'));
+
+      const result = await handler({});
+
+      expect(result.isError).toBeFalsy();
+      expect(result.content[0].text).toBe("No HTTP servers configured");
+    });
+
+    it("still surfaces a genuine read failure rather than claiming emptiness", async () => {
+      // The boundary: only a TRAVERSAL failure means "empty". An unreachable
+      // Caddy or an auth rejection must not be laundered into "no servers", which
+      // would tell an operator their production config had vanished.
+      api.configGet.mockResolvedValue(err(0, "Cannot connect to Caddy admin API at http://localhost:2019"));
+
+      const result = await handler({});
+
+      expect(result.isError).toBe(true);
+      expect(result.content[0].text).toContain("Cannot connect");
+      expect(result.content[0].text).not.toContain("No HTTP servers configured");
     });
 
     it("renders a malformed server entry instead of throwing", async () => {

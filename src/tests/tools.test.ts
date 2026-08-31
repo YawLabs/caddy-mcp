@@ -400,6 +400,20 @@ describe("caddy-mcp tools", () => {
         idempotentHint: false,
       });
     });
+
+    it("caddy_config_delete agrees with caddy_remove_route about idempotency", async () => {
+      // The two tools issue a BYTE-IDENTICAL request for the same job:
+      // caddy_remove_route's index mode calls configDelete on
+      // "apps/http/servers/<srv>/routes/<i>", which is exactly what
+      // caddy_config_delete sends when handed that path -- and that path is this
+      // tool's OWN documented example. Advertising the lower-level sibling as
+      // idempotent while the higher-level one says otherwise would let a host
+      // retry through the door that is still marked safe.
+      expect(await getAnnotations("caddy_config_delete")).toMatchObject({
+        destructiveHint: true,
+        idempotentHint: false,
+      });
+    });
   });
 
   describe("caddy_config_set default mode", () => {

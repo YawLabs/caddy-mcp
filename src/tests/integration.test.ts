@@ -433,15 +433,58 @@ describe.skipIf(!RUN)("integration: live Caddy admin API", () => {
     // tool would print "no routes configured" for a server it never read,
     // telling an operator a live server is empty and inviting an overwrite.
     //
-    // This covers the GET-FAILS path -- reachable only while apps/http/servers is
-    // absent entirely, which makes Caddy reject the traversal. The far more common
-    // mistyped-name case takes the null path pinned in the next test.
-    it("caddy_list_routes surfaces a failed server GET rather than reporting an empty server", async () => {
+    // The GET-FAILS path, reachable while apps/http/servers is absent entirely.
+    // A traversal failure is DECISIVE -- no parent chain means no server -- so
+    // unlike the ambiguous null body below, asserting non-existence is honest,
+    // and the operator gets the create-it recipe instead of a Go error.
+    it("caddy_list_routes answers a config-less instance with the create-it recipe", async () => {
       const handler = getHandler(registerRouteTools, "caddy_list_routes");
       const result = await handler({ server: "does-not-exist" });
       expect(result.isError).toBe(true);
-      expect(result.content[0].text).toContain("invalid traversal path");
+      expect(result.content[0].text).toContain('Server "does-not-exist" does not exist');
+      expect(result.content[0].text).toContain("caddy_load");
+      expect(result.content[0].text).not.toContain("invalid traversal path");
       expect(result.content[0].text).not.toContain("no routes configured");
+    });
+
+    // The write-side counterpart, and the case isParentMissing exists for. Live
+    // Caddy answers a POST under a missing server with 500 "invalid traversal
+    // path", never the 404 / "key does not exist" every mocked fixture used --
+    // so serverNotFoundError was unreachable here and callers saw the raw error.
+    it("caddy_reverse_proxy names the missing server instead of leaking a Go error", async () => {
+      const loaded = await loadAndSettle({
+        apps: { http: { servers: { srv0: { listen: [":18875"], routes: [] } } } },
+      });
+      assertOk(loaded, "loadConfig one real server");
+
+      const handler = getHandler(registerRouteTools, "caddy_reverse_proxy");
+      const result = await handler({ from: "app.local", to: ["localhost:3000"], server: "nosuch" });
+
+      expect(result.isError).toBe(true);
+      expect(result.content[0].text).toContain('Server "nosuch" does not exist');
+      expect(result.content[0].text).not.toContain("invalid traversal path");
+    });
+
+    // The advice has to WORK, not merely read well: following it verbatim must
+    // produce a server that accepts its first route. The original text omitted
+    // both `routes: []` and mode "append", so an operator who followed it hit
+    // "cannot unmarshal object into ... RouteList" on their very next call.
+    it("the create-it advice actually produces a usable server", async () => {
+      const loaded = await loadAndSettle({ apps: { http: { servers: { srv0: { listen: [":18876"], routes: [] } } } } });
+      assertOk(loaded, "loadConfig seed server");
+
+      // Exactly what serverNotFoundError tells the operator to do.
+      const create = await api.configPost("apps/http/servers/fresh", {
+        listen: [":18877"],
+        routes: [],
+        automatic_https: { disable_redirects: true },
+      });
+      assertOk(create, "create server per the advice");
+
+      const handler = getHandler(registerRouteTools, "caddy_reverse_proxy");
+      const added = await handler({ from: "/api", to: ["localhost:3000"], server: "fresh" });
+      expect(added.isError, added.content?.[0]?.text).toBeFalsy();
+      expect(added.content[0].text).toContain("Route added");
     });
 
     // The live half of the null-body bug. Only a real Caddy produces this shape,
@@ -496,16 +539,17 @@ describe.skipIf(!RUN)("integration: live Caddy admin API", () => {
       expect(emptied.content[0].text).toContain("no routes configured");
     });
 
-    // On an instance with no apps/http, GET /config/apps/http/servers is a 400,
-    // not an empty object -- so caddy_list_servers reaches formatResult and
-    // never gets to say "No HTTP servers configured". Every mocked test feeds
-    // an ok({...}), so no test has seen what a bare Caddy actually answers.
-    it("caddy_list_servers surfaces the empty-instance failure rather than 'No HTTP servers configured'", async () => {
+    // The first-run empty state, and the reason it needs a LIVE test: a bare
+    // Caddy has no `apps` key, so GET /config/apps/http/servers fails the path
+    // walk with HTTP 400 rather than returning {}. Every mocked fixture feeds
+    // ok({...}), so the whole suite could stay green while this tool answered a
+    // fresh instance with a raw Go error -- which is exactly what it used to do.
+    it("caddy_list_servers reports an empty instance as empty, not as a Go error", async () => {
       const handler = getHandler(registerOperationalTools, "caddy_list_servers");
       const result = await handler({});
-      expect(result.isError).toBe(true);
-      expect(result.content[0].text).toContain("invalid traversal path");
-      expect(result.content[0].text).not.toContain("No HTTP servers configured");
+      expect(result.isError).toBeFalsy();
+      expect(result.content[0].text).toBe("No HTTP servers configured");
+      expect(result.content[0].text).not.toContain("invalid traversal path");
     });
 
     // An adapter failure has to come back as an error result. If this guard

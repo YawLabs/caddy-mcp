@@ -50,7 +50,15 @@ export function registerConfigTools(server: McpServer) {
         .default(false)
         .describe("Must be true to actually delete the config node (safety)"),
     },
-    { readOnlyHint: false, destructiveHint: true, idempotentHint: true, openWorldHint: false },
+    // idempotentHint is FALSE because the hint covers the whole tool and cannot see
+    // the path it is called with. This tool's own documented example ends in an
+    // array index -- 'apps/http/servers/srv0/routes/0' -- and Caddy re-packs an
+    // array after a delete, so repeating that call removes a DIFFERENT route each
+    // time. caddy_remove_route carries the same correction for the byte-identical
+    // underlying request; the two must agree. Nothing here is auto-recoverable
+    // either: only caddy_load captures a snapshot, so a spurious repeat cannot be
+    // undone with caddy_revert.
+    { readOnlyHint: false, destructiveHint: true, idempotentHint: false, openWorldHint: false },
     async ({ path, confirm }) => {
       if (!confirm) {
         return {

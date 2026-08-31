@@ -264,6 +264,14 @@ function planUpstreams(to: string[]): UpstreamPlan | { error: string } {
 function isParentMissing(res: { ok: boolean; status: number; error?: string }): boolean {
   if (res.ok) return false;
   if (res.status === 404) return true;
+  // Both markers, because Caddy uses different ones depending on WHERE the path
+  // breaks. Writing under a server that does not exist is the case this helper
+  // exists for, and 2.11.4 answers it with 500 "invalid traversal path at:
+  // config/apps/http/servers/<srv>/routes" -- no 404, and no "key does not exist".
+  // Matching only the older marker made this return false for its own headline
+  // case, so serverNotFoundError was unreachable from all three call sites and
+  // callers got the raw Go error instead of the create-it recipe.
+  if (api.isMissingConfigPath(res)) return true;
   return res.error?.includes("key does not exist") ?? false;
 }
 
@@ -307,7 +315,14 @@ function serverNotFoundError(srv: string, op = "operation") {
     content: [
       {
         type: "text" as const,
-        text: `Error: Server "${srv}" does not exist (${op}). Use caddy_list_servers to see available servers, or create one with caddy_load or caddy_config_set at path 'apps/http/servers/${srv}' with at minimum: { "listen": [":443"] }`,
+        text:
+          `Error: Server "${srv}" does not exist (${op}). Use caddy_list_servers to see what is configured. ` +
+          `To create it: caddy_config_set { path: "apps/http/servers/${srv}", mode: "append", ` +
+          `value: { "listen": [":443"], "routes": [] } }. Both arguments are load-bearing: mode "append" ` +
+          `creates the key, while the default "overwrite" fails with "key does not exist"; and "routes": [] ` +
+          `must be present, or adding the first route fails, because a POST creates a missing routes key as ` +
+          `an object rather than an array. On an instance with no config at all, use caddy_load instead -- ` +
+          `caddy_config_set cannot create the apps/http tree it would write into.`,
       },
     ],
   };
@@ -561,6 +576,15 @@ export function registerRouteTools(server: McpServer) {
     { readOnlyHint: true, destructiveHint: false, idempotentHint: true, openWorldHint: false },
     async ({ server: srv }) => {
       const serverRes = await api.configGet<CaddyServerConfig>(`apps/http/servers/${srv}`);
+      // A traversal failure means a segment ABOVE the server name is missing --
+      // apps, http, or servers -- so on a config-less instance this tool used to
+      // answer with a raw `{"error":"invalid traversal path at: config/apps/http"}`,
+      // which tells a first-time operator nothing about what to do next.
+      //
+      // Unlike the null body handled below, this one is NOT ambiguous: if the
+      // parent chain does not exist then neither does the server, so asserting
+      // non-existence here is honest, and serverNotFoundError carries the recipe.
+      if (api.isMissingConfigPath(serverRes)) return serverNotFoundError(srv, "caddy_list_routes");
       if (!serverRes.ok) return formatResult(serverRes);
 
       // A `null` body is a 200, so the guard above never catches it. Without this
