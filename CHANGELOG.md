@@ -12,6 +12,31 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Fixed
+- **The first-run path works.** On an instance with no config, Caddy has no `apps`
+  key, so config reads fail the path walk instead of returning empty:
+  `caddy_list_servers` answered a fresh instance with
+  `{"error":"invalid traversal path at: config/apps/http"}` — a Go internal error
+  from the tool whose entire job is to say what exists. It now reports `No HTTP
+  servers configured`, matching `caddy_status` on the same state, and
+  `caddy_list_routes` returns the create-it recipe. A traversal failure is
+  decisive — no parent chain means no server — so asserting non-existence is honest
+  here, unlike the ambiguous null body, which keeps its both-causes wording.
+- **The "server does not exist" advice now works if you follow it.** It said to
+  create the server with `{ "listen": [":443"] }`, which omits two things the
+  follower needs: `mode: "append"`, because the default `overwrite` is a PATCH that
+  fails with `key does not exist`; and `"routes": []`, because a POST creates a
+  missing `routes` key as an *object*, so the very next call died with
+  `cannot unmarshal object into ... RouteList`. A live test now follows the advice
+  verbatim and adds a route to what it produces.
+- **`serverNotFoundError` was unreachable from all three of its call sites.**
+  `isParentMissing` matched only `404` / `key does not exist`, but a POST under a
+  missing server answers HTTP 500 `invalid traversal path` — a shape no mocked
+  fixture had ever produced — so the raw Go error reached the caller instead of the
+  recipe. Both markers are matched now.
+- **`caddy_config_delete` no longer advertises itself as idempotent.** Its own
+  documented example path ends in an array index, and Caddy re-packs the array
+  after a delete, so a repeat removes a different route. `caddy_remove_route`
+  already carried this correction for the byte-identical underlying request.
 - **Config paths are percent-encoded per segment.** A `#` or `?` in a config key
   truncated the request URL, because both are URL syntax rather than path text:
   `caddy_config_delete { path: "apps/http/servers/prod#1" }` sent
