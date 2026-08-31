@@ -201,15 +201,26 @@ export function registerConfigTools(server: McpServer) {
       }
       const when = new Date(snap.timestamp).toISOString();
       // Say so when the safety net was skipped. The load is what decides success,
-      // so a failed pre-revert read does NOT make this a failed revert -- but it
-      // does mean the config that was just replaced went unrecorded and this revert
-      // cannot itself be reverted. Reporting a bare success would hide that at
-      // exactly the moment it matters, and the read fails for an ordinary reason:
-      // Caddy restarts its admin listener on every /load, so a revert issued during
-      // that window loses the roll-forward snapshot while everything else succeeds.
+      // so a skipped snapshot does NOT make this a failed revert -- but it does mean
+      // the config just replaced went unrecorded, and reporting a bare success would
+      // hide that at exactly the moment it matters.
+      //
+      // TWO distinct reasons reach here, and `current.ok` separates them, so the
+      // message must not collapse them into one. A read that returned HTTP 200 with
+      // a body that simply is not a JSON object (Caddy answers a config-less
+      // instance with a literal `null`) is not a read FAILURE, and saying so would
+      // send the operator after a connectivity or admin-listener problem that does
+      // not exist. The save path above already draws exactly this distinction.
+      // Naming a cause the signal does not support is what got 1.2.5 deprecated.
+      const skipped = current.ok
+        ? "the pre-revert config was empty or not a JSON object"
+        : "the pre-revert config could not be read";
+      // "cannot be rolled back to what it replaced", not "cannot be undone": other
+      // snapshots may still sit in the ring, so the operator is not out of options
+      // -- what is gone is specifically the state this revert overwrote.
       const note = capturedRollforward
         ? ""
-        : " Warning: the pre-revert config could not be read, so no roll-forward snapshot was captured -- this revert cannot be undone with caddy_revert.";
+        : ` Warning: ${skipped}, so no roll-forward snapshot was captured -- this revert cannot be rolled back to the config it replaced.`;
       return {
         content: [
           { type: "text" as const, text: `Reverted to snapshot [${index}] (${when}, trigger=${snap.trigger}).${note}` },

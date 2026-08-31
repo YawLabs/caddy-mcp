@@ -2305,11 +2305,43 @@ describe("tool handler behavior", () => {
       // revert, at the one moment they cannot -- the config just replaced went
       // unrecorded, so there is nothing to go back to.
       expect(result.content[0].text).toContain("no roll-forward snapshot was captured");
-      expect(result.content[0].text).toContain("cannot be undone");
+      expect(result.content[0].text).toContain("cannot be rolled back to the config it replaced");
+      // The READ FAILED here, so the warning must say so -- and must not use the
+      // wording reserved for a read that succeeded with a non-object body.
+      expect(result.content[0].text).toContain("could not be read");
+      expect(result.content[0].text).not.toContain("empty or not a JSON object");
       const snaps = listSnapshots();
       expect(snaps).toHaveLength(1);
       expect(snaps[0].trigger).toBe("caddy_load");
       expect(snaps[0].config).toEqual(target);
+    });
+
+    it.each([
+      ["a null body", null],
+      ["a bare string", "not-a-config"],
+      ["an array", []],
+    ])("blames the body, not the admin API, when the pre-revert read returns %s", async (_label, body) => {
+      // The snapshot is skipped for TWO distinguishable reasons and the warning
+      // must not conflate them. Here the read SUCCEEDED -- Caddy answers a
+      // config-less instance with HTTP 200 and a literal `null` -- so claiming it
+      // "could not be read" would send the operator chasing a connectivity or
+      // admin-listener fault that does not exist. Naming a cause the signal does
+      // not support is the mistake that got 1.2.5 deprecated.
+      const { saveSnapshot, listSnapshots } = await import("../snapshots.js");
+      saveSnapshot({ apps: { intended: true } }, "caddy_load");
+
+      api.configGet.mockResolvedValue(ok(body));
+      api.loadConfig.mockResolvedValue(ok());
+
+      const result = await handler({ action: "apply", index: 0, confirm: true });
+
+      expect(result.isError).toBeFalsy();
+      expect(result.content[0].text).toContain("Reverted to snapshot [0]");
+      expect(result.content[0].text).toContain("empty or not a JSON object");
+      expect(result.content[0].text).not.toContain("could not be read");
+      // Still no roll-forward snapshot -- only the wording differs.
+      expect(listSnapshots()).toHaveLength(1);
+      expect(listSnapshots()[0].trigger).toBe("caddy_load");
     });
 
     it("does not warn about the roll-forward snapshot when it was captured", async () => {
