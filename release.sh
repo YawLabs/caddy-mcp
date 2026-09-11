@@ -27,12 +27,27 @@ warn() { echo -e "${YELLOW}  ! $1${NC}"; }
 fail() { echo -e "${RED}  x $1${NC}"; exit 1; }
 
 # SKIP_LINT=1 escape hatch -- wraps `npm`/`pnpm` so lint-related runs are
-# no-ops. Workaround for the MINGW64-ARM64 npm-run-script wrapper that
-# segfaults on exit-cleanup (platform-windows.md). NOTE: there is no PR/push
-# CI -- this release flow's `npm run lint` (step 1) is the ONLY lint gate, so
-# SKIP_LINT disables it entirely. Before using it, verify formatting another
-# way (`npx biome check src/` direct -- it can succeed even when the `npm run`
-# wrapper segfaults) and apply any fixes, or the release ships unformatted.
+# no-ops.
+#
+# THIS SHOULD NOW BE UNNECESSARY, and reaching for it is a signal something
+# regressed. `npm run lint` routes through scripts/lint.mjs, which picks a
+# biome binary that works on the host -- including Windows ARM64, where the
+# native arm64 build segfaults and the wrapper provisions the x64 build to run
+# under emulation instead. Verified: `npm run lint` exits 0 on that host.
+#
+# The earlier text here blamed "the MINGW64-ARM64 npm-run-script wrapper" and
+# offered `npx biome check src/` direct as a way to verify formatting instead.
+# Both were wrong. `npm run` is fine on that host; the SIGSEGV comes from
+# `@biomejs/cli-win32-arm64/biome.exe` itself, reproducible by invoking that
+# binary directly with no npm in the picture -- so `npx biome` runs the same
+# crashing binary, and can exit 0 by silently skipping files it cannot process.
+#
+# There is also no CI behind this: the repo has no .github/workflows and
+# GitHub Actions is disabled on it, so step 1's `npm run lint` is the ONLY
+# lint gate. Skipping it means the release is published unlinted, full stop.
+#
+# So: only set SKIP_LINT=1 if scripts/lint.mjs cannot produce a result at all,
+# and treat that as a bug to fix rather than a step to routinely skip.
 if [ "${SKIP_LINT:-}" = "1" ]; then
   npm() {
     if [ "$1" = "run" ] && [[ "$2" == lint* ]]; then
