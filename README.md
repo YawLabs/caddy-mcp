@@ -3,6 +3,7 @@
 [![npm version](https://img.shields.io/npm/v/@yawlabs/caddy-mcp)](https://www.npmjs.com/package/@yawlabs/caddy-mcp)
 [![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](https://opensource.org/licenses/MIT)
 [![GitHub stars](https://img.shields.io/github/stars/YawLabs/caddy-mcp)](https://github.com/YawLabs/caddy-mcp/stargazers)
+[![Follow @TokenLimitNews on X](https://img.shields.io/badge/follow-%40TokenLimitNews-000000?logo=x&logoColor=white)](https://x.com/TokenLimitNews)
 
 **Manage Caddy web servers from Claude Code, Cursor, and any MCP client.** 18 tools + 4 resources covering every endpoint of Caddy's admin API — config, routes, reverse proxies, TLS, PKI, metrics, snapshots.
 
