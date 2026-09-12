@@ -1,6 +1,6 @@
 {
   "name": "@yawlabs/caddy-mcp",
-  "version": "2.4.0",
+  "version": "2.4.1",
   "mcpName": "io.github.YawLabs/caddy-mcp",
   "description": "Caddy MCP server for Claude Code, Cursor, and any MCP client: admin API, config, routes, reverse proxy, TLS, PKI, metrics",
   "license": "MIT",
