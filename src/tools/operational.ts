@@ -94,10 +94,10 @@ function metricNameFromLine(line: string): string | undefined {
  * metric name (blank lines, free-form `#` comments) are dropped when filtering.
  *
  * Truncation: if the resulting line count exceeds `maxLines`, output is cut at `maxLines` and a
- * trailing `# [truncated, N lines omitted -- use filter to narrow]` comment is appended. If the
- * input contained a `# EOF` end-of-file marker that would have been dropped by the cut, it is
- * re-appended after the truncation comment so strict downstream parsers still see a terminated
- * stream.
+ * trailing `# [truncated, N lines omitted; max_lines=M -- use filter or raise max_lines]` comment
+ * is appended, where N is the number of lines cut and M is `maxLines`. If the input contained a
+ * `# EOF` end-of-file marker that would have been dropped by the cut, it is re-appended after the
+ * truncation comment so strict downstream parsers still see a terminated stream.
  */
 export function applyMetricsControls(raw: string, filter: string | undefined, maxLines: number): string {
   const lines = raw.split("\n");
