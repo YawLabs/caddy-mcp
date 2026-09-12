@@ -2,7 +2,7 @@
   "name": "@yawlabs/caddy-mcp",
   "version": "2.4.0",
   "mcpName": "io.github.YawLabs/caddy-mcp",
-  "description": "MCP server for managing Caddy web servers via the admin API",
+  "description": "Caddy MCP server for Claude Code, Cursor, and any MCP client: admin API, config, routes, reverse proxy, TLS, PKI, metrics",
   "license": "MIT",
   "author": "Yaw Labs <contact@yaw.sh> (https://yaw.sh)",
   "type": "module",
@@ -63,12 +63,22 @@
     "node": ">=20"
   },
   "keywords": [
-    "mcp",
-    "model-context-protocol",
     "caddy",
+    "caddy-mcp",
+    "caddy-server",
+    "caddyfile",
+    "mcp",
+    "mcp-server",
+    "model-context-protocol",
     "reverse-proxy",
     "web-server",
-    "mcp-server",
+    "admin-api",
+    "tls",
+    "acme",
+    "pki",
+    "prometheus",
+    "claude-code",
+    "cursor",
     "devtools",
     "ai"
   ],
@@ -79,5 +89,5 @@
   "bugs": {
     "url": "https://github.com/YawLabs/caddy-mcp/issues"
   },
-  "homepage": "https://github.com/YawLabs/caddy-mcp"
+  "homepage": "https://yaw.sh/mcp-servers/caddy-mcp/"
 }
