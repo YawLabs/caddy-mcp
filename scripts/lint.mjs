@@ -8,7 +8,8 @@
  *
  * Why: SOME `@biomejs/cli-win32-arm64` builds are broken, and which ones is not
  * predictable from the version number. Measured on a win32-arm64 host
- * (2026-09-11): 2.5.4 exits 139 on every invocation path -- the `.bin/biome`
+ * (2026-09-11): 2.5.4 exits 139 on every CHECK-shaped run -- it answers
+ * `--version` with exit 0, but every check dies: the `.bin/biome`
  * shim, `biome.cmd` from PowerShell (STATUS_ACCESS_VIOLATION 0xC0000005), and
  * the binary invoked directly with no npm in the picture -- while 2.4.16 and
  * 2.5.13 both run correctly on the same host (exit 0 on a clean tree, exit 1
