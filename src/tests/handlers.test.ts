@@ -3380,6 +3380,21 @@ describe("tool handler behavior", () => {
       expect(result.contents[0].text).toMatch(/^Error: /);
     });
 
+    it("caddy://metrics: caps the body at 500 lines plus a truncation comment", async () => {
+      // The README documents a 500-line cap on this resource. Every other max_lines
+      // assertion goes through the caddy_metrics tool, so this is the only guard on
+      // the resource path. No `# EOF` in the body keeps the re-append path out of scope.
+      const sampleLines = Array.from({ length: 600 }, (_, i) => `metric_${i} 1`);
+      api.getMetrics.mockResolvedValueOnce(ok(`${sampleLines.join("\n")}\n`));
+      const handler = await getResourceHandler("caddy-metrics");
+      const result = await handler();
+      const lines = result.contents[0].text.split("\n");
+
+      expect(lines).toHaveLength(501);
+      expect(lines.slice(0, 500)).toEqual(sampleLines.slice(0, 500));
+      expect(lines[500]).toBe("# [truncated, 100 lines omitted; max_lines=500 -- use filter or raise max_lines]");
+    });
+
     it.each([
       ["caddy-config", "configGet"],
       ["caddy-upstreams", "getUpstreams"],
