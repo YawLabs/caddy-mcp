@@ -27,12 +27,31 @@ warn() { echo -e "${YELLOW}  ! $1${NC}"; }
 fail() { echo -e "${RED}  x $1${NC}"; exit 1; }
 
 # SKIP_LINT=1 escape hatch -- wraps `npm`/`pnpm` so lint-related runs are
-# no-ops. Workaround for the MINGW64-ARM64 npm-run-script wrapper that
-# segfaults on exit-cleanup (platform-windows.md). NOTE: there is no PR/push
-# CI -- this release flow's `npm run lint` (step 1) is the ONLY lint gate, so
-# SKIP_LINT disables it entirely. Before using it, verify formatting another
-# way (`npx biome check src/` direct -- it can succeed even when the `npm run`
-# wrapper segfaults) and apply any fixes, or the release ships unformatted.
+# no-ops.
+#
+# THIS SHOULD NOW BE UNNECESSARY, and reaching for it is a signal something
+# regressed. `npm run lint` routes through scripts/lint.mjs, which picks a
+# biome binary that works on the host -- including Windows ARM64, where some
+# biome versions ship a broken arm64 executable, so the wrapper provisions the
+# x64 build of the SAME version and runs that under emulation. Verified: `npm
+# run lint` exits 0 on that host.
+#
+# The earlier text here blamed "the MINGW64-ARM64 npm-run-script wrapper" and
+# offered `npx biome check src/` direct as a way to verify formatting instead.
+# The first was wrong: `npm run` is fine on that host, and so is invoking biome
+# directly. When the crash happens it is inside the specific version of
+# `@biomejs/cli-win32-arm64/biome.exe` that is installed -- measured on this
+# host, 2.5.4 exits 139 while 2.4.16 and 2.5.13 run correctly -- so it is a
+# per-version packaging bug, not a property of arm64 and not a property of npm.
+# `npx biome` is not a substitute either, though: it runs whichever arm64
+# binary is installed, so on an affected version it crashes the same way.
+#
+# There is also no CI behind this: the repo has no .github/workflows and
+# GitHub Actions is disabled on it, so step 1's `npm run lint` is the ONLY
+# lint gate. Skipping it means the release is published unlinted, full stop.
+#
+# So: only set SKIP_LINT=1 if scripts/lint.mjs cannot produce a result at all,
+# and treat that as a bug to fix rather than a step to routinely skip.
 if [ "${SKIP_LINT:-}" = "1" ]; then
   npm() {
     if [ "$1" = "run" ] && [[ "$2" == lint* ]]; then
