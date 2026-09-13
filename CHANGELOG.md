@@ -11,6 +11,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+- **The launcher no longer boots a second oam when it is already running on one.**
+  A host that resolves this package's `bin` and launches `oam run bin/caddy-mcp.mjs`
+  — Yaw MCP does, and so does oam's sidecar regression matrix — got a nested oam:
+  the launcher discovered and spawned one without asking what it was already
+  running on, so one server cost two runtime boots (measured on Windows as
+  `oam.exe` → `oam.exe` + `conhost.exe`). When `process.versions.oam` clears the
+  same 0.9.0 floor a discovered binary must, the server is now imported into the
+  host process. A host oam below the floor keeps the discovery path, and so does
+  `CADDY_MCP_SANDBOX=1`, because `--permission` only applies to a fresh oam. That
+  is a request for a spawn, not a guarantee: if no oam can be launched,
+  `CADDY_MCP_RUNTIME=auto` still falls back in-process without `--permission`, as
+  it always has — set `CADDY_MCP_RUNTIME=oam` alongside the sandbox to make that
+  a hard failure instead.
+
 ## [2.4.0] — 2026-08-31
 
 ### Fixed
