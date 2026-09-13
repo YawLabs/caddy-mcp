@@ -11,6 +11,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [2.4.4] — 2026-09-13
+
 ### Fixed
 - **The launcher always uses the newest oam, and the minimum is now the latest
   release, 0.15.2.** It used to take the FIRST oam binary it found and only then
