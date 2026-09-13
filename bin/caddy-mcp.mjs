@@ -2,8 +2,8 @@
 /**
  * Runtime launcher for @yawlabs/caddy-mcp.
  *
- * Prefers the oam runtime (https://oamjs.org) and falls back to the Node
- * process already running this file.
+ * Prefers the newest usable oam runtime (https://oamjs.org) and falls back to
+ * Node. It never serves on an oam older than the floor below.
  *
  * Unlike npmjs-mcp, this server is NOT a zero-dependency bundle -- dist/
  * imports @modelcontextprotocol/sdk and zod from node_modules at runtime. That
@@ -15,18 +15,32 @@
  * WHY THE FALLBACK COSTS NOTHING
  * npm has already started Node to run this launcher, so falling back is a
  * plain `import()` of the server into THIS process: no extra spawn, no extra
- * startup, byte-identical to invoking dist/index.js directly. Discovery is
- * stat-only -- never a subprocess -- so the miss case stays sub-millisecond.
+ * startup, byte-identical to invoking dist/index.js directly. Finding the
+ * candidates is stat-only, so a machine without oam never pays for a
+ * subprocess.
  *
  * WHAT THE OAM PATH COSTS
- * Reaching oam through an npm `bin` means Node boots first and oam boots
- * second, so the launcher is slower than either runtime alone. Measured on
+ * Reaching oam through an npm `bin` means Node boots first, every oam binary
+ * found is asked for its version, and then oam boots to serve -- so the
+ * launcher is slower than pointing a host at oam directly. Measured on
  * npmjs-mcp (windows-arm64, n=12 medians, spawn to first MCP initialize):
- * oam 116ms, node 172ms, launcher 243ms. oam is the fastest runtime and the
- * launcher is the slowest path -- it exists for `npx` convenience.
+ * oam 116ms, node 172ms, launcher 243ms. It exists for `npx` convenience.
  *
  * For an MCP host config, point straight at oam and skip this file:
  *   { "command": "oam", "args": ["run", "<abs>/dist/index.js"] }
+ *
+ * WHICH OAM
+ * OAM_BIN, when set and usable, is used as given. Otherwise every oam binary
+ * discovery can see -- the installed locations, then PATH -- is asked for its
+ * version, and the NEWEST one at or above the floor wins; a tie keeps search
+ * order. Taking the first binary found instead let a stale copy early in the
+ * search order hide a current one later: with oam 0.9.0 installed in ~/.oam/bin
+ * and 0.15.2 on PATH, the launcher bound to 0.9.0 because installed locations
+ * are searched first.
+ *
+ * An OAM_BIN that does not exist, is below the floor, or will not run is named
+ * on stderr and discovery carries on. It used to stop everything: a typo in
+ * OAM_BIN meant Node, with no hint why.
  *
  * ALREADY RUNNING ON OAM
  * A host can resolve this package's `bin` and launch `oam run <this file>`
@@ -39,23 +53,35 @@
  * no `oam --version` probe, no second oam. OAM_BIN is a discovery input, so it
  * is not consulted on that path: the host has already chosen which oam runs.
  *
- * Two cases still take the discovery path, deliberately. CADDY_MCP_SANDBOX=1,
- * because `--permission` is a process-level flag that only a FRESH oam can
- * apply -- serving in-process on the host would drop the sandbox without a
- * word, a security downgrade dressed up as an optimisation. And a host oam
- * below the floor, which takes the discovery path exactly as it always did.
+ * CADDY_MCP_SANDBOX=1 still takes the discovery path on such a host,
+ * deliberately: `--permission` is a process-level flag that only a FRESH oam
+ * can apply, so serving in-process on the host would drop the sandbox without
+ * a word -- a security downgrade dressed up as an optimisation.
+ *
+ * A host oam BELOW the floor never serves. It used to, whenever discovery came
+ * up empty. It now hands the server off to the newest usable oam, or to Node
+ * found on PATH, or exits with an error when there is neither.
+ *
+ * Every handoff from an oam host PIPES stdio rather than inheriting it. Before
+ * 0.9.0 oam treated `stdio: 'inherit'` as `'pipe'`, so an inherited handoff
+ * from such a host connected the child to pipes nobody reads: measured with a
+ * real oam 0.8.2 host, the MCP handshake never answered. Piping the streams
+ * explicitly completes it, to both oam and Node. The sandbox spawn from a
+ * supported oam host pipes too -- one rule for every oam host, verified with a
+ * real handshake on 0.15.2. A Node host keeps `inherit`, which hands over the
+ * same fds untouched.
  *
  * The sandbox asks for a spawn; it does not guarantee one. Discovery can still
- * come up empty -- no oam binary, one below the floor or unreadable, a spawn
- * that fails -- and under CADDY_MCP_RUNTIME=auto that falls back exactly as it
- * does on Node: the server runs in THIS process WITHOUT `--permission`. No oam
- * (and no .cmd shim) and a failed spawn fall back silently; the too-old or
- * unreadable binary and .cmd-shim cases print a note that does not mention the
- * sandbox. Only CADDY_MCP_RUNTIME=oam turns that miss into a hard failure, so
- * pair it with CADDY_MCP_SANDBOX=1 when the sandbox has to hold.
- * CADDY_MCP_RUNTIME=node ignores the sandbox entirely.
+ * come up empty -- no usable oam binary, or a spawn that fails -- and under
+ * CADDY_MCP_RUNTIME=auto the server then runs WITHOUT `--permission`: in THIS
+ * process on Node or on a host oam at the floor, handed off to Node from a host
+ * oam below it. The stderr notes name a passed-over OAM_BIN, found binary or
+ * .cmd shim, and a failed spawn, but none of them mentions the sandbox, and
+ * with nothing found at all the fallback is silent. Only CADDY_MCP_RUNTIME=oam
+ * turns that miss into a hard failure, so pair it with CADDY_MCP_SANDBOX=1 when
+ * the sandbox has to hold. CADDY_MCP_RUNTIME=node ignores the sandbox entirely.
  *
- * THE `--permission` SANDBOX (oam 0.9.0+, opt-in)
+ * THE `--permission` SANDBOX (opt-in)
  * `CADDY_MCP_SANDBOX=1` runs the server under oam's permission model when an
  * oam binary is found and launched -- see ALREADY RUNNING ON OAM for the
  * fallback that runs it unsandboxed, and how to refuse that instead.
@@ -86,34 +112,43 @@
  * "unauthenticated". The env list is derived from the shipped bundle.
  *
  * MINIMUM OAM VERSION
- * 0.9.0. Below it `child_process.execFile` ran its arguments through a SHELL,
- * `exec` accepted `timeout` and ignored it, `spawnSync` truncated at
- * `maxBuffer` while reporting success, and `stdio: 'inherit'`/`'ignore'` both
- * behaved as `'pipe'`. This server spawns nothing, so the floor is
- * enforced for consistency across @yawlabs/*-mcp rather than because this
- * launcher was exposed.
- * An older oam is not an error: the launcher falls back to Node and says so on
- * stderr. Pinning the floor here is what makes that fallback automatic.
+ * The latest oam release, 0.15.2 -- bump OAM_MIN when oam ships a newer one.
+ * Only the current oam is used and verified; an older one is passed over. The
+ * floor is not cosmetic: before 0.9.0 `child_process.execFile` ran its
+ * arguments through a SHELL, `exec` accepted `timeout` and ignored it,
+ * `spawnSync` truncated at `maxBuffer` while reporting success, and
+ * `stdio: 'inherit'`/`'ignore'` both behaved as `'pipe'`. The server itself
+ * spawns nothing, but this launcher does, and the last of those reached it: an
+ * old oam host's inherited handoff never answered the MCP handshake (see
+ * ALREADY RUNNING ON OAM).
  *
  * SELECTION
- *   CADDY_MCP_RUNTIME=oam    require oam; fail loudly if it is missing
- *                            (already running on oam satisfies it, except
- *                            under CADDY_MCP_SANDBOX=1)
- *   CADDY_MCP_RUNTIME=node   never use oam
- *   CADDY_MCP_RUNTIME=auto   prefer oam, silently fall back (default)
- *   CADDY_MCP_SANDBOX=1      run oam under --permission (oam 0.9.0+); under
+ *   CADDY_MCP_RUNTIME=auto   newest usable oam, else Node (default)
+ *   CADDY_MCP_RUNTIME=oam    newest usable oam, else exit with an error
+ *                            (already running on oam at the floor satisfies
+ *                            it, except under CADDY_MCP_SANDBOX=1)
+ *   CADDY_MCP_RUNTIME=node   Node: in THIS process on Node, handed off to Node
+ *                            on PATH when THIS process is oam
+ *   CADDY_MCP_SANDBOX=1      run the spawned oam under --permission; under
  *                            auto a discovery miss still runs unsandboxed
- *   OAM_BIN=/path/to/oam     explicit binary, checked before any discovery
+ *   OAM_BIN=/path/to/oam     use this oam when it is usable, before discovery
+ * The runtime value is case-insensitive; anything else behaves like `auto`.
  */
 
 import { execFileSync, spawn } from "node:child_process";
-import { existsSync } from "node:fs";
+import { existsSync, realpathSync } from "node:fs";
 import { constants, homedir } from "node:os";
 import { delimiter, join } from "node:path";
 import { fileURLToPath } from "node:url";
 
-/** Oldest oam whose `child_process` matches Node. See MINIMUM OAM VERSION above. */
-const OAM_MIN = [0, 9, 0];
+/** Oldest oam this server is served on. See MINIMUM OAM VERSION above. */
+const OAM_MIN = [0, 15, 2];
+
+/**
+ * Bound on each `oam --version` probe. A healthy oam answers in milliseconds;
+ * the bound only exists so a wedged binary on PATH cannot hang the launch.
+ */
+const VERSION_PROBE_TIMEOUT_MS = 5_000;
 
 // Two forms, deliberately. `import()` on Windows REJECTS a bare `C:\...` path
 // with ERR_UNSUPPORTED_ESM_URL_SCHEME (it reads `c:` as a protocol), so the
@@ -123,55 +158,71 @@ const SERVER_ENTRY = fileURLToPath(SERVER_URL);
 const isWin = process.platform === "win32";
 const exe = isWin ? "oam.exe" : "oam";
 
-/** Locate an oam binary, or null. Every branch is a stat, never a subprocess. */
-function findOam() {
-  // 1. Explicit override wins and is never second-guessed.
-  const override = process.env.OAM_BIN;
-  if (override) return existsSync(override) ? override : null;
+/** Identity for de-duplicating paths: resolved, and case-folded on Windows. */
+function pathKey(p) {
+  let key = p;
+  try {
+    key = realpathSync(p);
+  } catch {
+    // Unresolvable: fall back to the literal path.
+  }
+  return isWin ? key.toLowerCase() : key;
+}
 
-  // 2. Installed locations, BEFORE PATH. Someone who develops oam itself
-  //    usually has oam/target/release on PATH, and a build directory is the
-  //    wrong thing for a user-facing launcher to bind to: cargo replaces the
-  //    binary underneath running processes, and the dev build is not the
-  //    release the user installed. Preferring the installed copy makes the
-  //    default path "what a normal user has", and OAM_BIN remains the way to
-  //    point deliberately at a dev build.
-  //
-  //    Both forms are checked on Windows: the installer defaults to
-  //    %LOCALAPPDATA%\oam\bin there, but oam's docs name ~/.oam/bin first and
-  //    OAM_INSTALL_DIR can pick either, so checking one silently misses a real
-  //    install.
+/**
+ * Every oam binary discovery can see, in search order, de-duplicated. Stat-only,
+ * never a subprocess.
+ *
+ * Installed locations come BEFORE PATH, so when two binaries report the same
+ * version the installed copy wins the tie. Someone who develops oam itself
+ * usually has oam/target/release on PATH, and a build directory is the wrong
+ * thing to prefer at equal versions: cargo replaces the binary underneath
+ * running processes, and the dev build is not the release the user installed.
+ * A NEWER build on PATH still wins -- the newest usable oam is the rule -- and
+ * OAM_BIN remains the way to point deliberately at one.
+ *
+ * Both installed forms are checked on Windows: the installer defaults to
+ * %LOCALAPPDATA%\oam\bin there, but oam's docs name ~/.oam/bin first and
+ * OAM_INSTALL_DIR can pick either, so checking one silently misses a real
+ * install.
+ *
+ * PATH is resolved manually rather than by spawning `which`/`where`, which
+ * would cost a subprocess on every launch just to decide whether to spawn.
+ *
+ * Windows: `.exe` ONLY -- deliberately narrower than PATHEXT. Node refuses to
+ * run a .cmd/.bat through execFile/spawn without `shell: true` (EINVAL, and for
+ * spawn it throws SYNCHRONOUSLY rather than emitting 'error'), so walking the
+ * full PATHEXT list would only collect paths this launcher cannot execute.
+ * Discovery has to agree with execution. A skipped shim is still reported --
+ * see findOamShim.
+ *
+ * scripts/runtime.mjs carries its OWN findOam that DOES walk the full PATHEXT.
+ * That is a deliberate difference, not drift: it serves the build and
+ * typecheck scripts, drops whatever fails its execFileSync probe, and has no
+ * diagnostic to give, so a wider walk there only ever finds more. Here a
+ * collected .cmd would cost a probe that cannot succeed, and add a "could not
+ * be run" note beside the shim note that actually says what to do about it.
+ * Same question, different constraint; change one and re-read the other.
+ */
+function discoverOamPaths() {
   const installed = [join(homedir(), ".oam", "bin", exe)];
   if (isWin) {
     installed.unshift(join(process.env.LOCALAPPDATA ?? join(homedir(), "AppData", "Local"), "oam", "bin", exe));
   }
-  for (const candidate of installed) {
-    if (existsSync(candidate)) return candidate;
+  const onPath = (process.env.PATH ?? "")
+    .split(delimiter)
+    .filter(Boolean)
+    .map((dir) => join(dir, exe));
+  const seen = new Set();
+  const found = [];
+  for (const candidate of [...installed, ...onPath]) {
+    if (!existsSync(candidate)) continue;
+    const key = pathKey(candidate);
+    if (seen.has(key)) continue;
+    seen.add(key);
+    found.push(candidate);
   }
-
-  // 3. PATH, resolved manually rather than by spawning `which`/`where`, which
-  //    would cost a subprocess on every launch just to decide whether to spawn.
-  // Windows: `.exe` ONLY -- deliberately narrower than PATHEXT. Node refuses to
-  // run a .cmd/.bat through execFile/spawn without `shell: true` (EINVAL, and
-  // for spawn it throws SYNCHRONOUSLY rather than emitting 'error'), so walking
-  // the full PATHEXT list would hand back a path this launcher cannot execute.
-  // Discovery has to agree with execution. A skipped shim is still reported --
-  // see findOamShim.
-  //
-  // scripts/runtime.mjs carries its OWN findOam that DOES walk the full PATHEXT.
-  // That is a deliberate difference, not drift: it probes each candidate with
-  // execFileSync before returning it, so a shim it cannot run is dropped anyway
-  // and a wider walk only ever finds more. This one is stat-only on the hot
-  // launch path -- no probe to filter with -- so whatever it returns it must be
-  // able to spawn. Same question, different constraint; change one and re-read
-  // the other.
-  for (const dir of (process.env.PATH ?? "").split(delimiter)) {
-    if (!dir) continue;
-    const candidate = join(dir, exe);
-    if (existsSync(candidate)) return candidate;
-  }
-
-  return null;
+  return found;
 }
 
 /**
@@ -194,10 +245,12 @@ function oamVersion(cmd) {
     const out = execFileSync(cmd, ["--version"], {
       encoding: "utf-8",
       stdio: ["ignore", "pipe", "ignore"],
+      timeout: VERSION_PROBE_TIMEOUT_MS,
+      windowsHide: true,
     });
     return parseVersion(out);
   } catch {
-    // Not executable, wrong arch, or deleted since the stat. Caller degrades.
+    // Not executable, wrong arch, wedged, or deleted since the stat. Caller degrades.
     return null;
   }
 }
@@ -213,24 +266,46 @@ function atLeast(v, min) {
 }
 
 /**
- * Where the server runs, decided BEFORE any discovery:
- *   "in-process"  import it into THIS process
- *   "discover"    find an oam binary, gate its version, spawn it -- or fall
- *                 back to Node in-process when that fails
+ * The newest candidate at or above the floor, or null. `candidates` is
+ * `{ path, version }[]` in search order, `version` null when unreadable.
+ * Strictly-greater replaces, so a tie keeps the earlier candidate.
  *
- * `hostOam` is `process.versions.oam`: oam's own key, absent on Node, so on
- * Node every mode but `node` is the discovery path it always was. `sandbox`
- * is whether a spawn would carry flags only a fresh oam can apply; see ALREADY
- * RUNNING ON OAM above for why that alone forces discovery -- and why discovery
- * is not a guaranteed spawn, since its miss still falls back in-process. The
+ * Pure on purpose, like runtimePlan: the choice is testable without binaries.
+ */
+function pickNewest(candidates) {
+  let best = null;
+  for (const candidate of candidates) {
+    if (!atLeast(candidate.version, OAM_MIN)) continue;
+    if (!best || !atLeast(best.version, candidate.version)) best = candidate;
+  }
+  return best;
+}
+
+/**
+ * Where the server runs, decided BEFORE any discovery:
+ *   "in-process"   import it into THIS process
+ *   "discover"     choose an oam and spawn it, or fall back when none is usable
+ *   "handoff-node" hand it off to Node on PATH: THIS process is an oam and
+ *                  Node was asked for
+ *
+ * `hostOam` is `process.versions.oam`: oam's own key, absent on Node. An oam
+ * host whose version cannot be read is treated as below the floor -- it never
+ * proved it is a supported oam. `sandbox` is whether a spawn would carry flags
+ * only a fresh oam can apply; see ALREADY RUNNING ON OAM above for why that
+ * alone forces discovery -- and why discovery is not a guaranteed spawn. The
  * floor is OAM_MIN itself, not a parameter, so a host oam and a discovered one
  * can never be held to different minimums.
+ *
+ * A host oam below the floor gets "discover", not a handoff straight to Node:
+ * a newer oam may still be found, and when none is, the fallback hands off to
+ * Node rather than serving on the host.
  *
  * Pure on purpose: every input is passed in, so the whole decision is testable
  * without booting a runtime.
  */
 function runtimePlan({ mode, hostOam, sandbox }) {
-  if (mode === "node") return "in-process";
+  const onOam = hostOam !== undefined;
+  if (mode === "node") return onOam ? "handoff-node" : "in-process";
   if (sandbox) return "discover";
   return atLeast(parseVersion(hostOam ?? ""), OAM_MIN) ? "in-process" : "discover";
 }
@@ -282,7 +357,7 @@ function sandboxFlags() {
   // Omitting the flag DENIES the category (oam reads an absent --allow-net as
   // false, a bare one as "*"), and denial costs nothing here: oam has no unix
   // socket transport at all, so api.ts's node:http `socketPath` dial cannot work
-  // under oam whether the grant is open or closed. Verified against oam 0.9.0 --
+  // under oam whether the grant is open or closed. Re-verified against oam 0.15.2 --
   // bare grant lets an unrelated host through, omitted grant denies it.
   //
   // This mirrors getMalformedUnixUrl's predicate in src/api.ts, NOT the stricter
@@ -408,6 +483,58 @@ function findOamShim() {
   return null;
 }
 
+/** A Node binary on PATH, or null. Stat-only; used only when THIS process is oam. */
+function findNodeOnPath() {
+  const name = isWin ? "node.exe" : "node";
+  for (const dir of (process.env.PATH ?? "").split(delimiter)) {
+    if (!dir) continue;
+    const candidate = join(dir, name);
+    if (existsSync(candidate)) return candidate;
+  }
+  return null;
+}
+
+/**
+ * Why a candidate was passed over, for stderr. Two causes need two details: a
+ * null version is NOT "old" -- the binary could not be run at all (not
+ * executable, wrong arch, wedged, deleted between the stat and the probe) or
+ * its output did not parse -- so it must not be described as one that needs
+ * an update.
+ */
+function unusableReason(path, version, label = path) {
+  const min = OAM_MIN.join(".");
+  return version
+    ? `${label} is oam ${version.join(".")}, older than ${min}`
+    : `${label} could not be run, or did not report a version this launcher understands`;
+}
+
+/**
+ * Choose the oam to spawn: a usable OAM_BIN, else the newest usable discovered
+ * binary. Returns the choice (or null) plus stderr notes: `overrideNote` about
+ * an unusable OAM_BIN, and `skipped` describing what was found and rejected
+ * when nothing was usable.
+ */
+function chooseOam() {
+  const override = process.env.OAM_BIN;
+  let overrideNote = null;
+  if (override) {
+    if (!existsSync(override)) {
+      overrideNote = `OAM_BIN=${override} does not exist`;
+    } else {
+      const version = oamVersion(override);
+      if (atLeast(version, OAM_MIN)) return { chosen: { path: override, version }, overrideNote, skipped: [] };
+      overrideNote = unusableReason(override, version, `OAM_BIN=${override}`);
+    }
+  }
+  const overrideKey = override ? pathKey(override) : null;
+  const candidates = discoverOamPaths()
+    .filter((path) => pathKey(path) !== overrideKey)
+    .map((path) => ({ path, version: oamVersion(path) }));
+  const chosen = pickNewest(candidates);
+  const skipped = chosen ? [] : candidates.map((c) => unusableReason(c.path, c.version));
+  return { chosen, overrideNote, skipped };
+}
+
 /** Run the server in THIS process. The zero-overhead fallback. */
 async function runInProcess() {
   // A server may gate its bootstrap on being the process ENTRY POINT --
@@ -424,195 +551,251 @@ async function runInProcess() {
   await import(SERVER_URL.href);
 }
 
+// ONE reporter for every failed in-process fallback. runInProcess() is a bare
+// import() that rejects when dist/index.js is missing, and at ESM top level an
+// unhandled rejection is an uncaught exception -- replacing this launcher's
+// diagnostic with a raw stack trace.
+const fallbackFailed = (e) => {
+  process.stderr.write(`caddy-mcp: fallback to Node failed (${e?.message ?? e})\n`);
+  process.exitCode = 1;
+};
+
+/**
+ * Spawn the server in a child runtime and mirror its lifetime.
+ *
+ * `onLaunchFailed(err)` runs when the child could not be started at all; it is
+ * never called once the child is running, which would double-start the server
+ * on the same stdio.
+ */
+async function launchChild(cmd, args, onLaunchFailed) {
+  // THIS process being an oam means one below the floor, or a supported one
+  // spawning a fresh oam for CADDY_MCP_SANDBOX=1. Below the floor
+  // `stdio: 'inherit'` does not hand over the fds, so pipe explicitly on every
+  // oam host; see ALREADY RUNNING ON OAM.
+  const piped = process.versions.oam !== undefined;
+  let child = null;
+  try {
+    child = spawn(cmd, args, {
+      // inherit keeps the SAME fds, so MCP's newline-delimited JSON framing on
+      // stdin/stdout is untouched and the host's stdin-close still reaches the
+      // server's shutdown path. Piping preserves both as well: bytes are copied
+      // unchanged, and stdin's end propagates to the child.
+      stdio: piped ? ["pipe", "pipe", "pipe"] : "inherit",
+      env: process.env,
+      windowsHide: true,
+    });
+  } catch (err) {
+    // spawn() THROWS for some failures instead of emitting 'error', and the
+    // 'error' listener is registered AFTER this call, so it can never observe
+    // one -- an uncaught throw here kills the launcher with a raw stack trace
+    // instead of falling back.
+    await onLaunchFailed(err).catch(fallbackFailed);
+    return;
+  }
+
+  // If the runtime cannot be executed at all (deleted between the version probe
+  // and the spawn, wrong arch, permission), fall back rather than failing the
+  // whole server. `spawned` prevents falling back AFTER the child started.
+  //
+  // Everything that assumes a live child waits for 'spawn'. A failed spawn
+  // still emits 'close' (after 'error', with the negative errno as its code), so
+  // an unguarded close handler would process.exit() out from under the fallback
+  // onLaunchFailed has just started -- and stdin piped into a child that never
+  // ran would swallow the host's first bytes before the fallback could read
+  // them. Until 'spawn', process.stdin has no reader and simply stays paused.
+  let spawned = false;
+  child.on("spawn", () => {
+    spawned = true;
+    if (piped) {
+      process.stdin.pipe(child.stdin);
+      child.stdout.pipe(process.stdout);
+      child.stderr.pipe(process.stderr);
+    }
+    forwardSignals();
+  });
+  child.on("error", (err) => {
+    if (spawned) return;
+    onLaunchFailed(err).catch(fallbackFailed);
+  });
+  // A child that exits before reading everything closes its stdin; the
+  // resulting EPIPE is not worth crashing over.
+  child.stdin?.on("error", () => {});
+
+  // Forward termination so the server's own shutdown path runs in the child
+  // rather than the child being orphaned.
+  //
+  // Registering ANY handler for these suppresses Node's default
+  // terminate-on-signal, so the parent's exit has to be arranged explicitly.
+  // `child.killed` only records that kill() was CALLED, never that the child
+  // is gone, so gating on it swallows every signal after the first and wedges
+  // the launcher with no escape hatch.
+  //
+  // Escalation is driven by a TIMER, not by counting signals. Counting is
+  // ambiguous: a supervisor routinely sends SIGINT then SIGTERM milliseconds
+  // apart, and a terminal Ctrl-C reaches the whole process group, so reading
+  // "a second signal" as impatience hard-kills a child that is already
+  // shutting down cleanly. A timer makes the count irrelevant -- ONE press is
+  // enough, and a wedged child dies on schedule. setTimeout is monotonic, so
+  // a wall-clock step cannot mis-gate the window either.
+  //
+  // POSIX vs Windows, and why we do NOT forward on Windows.
+  // On POSIX child.kill(sig) delivers a real, catchable signal, so forwarding
+  // is what lets the child run its shutdown. On Windows there are no POSIX
+  // signals: child.kill IGNORES the name and calls TerminateProcess -- an
+  // immediate hard kill (verified: a child with a SIGTERM handler never runs
+  // it and dies with code=null, signal=SIGTERM). Forwarding there ABORTS the
+  // graceful shutdown the console's own Ctrl-C just started, skipping the
+  // child's process.on("exit") cleanup. The console has already notified the
+  // child, so on Windows the timer below is the only kill we issue.
+  // 5s, not 2s. This is a HARD kill of a server that may be mid-shutdown --
+  // flushing a large config, finishing a TLS provision -- and the cost of
+  // waiting too long (a wedged child lingers a few extra seconds) is far
+  // smaller than the cost of cutting a legitimate shutdown short. The window
+  // only ever elapses when the child has NOT exited on its own.
+  const ESCALATE_AFTER_MS = 5000;
+  let escalation = null;
+  function forwardSignals() {
+    for (const sig of ["SIGINT", "SIGTERM"]) {
+      process.on(sig, () => {
+        // No try/catch: kill() on an already-exited child returns false, it does
+        // not throw. It throws only for a signal the platform does not know,
+        // which SIGINT/SIGTERM/SIGKILL never are.
+        if (!isWin) child.kill(sig);
+        if (escalation) return; // already counting down; further signals are noise
+        escalation = setTimeout(() => {
+          // Still here after its grace window. Stop waiting on it.
+          child.kill("SIGKILL");
+          process.exit(128 + (constants.signals[sig] ?? 15));
+        }, ESCALATE_AFTER_MS);
+      });
+    }
+  }
+
+  // Piped: wait for 'close', so the child's last stdout bytes are copied out
+  // before this process exits. Inherited: 'exit' is enough, the fds were never
+  // ours to drain. Either way, only for a child that actually ran -- see the
+  // 'spawn' handler above.
+  child.on(piped ? "close" : "exit", (code, signal) => {
+    if (!spawned) return;
+    if (escalation) clearTimeout(escalation);
+    // Mirror the child's fate: a signal death becomes 128+n so callers see a
+    // conventional shell exit status rather than a bare 0.
+    if (signal) {
+      process.exit(128 + (constants.signals[signal] ?? 15));
+    }
+    process.exit(code ?? 0);
+  });
+}
+
+/**
+ * Hand the server to Node on PATH. Only reachable when THIS process is oam --
+ * one below the floor with no newer oam, or any oam under
+ * CADDY_MCP_RUNTIME=node -- so there is no in-process option left.
+ */
+async function handOffToNode(reason) {
+  const node = findNodeOnPath();
+  if (!node) {
+    await errSync(
+      `caddy-mcp: ${reason}, and no Node was found on PATH to run the server instead.\n` +
+        `Run \`oam self-update\` to get oam ${OAM_MIN.join(".")} or newer, or launch this command with node.\n`,
+    );
+    process.exit(1);
+  }
+  if (reason) await errSync(`caddy-mcp: ${reason}; running on ${node} instead.\n`);
+  await launchChild(node, [SERVER_ENTRY, ...process.argv.slice(2)], async (err) => {
+    await errSync(`caddy-mcp: failed to launch Node at ${node} (${err?.message ?? err})\n`);
+    process.exit(1);
+  });
+}
+
+/**
+ * True when THIS process may serve without spawning: it is Node, or an oam at
+ * or above the floor. The second is reachable after discovery only under
+ * CADDY_MCP_SANDBOX=1, and serves WITHOUT --permission; see ALREADY RUNNING ON
+ * OAM.
+ */
+function hostMayServe(hostOam) {
+  return hostOam === undefined || atLeast(parseVersion(hostOam), OAM_MIN);
+}
+
+/** What the fallback below will do, for the tail of a stderr note. */
+function fallbackTail(hostOam) {
+  return hostOam !== undefined && hostMayServe(hostOam)
+    ? `serving in this process (oam ${hostOam}) instead`
+    : "using Node instead";
+}
+
+/**
+ * No oam was spawned, under a mode that allows serving without one. Serve in
+ * THIS process when it may, otherwise -- a host oam below the floor -- hand off
+ * to Node.
+ */
+async function fallBack(hostOam) {
+  if (hostMayServe(hostOam)) {
+    await runInProcess();
+    return;
+  }
+  await handOffToNode(`this process is oam ${hostOam}, older than ${OAM_MIN.join(".")}, and no newer oam was found`);
+}
+
 const mode = (process.env.CADDY_MCP_RUNTIME ?? "auto").toLowerCase();
+const hostOam = process.versions.oam;
 
 // The sandbox is read off the grant list rather than CADDY_MCP_SANDBOX, so
 // "would the spawn carry --permission" cannot drift from what the spawn below
 // actually passes.
-const plan = runtimePlan({ mode, hostOam: process.versions.oam, sandbox: sandboxFlags().length > 0 });
+const plan = runtimePlan({ mode, hostOam, sandbox: sandboxFlags().length > 0 });
 
 if (plan === "in-process") {
   await runInProcess();
+} else if (plan === "handoff-node") {
+  const belowFloor = !atLeast(parseVersion(hostOam), OAM_MIN);
+  await handOffToNode(belowFloor ? `this process is oam ${hostOam}, older than ${OAM_MIN.join(".")}` : "");
 } else {
-  const oam = findOam();
-  // Read the version ONCE, and only when discovery found something: the gate
-  // below has to tell "too old" apart from "could not be read at all", and
-  // re-probing inside the branch would cost a second subprocess.
-  //
-  // This is the first subprocess the launcher runs -- discovery itself is
-  // stat-only. Paid on every launch that finds an oam, including the ones
-  // that go on to fall back to Node.
-  const found = oam ? oamVersion(oam) : null;
+  const { chosen, overrideNote, skipped } = chooseOam();
 
-  if (!oam) {
-    // An oam-named .cmd/.bat on PATH is a real install in a shape this
-    // launcher cannot spawn. Naming it turns "no oam binary was found" --
-    // which reads as "install oam", the one thing that will not help --
-    // into something the user can act on.
-    const oamShim = findOamShim();
-    const shimNote = oamShim
-      ? `Found ${oamShim}, but Node cannot execute a .cmd/.bat directly.\n` +
-        "Install the native oam binary, or point OAM_BIN at one.\n"
-      : "";
+  if (chosen) {
+    if (overrideNote)
+      await errSync(`caddy-mcp: ${overrideNote}; using ${chosen.path} (oam ${chosen.version.join(".")}).\n`);
+    // `--` separates oam's own flags from the script's argv, so `caddy-mcp
+    // --version` and any host-supplied flags survive the hop unchanged. The
+    // sandbox flags are process-level, so they go BEFORE `run`.
+    await launchChild(
+      chosen.path,
+      [...sandboxFlags(), "run", SERVER_ENTRY, "--", ...process.argv.slice(2)],
+      async (err) => {
+        if (mode === "oam") {
+          await errSync(`caddy-mcp: failed to launch oam at ${chosen.path} (${err?.message ?? err})\n`);
+          process.exit(1);
+        }
+        await errSync(
+          `caddy-mcp: failed to launch oam at ${chosen.path} (${err?.message ?? err}); ${fallbackTail(hostOam)}.\n`,
+        );
+        await fallBack(hostOam);
+      },
+    );
+  } else {
+    const shim = findOamShim();
+    const notes = [
+      ...(overrideNote ? [overrideNote] : []),
+      ...skipped,
+      ...(shim
+        ? [
+            `found ${shim}, but Node cannot execute a .cmd/.bat directly -- install the native oam binary, or point OAM_BIN at one`,
+          ]
+        : []),
+    ];
     if (mode === "oam") {
-      // Explicitly demanded, so this is a real misconfiguration. writeSync
-      // because stderr is async for TTYs/pipes on Windows and process.exit
-      // truncates pending writes.
-      const { writeSync } = await import("node:fs");
-      writeSync(
-        2,
-        "caddy-mcp: CADDY_MCP_RUNTIME=oam but no runnable oam binary was found.\n" +
-          shimNote +
-          "Install from https://oamjs.org, set OAM_BIN=/path/to/oam, or use CADDY_MCP_RUNTIME=node.\n",
+      await errSync(
+        `caddy-mcp: CADDY_MCP_RUNTIME=oam but no usable oam (${OAM_MIN.join(".")} or newer) was found.\n` +
+          notes.map((note) => `  ${note}\n`).join("") +
+          "Install or update from https://oamjs.org, set OAM_BIN=/path/to/oam, or use CADDY_MCP_RUNTIME=node.\n",
       );
       process.exit(1);
     }
     // auto: falling back is correct, but silence is how someone never learns
-    // their oam install is a shape this launcher skips.
-    if (oamShim) await errSync(`caddy-mcp: ${shimNote}Using Node instead.\n`);
-    await runInProcess();
-  } else if (!atLeast(found, OAM_MIN)) {
-    const min = OAM_MIN.join(".");
-    // Two different causes reach this branch and they need different
-    // remedies. `found === null` is NOT "old": oamVersion returns null when
-    // the binary could not be run at all (not executable, wrong arch, a
-    // .cmd/.bat Node refuses, deleted between the stat and the probe) or
-    // when its --version output did not parse. Telling that user to
-    // `oam self-update` sends them after the one cause it definitely is not.
-    const detail = found
-      ? `${oam} is oam ${found.join(".")}, older than ${min}`
-      : `${oam} could not be run, or did not report a version this launcher understands`;
-    const remedy = found
-      ? "Run `oam self-update`, or use CADDY_MCP_RUNTIME=node.\n"
-      : "Check that it is an executable oam binary for this platform, or use CADDY_MCP_RUNTIME=node.\n";
-    if (mode === "oam") {
-      await errSync(`caddy-mcp: CADDY_MCP_RUNTIME=oam but ${detail}.\n${remedy}`);
-      process.exit(1);
-    }
-    // auto: neither cause is worth failing over -- prefer Node. Say so,
-    // because a silent downgrade is how someone keeps running an oam they
-    // meant to update, or never learns their oam is unexecutable.
-    await errSync(`caddy-mcp: ${detail}; using Node instead.\n`);
-    await runInProcess();
-  } else {
-    // `--` separates oam's own flags from the script's argv, so `caddy-mcp
-    // --version` and any host-supplied flags survive the hop unchanged.
-    // Every "oam could not be executed" outcome lands here: the synchronous
-    // throw from spawn() and the async 'error' event mean the same thing and
-    // must degrade the same way, so the handling lives in one place.
-    // errSync rather than process.stderr.write because stderr is async for
-    // TTYs and pipes on Windows and the process.exit below truncates pending
-    // writes.
-    const launchFailed = async (err) => {
-      if (mode === "oam") {
-        await errSync(`caddy-mcp: failed to launch oam (${err?.message ?? err})\n`);
-        process.exit(1);
-      }
-      await runInProcess();
-    };
-
-    // ONE reporter shared by both launchFailed call sites, so the sync-throw
-    // path and the 'error'-event path cannot drift apart. Either can reject:
-    // runInProcess() is a bare import() that rejects when dist/index.js is
-    // missing, and at ESM top level an unhandled rejection is an uncaught
-    // exception -- the exact failure this handling exists to prevent.
-    const fallbackFailed = (e) => {
-      process.stderr.write(`caddy-mcp: fallback to Node failed (${e?.message ?? e})\n`);
-      process.exitCode = 1;
-    };
-
-    let child = null;
-    try {
-      child = spawn(oam, [...sandboxFlags(), "run", SERVER_ENTRY, "--", ...process.argv.slice(2)], {
-        // inherit keeps the SAME fds, so MCP's newline-delimited JSON framing on
-        // stdin/stdout is untouched and the host's stdin-close still reaches the
-        // server's shutdown path.
-        stdio: "inherit",
-        env: process.env,
-        windowsHide: true,
-      });
-    } catch (err) {
-      // spawn() THROWS for some failures instead of emitting 'error', and the
-      // 'error' listener is registered AFTER this call, so it can never observe
-      // one -- an uncaught throw here kills the launcher with a raw stack trace
-      // instead of falling back to Node.
-      await launchFailed(err).catch(fallbackFailed);
-    }
-
-    if (child) {
-      // If oam cannot be executed at all (deleted between the stat and the spawn,
-      // wrong arch, permission), fall back rather than failing the whole server.
-      // `spawned` prevents falling back AFTER the child started, which would
-      // double-start the server on the same stdio.
-      let spawned = false;
-      child.on("spawn", () => {
-        spawned = true;
-      });
-      child.on("error", (err) => {
-        if (spawned) return;
-        // Handle the rejection instead of discarding it: a failing in-process
-        // fallback would otherwise escape as an unhandled rejection, replacing
-        // this launcher's diagnostic with a raw stack trace.
-        launchFailed(err).catch(fallbackFailed);
-      });
-
-      // Forward termination so the server's own shutdown path runs in the child
-      // rather than the child being orphaned.
-      //
-      // Registering ANY handler for these suppresses Node's default
-      // terminate-on-signal, so the parent's exit has to be arranged explicitly.
-      // `child.killed` only records that kill() was CALLED, never that the child
-      // is gone, so gating on it swallows every signal after the first and wedges
-      // the launcher with no escape hatch.
-      //
-      // Escalation is driven by a TIMER, not by counting signals. Counting is
-      // ambiguous: a supervisor routinely sends SIGINT then SIGTERM milliseconds
-      // apart, and a terminal Ctrl-C reaches the whole process group, so reading
-      // "a second signal" as impatience hard-kills a child that is already
-      // shutting down cleanly. A timer makes the count irrelevant -- ONE press is
-      // enough, and a wedged child dies on schedule. setTimeout is monotonic, so
-      // a wall-clock step cannot mis-gate the window either.
-      //
-      // POSIX vs Windows, and why we do NOT forward on Windows.
-      // On POSIX child.kill(sig) delivers a real, catchable signal, so forwarding
-      // is what lets the child run its shutdown. On Windows there are no POSIX
-      // signals: child.kill IGNORES the name and calls TerminateProcess -- an
-      // immediate hard kill (verified: a child with a SIGTERM handler never runs
-      // it and dies with code=null, signal=SIGTERM). Forwarding there ABORTS the
-      // graceful shutdown the console's own Ctrl-C just started, skipping the
-      // child's process.on("exit") cleanup. The console has already notified the
-      // child, so on Windows the timer below is the only kill we issue.
-      // 5s, not 2s. This is a HARD kill of a server that may be mid-shutdown --
-      // flushing a large config, finishing a TLS provision -- and the cost of
-      // waiting too long (a wedged child lingers a few extra seconds) is far
-      // smaller than the cost of cutting a legitimate shutdown short. The window
-      // only ever elapses when the child has NOT exited on its own.
-      const ESCALATE_AFTER_MS = 5000;
-      let escalation = null;
-      for (const sig of ["SIGINT", "SIGTERM"]) {
-        process.on(sig, () => {
-          // No try/catch: kill() on an already-exited child returns false, it does
-          // not throw. It throws only for a signal the platform does not know,
-          // which SIGINT/SIGTERM/SIGKILL never are.
-          if (!isWin) child.kill(sig);
-          if (escalation) return; // already counting down; further signals are noise
-          escalation = setTimeout(() => {
-            // Still here after its grace window. Stop waiting on it.
-            child.kill("SIGKILL");
-            process.exit(128 + (constants.signals[sig] ?? 15));
-          }, ESCALATE_AFTER_MS);
-        });
-      }
-
-      child.on("exit", (code, signal) => {
-        if (escalation) clearTimeout(escalation);
-        // Mirror the child's fate: a signal death becomes 128+n so callers see a
-        // conventional shell exit status rather than a bare 0.
-        if (signal) {
-          process.exit(128 + (constants.signals[signal] ?? 15));
-        }
-        process.exit(code ?? 0);
-      });
-    }
+    // their OAM_BIN is wrong or their oam is too old to use.
+    if (notes.length > 0) await errSync(`caddy-mcp: ${notes.join("; ")}; ${fallbackTail(hostOam)}.\n`);
+    await fallBack(hostOam).catch(fallbackFailed);
   }
 }

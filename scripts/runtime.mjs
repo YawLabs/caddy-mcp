@@ -65,14 +65,16 @@ function installedCandidates() {
 /**
  * Absolute paths for `oam` on PATH, so callers see WHERE it came from.
  *
- * bin/caddy-mcp.mjs carries its OWN findOam, and the two are deliberately not
+ * bin/caddy-mcp.mjs carries its OWN discovery, and the two are deliberately not
  * shared: this one walks the full PATHEXT on Windows, the launcher's is
  * restricted to `.exe`. Node cannot spawn a .cmd/.bat without `shell: true`,
- * and the launcher's discovery is stat-only on the hot launch path, so whatever
- * it returns it must be able to execute -- discovery there has to agree with
- * execution. Here the candidate is probed with execFileSync before it is
- * returned (see findOam below), so a shim that cannot be run is dropped anyway
- * and a wider walk only ever finds more. Keep them separate.
+ * and the launcher names a skipped shim on stderr, so its discovery collects
+ * only what it can execute -- a collected shim would just fail its version
+ * probe and add a misleading "could not be run" note. Here the candidate is
+ * probed with execFileSync before it is returned (see findOam below), so a shim
+ * that cannot be run is dropped anyway and a wider walk only ever finds more.
+ * The launcher also asks EVERY candidate for its version and takes the newest;
+ * this returns the first that runs. Keep them separate.
  */
 function pathCandidates() {
   const found = [];

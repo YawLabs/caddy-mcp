@@ -28,7 +28,8 @@ The split is deliberate — **auto-detect for tools, explicit for artifacts**:
 | `npm run typecheck` | `oam check .` if available, else `tsc --noEmit` | `CADDY_MCP_RUNTIME=node` forces tsc; `typecheck:tsc` pins it |
 | `node scripts/build-binary.mjs` | **Node SEA + postject** | `CADDY_MCP_RUNTIME=oam` builds the oam carrier |
 | `npm test` | vitest (Node) | — |
-| `npm start` / `bin` entry | Node | — |
+| `npm start` | Node | — |
+| `bin` entry (`bin/caddy-mcp.mjs`) | newest oam at or above 0.15.2, else Node | `CADDY_MCP_RUNTIME=node` / `=oam`, `OAM_BIN`; see the launcher header |
 
 **Why the binary does NOT auto-detect.** It is a release artifact. If the carrier were
 chosen by what happens to be installed, the same git tag would produce a 57 MB oam binary
@@ -52,10 +53,11 @@ Measured on windows-arm64, 7-run averages:
 
 Two deliberate non-changes:
 
-- **`oam run` is not used anywhere.** On loose source it is *slower* than Node
-  (853 ms vs 701 ms) — the compiled binary's win comes from bytecode produced at
-  compile time, not from the runtime itself. Making oam the launcher for
-  `dist/index.js` would be a startup regression.
+- **`oam run` is used only by the published `bin` launcher**, on the built
+  `dist/index.js`. An earlier note here called it *slower* than Node (853 ms vs
+  701 ms); that timed an oam inside `target/release` mid-rebuild. Against an
+  installed oam it is faster (184 ms vs 213 ms, see `scripts/build-binary.mjs`).
+  The launcher never serves on an oam older than 0.15.2.
 - **Tests stay on vitest.** oam ships its own runner (`import 'oam:test'`), but the
   suite leans on `vi.mock` for module-level api mocking; porting it would trade a
   working 310-test suite for a rewrite and would break the Node-only path.
