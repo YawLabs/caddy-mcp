@@ -11,6 +11,31 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+- **The launcher always uses the newest oam, and the minimum is now the latest
+  release, 0.15.2.** It used to take the FIRST oam binary it found and only then
+  check its version, so a stale copy in an earlier location hid a current one:
+  with oam 0.9.0 in `~/.oam/bin` and 0.15.2 on `PATH`, it ran 0.9.0. Every oam
+  binary it can see is now asked for its version, and the newest at or above
+  0.15.2 wins; on a tie the installed copy still wins.
+- **An oam host older than the floor no longer serves the server itself.** When a
+  client ran `oam run bin/caddy-mcp.mjs` with an old oam and no usable one was
+  found, the server ran on that old oam. When one WAS found, the handoff inherited
+  stdio, which an oam before 0.9.0 does not honor, so the MCP handshake never
+  answered. An old host now hands off with piped stdio to the newest usable oam,
+  or to Node on `PATH`, or exits with an error when there is neither.
+  `CADDY_MCP_SANDBOX=1` on a supported oam host still spawns a fresh oam for
+  `--permission`, now with piped stdio too; if none is usable under `auto` it
+  still serves in the host process without the sandbox, as before.
+- **A bad `OAM_BIN` is reported instead of ending discovery.** A path that does
+  not exist, an oam below the floor, or a binary that will not run is named on
+  stderr, and discovery carries on instead of dropping straight to Node.
+- **`CADDY_MCP_RUNTIME=node` now always means Node.** Launched under `oam run`, it
+  hands off to Node on `PATH` rather than staying on oam.
+- Each `oam --version` probe is bounded at 5s, so a wedged binary on `PATH`
+  cannot hang the launch. A spawn that fails under `auto` now says so on stderr
+  before falling back.
+
 ## [2.4.3] — 2026-09-13
 
 No functional changes. Republishes 2.4.2 under a new version.
