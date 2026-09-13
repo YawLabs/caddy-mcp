@@ -11,6 +11,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [2.4.2] — 2026-09-12
+
 ### Fixed
 - **The launcher no longer boots a second oam when it is already running on one.**
   A host that resolves this package's `bin` and launches `oam run bin/caddy-mcp.mjs`
