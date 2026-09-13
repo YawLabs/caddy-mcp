@@ -39,14 +39,26 @@
  * no `oam --version` probe, no second oam. OAM_BIN is a discovery input, so it
  * is not consulted on that path: the host has already chosen which oam runs.
  *
- * Two cases still spawn, deliberately. CADDY_MCP_SANDBOX=1, because
- * `--permission` is a process-level flag that only a FRESH oam can apply --
- * serving in-process there would drop the sandbox without a word, a security
- * downgrade dressed up as an optimisation. And a host oam below the floor,
- * which takes the discovery path exactly as it always did.
+ * Two cases still take the discovery path, deliberately. CADDY_MCP_SANDBOX=1,
+ * because `--permission` is a process-level flag that only a FRESH oam can
+ * apply -- serving in-process on the host would drop the sandbox without a
+ * word, a security downgrade dressed up as an optimisation. And a host oam
+ * below the floor, which takes the discovery path exactly as it always did.
+ *
+ * The sandbox asks for a spawn; it does not guarantee one. Discovery can still
+ * come up empty -- no oam binary, one below the floor or unreadable, a spawn
+ * that fails -- and under CADDY_MCP_RUNTIME=auto that falls back exactly as it
+ * does on Node: the server runs in THIS process WITHOUT `--permission`. No oam
+ * (and no .cmd shim) and a failed spawn fall back silently; the too-old or
+ * unreadable binary and .cmd-shim cases print a note that does not mention the
+ * sandbox. Only CADDY_MCP_RUNTIME=oam turns that miss into a hard failure, so
+ * pair it with CADDY_MCP_SANDBOX=1 when the sandbox has to hold.
+ * CADDY_MCP_RUNTIME=node ignores the sandbox entirely.
  *
  * THE `--permission` SANDBOX (oam 0.9.0+, opt-in)
- * `CADDY_MCP_SANDBOX=1` runs the server under oam's permission model.
+ * `CADDY_MCP_SANDBOX=1` runs the server under oam's permission model when an
+ * oam binary is found and launched -- see ALREADY RUNNING ON OAM for the
+ * fallback that runs it unsandboxed, and how to refuse that instead.
  *
  * The admin API endpoint is DERIVED from CADDY_ADMIN_URL (default
  * http://localhost:2019 -- byte-identical to DEFAULT_URL in src/api.ts, see
@@ -85,10 +97,12 @@
  *
  * SELECTION
  *   CADDY_MCP_RUNTIME=oam    require oam; fail loudly if it is missing
- *                            (already running on oam satisfies it)
+ *                            (already running on oam satisfies it, except
+ *                            under CADDY_MCP_SANDBOX=1)
  *   CADDY_MCP_RUNTIME=node   never use oam
  *   CADDY_MCP_RUNTIME=auto   prefer oam, silently fall back (default)
- *   CADDY_MCP_SANDBOX=1      run oam under --permission (oam 0.9.0+)
+ *   CADDY_MCP_SANDBOX=1      run oam under --permission (oam 0.9.0+); under
+ *                            auto a discovery miss still runs unsandboxed
  *   OAM_BIN=/path/to/oam     explicit binary, checked before any discovery
  */
 
@@ -207,9 +221,10 @@ function atLeast(v, min) {
  * `hostOam` is `process.versions.oam`: oam's own key, absent on Node, so on
  * Node every mode but `node` is the discovery path it always was. `sandbox`
  * is whether a spawn would carry flags only a fresh oam can apply; see ALREADY
- * RUNNING ON OAM above for why that alone forces the spawn. The floor is
- * OAM_MIN itself, not a parameter, so a host oam and a discovered one can never
- * be held to different minimums.
+ * RUNNING ON OAM above for why that alone forces discovery -- and why discovery
+ * is not a guaranteed spawn, since its miss still falls back in-process. The
+ * floor is OAM_MIN itself, not a parameter, so a host oam and a discovered one
+ * can never be held to different minimums.
  *
  * Pure on purpose: every input is passed in, so the whole decision is testable
  * without booting a runtime.
