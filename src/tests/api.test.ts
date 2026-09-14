@@ -2016,6 +2016,39 @@ describe("api", () => {
         );
       });
 
+      // Node 19+ made the global http agent keep sockets alive, which exposes
+      // this transport to the same stale-socket race as fetch once Caddy
+      // restarts its admin endpoint after a config change. Each request must
+      // therefore arrive on a connection of its own.
+      it("gives every request its own connection", async () => {
+        const { createServer } = await import("node:http");
+        const { mkdtempSync, rmSync } = await import("node:fs");
+        const { tmpdir } = await import("node:os");
+        const { join } = await import("node:path");
+        const dir = mkdtempSync(join(tmpdir(), "cmcp-"));
+        const sockPath = join(dir, "s.sock");
+        const sockets: unknown[] = [];
+        const srv = createServer((req, res) => {
+          sockets.push(req.socket);
+          res.end(req.method === "GET" ? "{}" : "");
+        });
+        await new Promise<void>((ok) => srv.listen(sockPath, ok));
+        try {
+          process.env.CADDY_ADMIN_URL = `unix://${sockPath}`;
+          const api = await import("../api.js");
+          forbidFetch();
+          await api.configGet("apps");
+          await api.configPatch("apps/http", {});
+          await api.configGet("apps");
+          expect(sockets).toHaveLength(3);
+          expect(new Set(sockets).size).toBe(3);
+        } finally {
+          srv.closeAllConnections();
+          await new Promise<void>((ok) => srv.close(() => ok()));
+          rmSync(dir, { recursive: true, force: true });
+        }
+      });
+
       it("times out on an absolute deadline rather than an inactivity timer", async () => {
         // AbortSignal.timeout, not req.setTimeout. A server that accepts and
         // never replies must still abort, and the AbortError must classify as
@@ -2036,6 +2069,407 @@ describe("api", () => {
           },
         );
       }, 15000);
+    });
+  });
+
+  // Caddy restarts its admin endpoint after every config change, and the old
+  // endpoint's shutdown closes each idle keep-alive connection. These drive REAL
+  // sockets through the real global fetch -- a stubbed fetch has no connection
+  // pool, so it can never reproduce a request written to a socket the server
+  // already dropped. That is why the mocked suites above never caught it.
+  describe("surviving an admin endpoint restart (real sockets)", () => {
+    interface Received {
+      method: string;
+      path: string;
+      /** Which accepted connection carried it (1-based). */
+      conn: number;
+      /** The connection was open during an earlier config change, so Caddy was closing it. */
+      stale: boolean;
+      body: string;
+    }
+
+    type Behavior = "caddy" | "no-restart" | "reset-writes";
+
+    /**
+     * A minimal HTTP/1.1 server on raw net sockets, so the test decides exactly
+     * what happens to each connection.
+     *
+     * "caddy": every response is keep-alive. A successful non-GET is a config
+     * change: the endpoint restarts, and the old one's shutdown closes every
+     * connection that was open at that moment, this one included -- a moment
+     * AFTER the response, as Caddy's does (measured within a millisecond of it).
+     * A request that arrives on such a connection before the close lands is
+     * answered with a TCP reset and no response byte: Caddy closed it before
+     * reading, the exact shape measured against 2.11.4 (ECONNRESET / "other
+     * side closed").
+     *
+     * "no-restart": a write is acknowledged but nothing is closed -- a `/load`
+     * whose config was already the running one, or a proxy in front of the
+     * admin API that keeps its own client connections open.
+     *
+     * "reset-writes": every non-GET is read in full and then reset without a
+     * response, on whatever connection it arrives. Caddy has the request, and the
+     * client cannot know whether it was applied.
+     */
+    async function startServer(behavior: Behavior) {
+      const net = await import("node:net");
+      const received: Received[] = [];
+      const sockets = new Set<import("node:net").Socket>();
+      const stale = new WeakSet<import("node:net").Socket>();
+      let connSeq = 0;
+
+      const server = net.createServer((socket) => {
+        sockets.add(socket);
+        socket.on("close", () => sockets.delete(socket));
+        socket.on("error", () => {});
+        const conn = ++connSeq;
+        let buf = Buffer.alloc(0);
+
+        socket.on("data", (chunk: Buffer) => {
+          buf = Buffer.concat([buf, chunk]);
+          for (;;) {
+            const headerEnd = buf.indexOf("\r\n\r\n");
+            if (headerEnd === -1) return;
+            const head = buf.subarray(0, headerEnd).toString("latin1").split("\r\n");
+            const [method, path] = (head[0] ?? "").split(" ");
+            const headers = new Map<string, string>();
+            for (const line of head.slice(1)) {
+              const i = line.indexOf(":");
+              if (i > 0) headers.set(line.slice(0, i).trim().toLowerCase(), line.slice(i + 1).trim());
+            }
+            const length = Number(headers.get("content-length") ?? 0);
+            if (buf.length < headerEnd + 4 + length) return;
+            const body = buf.subarray(headerEnd + 4, headerEnd + 4 + length).toString("utf8");
+            buf = buf.subarray(headerEnd + 4 + length);
+
+            received.push({ method, path, conn, stale: stale.has(socket), body });
+
+            const isWrite = method !== "GET";
+            if (stale.has(socket) || (behavior === "reset-writes" && isWrite)) {
+              socket.resetAndDestroy();
+              return;
+            }
+            const payload = isWrite ? "" : "{}";
+            const response =
+              `HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: ${Buffer.byteLength(payload)}\r\n\r\n` +
+              payload;
+            if (!(isWrite && behavior === "caddy")) {
+              socket.write(response);
+              continue;
+            }
+            // The restart: every connection open right now, this one included,
+            // is doomed. Caddy closes them just after the response goes out; a
+            // client that dispatches its next request before that has already
+            // lost the race, so the close is deliberately a short timer away.
+            const doomed = [...sockets];
+            for (const s of doomed) stale.add(s);
+            socket.write(response, () => {
+              setTimeout(() => {
+                for (const s of doomed) if (!s.destroyed) s.destroy();
+              }, 2);
+            });
+          }
+        });
+      });
+
+      await new Promise<void>((resolve) => server.listen(0, "127.0.0.1", resolve));
+      const { port } = server.address() as import("node:net").AddressInfo;
+      process.env.CADDY_ADMIN_URL = `http://127.0.0.1:${port}`;
+
+      return {
+        port,
+        received,
+        listenAgain: () => new Promise<void>((resolve) => server.listen(port, "127.0.0.1", resolve)),
+        stopListening: () => new Promise<void>((resolve) => server.close(() => resolve())),
+        close: async () => {
+          for (const s of sockets) s.destroy();
+          if (server.listening) await new Promise<void>((resolve) => server.close(() => resolve()));
+        },
+      };
+    }
+
+    const route = { handle: [{ handler: "static_response" }] };
+
+    // What an agent does when it calls two caddy-mcp tools back to back: create a
+    // server, then add a route to it. The second POST used to be written to a
+    // pooled socket the restart had closed, and POST is (rightly) never replayed,
+    // so the call failed with "Cannot connect ... is Caddy running?".
+    it("delivers a POST that follows a config change, exactly once", async () => {
+      process.env.CADDY_MAX_RETRIES = "2";
+      const srv = await startServer("caddy");
+      try {
+        const api = await import("../api.js");
+        // Several reads first, so the keep-alive pool holds idle sockets.
+        for (let i = 0; i < 3; i++) expect((await api.configGet("apps")).ok).toBe(true);
+
+        const create = await api.configPost("apps/http/servers/fresh", { listen: [":1"], routes: [] });
+        expect(create.ok).toBe(true);
+        const added = await api.configPost("apps/http/servers/fresh/routes", route);
+
+        expect(added.error).toBeUndefined();
+        expect(added.ok).toBe(true);
+        const routePosts = srv.received.filter((r) => r.path === "/config/apps/http/servers/fresh/routes");
+        expect(routePosts).toHaveLength(1);
+        expect(routePosts[0]?.stale).toBe(false);
+      } finally {
+        await srv.close();
+      }
+    });
+
+    // The mechanism behind the test above, stated directly: whatever its method,
+    // no request may ride a connection that was open when an earlier config
+    // change went through -- Caddy is closing every one of those. Reads before
+    // any change may share a connection; that pooling is what keeps the client
+    // clear of Caddy's accept-loop bug on Windows (see settleAdminRestart).
+    it("never writes a request to a connection that was open during an earlier config change", async () => {
+      process.env.CADDY_MAX_RETRIES = "2";
+      const srv = await startServer("caddy");
+      try {
+        const api = await import("../api.js");
+        await api.configGet("apps");
+        await api.configPatch("apps/http", {});
+        await api.configGet("apps");
+        await api.configPut("apps/http/servers/s/routes/0", route);
+        await api.configDelete("apps/http/servers/s/routes/0");
+        await api.configPost("apps/http/servers/s/routes", route);
+
+        // Six calls, six deliveries: nothing was reset, so nothing was retried.
+        expect(srv.received.map((r) => r.method)).toEqual(["GET", "PATCH", "GET", "PUT", "DELETE", "POST"]);
+        expect(srv.received.map((r) => r.stale)).toEqual([false, false, false, false, false, false]);
+        // And every request after a change is on a connection the change did not touch.
+        for (let i = 1; i < srv.received.length; i++) {
+          if (srv.received[i - 1]?.method !== "GET") expect(srv.received[i]?.conn).not.toBe(srv.received[i - 1]?.conn);
+        }
+      } finally {
+        await srv.close();
+      }
+    });
+
+    // (a) An idempotent read after a config change succeeds on its FIRST attempt:
+    // it no longer depends on the retry budget to get past a dead socket.
+    it("answers a GET that follows a config change without spending a retry", async () => {
+      process.env.CADDY_MAX_RETRIES = "0";
+      const srv = await startServer("caddy");
+      try {
+        const api = await import("../api.js");
+        for (let i = 0; i < 3; i++) await api.configGet("apps");
+        expect((await api.configPatch("apps/http", {})).ok).toBe(true);
+
+        const res = await api.configGet("apps/http");
+        expect(res.error).toBeUndefined();
+        expect(res.ok).toBe(true);
+      } finally {
+        await srv.close();
+      }
+    });
+
+    // The wait is for an event -- Caddy closing the pooled sockets -- not a
+    // fixed delay. The server here closes them a couple of milliseconds after
+    // the response; a change must come back in a fraction of the 250 ms cap.
+    it("reports a config change complete as soon as the pooled sockets are closed", async () => {
+      process.env.CADDY_MAX_RETRIES = "0";
+      const srv = await startServer("caddy");
+      try {
+        const api = await import("../api.js");
+        await api.configGet("apps");
+
+        const started = performance.now();
+        expect((await api.configPatch("apps/http", {})).ok).toBe(true);
+        const elapsed = performance.now() - started;
+
+        expect(elapsed).toBeLessThan(250);
+        expect((await api.configGet("apps")).ok).toBe(true);
+        expect(srv.received.map((r) => r.stale)).toEqual([false, false, false]);
+      } finally {
+        await srv.close();
+      }
+    });
+
+    // A write that closes nothing -- a /load of the config already running, or
+    // a proxy that keeps its connections -- waits out the cap and then carries
+    // on over the connection it has: the pre-fix behavior, never anything worse.
+    it("stops waiting after the cap when the server keeps its sockets open", async () => {
+      process.env.CADDY_MAX_RETRIES = "0";
+      const srv = await startServer("no-restart");
+      try {
+        const api = await import("../api.js");
+        await api.configGet("apps");
+
+        const started = performance.now();
+        expect((await api.loadConfig({ apps: {} })).ok).toBe(true);
+        const elapsed = performance.now() - started;
+
+        expect(elapsed).toBeGreaterThanOrEqual(240);
+        expect(elapsed).toBeLessThan(2000);
+        expect((await api.configGet("apps")).ok).toBe(true);
+        expect(srv.received.map((r) => r.method)).toEqual(["GET", "POST", "GET"]);
+      } finally {
+        await srv.close();
+      }
+    });
+
+    /**
+     * Wrap the real fetch so the admin port refuses the first `refusals`
+     * connection attempts and accepts after that. The listener comes back from
+     * inside the failed attempt, so the timing is deterministic: the first try
+     * is refused, the retry finds the port open.
+     */
+    function refuseFirst(srv: Awaited<ReturnType<typeof startServer>>, refusals: number) {
+      let attempts = 0;
+      let refused = 0;
+      globalThis.fetch = (async (...args: Parameters<typeof fetch>) => {
+        attempts++;
+        try {
+          return await originalFetch(...args);
+        } catch (err) {
+          const code = (err as { cause?: { code?: string } }).cause?.code;
+          if (code === "ECONNREFUSED" && ++refused === refusals) await srv.listenAgain();
+          throw err;
+        }
+      }) as typeof fetch;
+      return { attempts: () => attempts };
+    }
+
+    // (a) A read that lands while the port refuses connections is retried.
+    it("retries a GET whose connection was refused, then succeeds", async () => {
+      process.env.CADDY_MAX_RETRIES = "2";
+      const srv = await startServer("caddy");
+      try {
+        await srv.stopListening();
+        const counter = refuseFirst(srv, 1);
+        const api = await import("../api.js");
+
+        const res = await api.configGet("apps");
+        expect(res.error).toBeUndefined();
+        expect(res.ok).toBe(true);
+        expect(counter.attempts()).toBe(2);
+      } finally {
+        await srv.close();
+      }
+    });
+
+    // (b) A refused connect never sent a byte, so even an appending POST -- which
+    // no other failure may replay -- is retried, and lands exactly once.
+    it.each([
+      ["POST under /config", (api: typeof import("../api.js")) => api.configPost("apps/http/servers/s/routes", route)],
+      ["POST under /id", (api: typeof import("../api.js")) => api.configByIdSet("r1", route, "POST")],
+      [
+        "PUT at an array index",
+        (api: typeof import("../api.js")) => api.configPut("apps/http/servers/s/routes/0", route),
+      ],
+    ])("retries a %s whose connection was refused, and sends it once", async (_label, write) => {
+      process.env.CADDY_MAX_RETRIES = "2";
+      const srv = await startServer("caddy");
+      try {
+        await srv.stopListening();
+        const counter = refuseFirst(srv, 1);
+        const api = await import("../api.js");
+
+        const res = await write(api);
+        expect(res.error).toBeUndefined();
+        expect(res.ok).toBe(true);
+        expect(counter.attempts()).toBe(2);
+        expect(srv.received).toHaveLength(1);
+      } finally {
+        await srv.close();
+      }
+    });
+
+    // (b) A reset after Caddy read the request proves nothing about whether it was
+    // applied, so a non-idempotent write is surfaced, never replayed -- even with
+    // the maximum retry budget.
+    it.each([
+      ["POST under /config", (api: typeof import("../api.js")) => api.configPost("apps/http/servers/s/routes", route)],
+      ["POST under /id", (api: typeof import("../api.js")) => api.configByIdSet("r1", route, "POST")],
+      [
+        "PUT at an array index",
+        (api: typeof import("../api.js")) => api.configPut("apps/http/servers/s/routes/0", route),
+      ],
+    ])("sends a %s that was reset after delivery exactly once", async (_label, write) => {
+      process.env.CADDY_MAX_RETRIES = "5";
+      const srv = await startServer("reset-writes");
+      try {
+        const api = await import("../api.js");
+
+        const res = await write(api);
+        expect(res.ok).toBe(false);
+        expect(res.status).toBe(0);
+        expect(res.error).toBe(`Cannot connect to Caddy admin API at http://127.0.0.1:${srv.port} — is Caddy running?`);
+        expect(srv.received).toHaveLength(1);
+      } finally {
+        await srv.close();
+      }
+    });
+
+    // (c) A Caddy that is genuinely down: every method gives up within the bound,
+    // after exactly 1 + CADDY_MAX_RETRIES attempts, with the unchanged message.
+    it.each([
+      ["GET", (api: typeof import("../api.js")) => api.configGet("apps")],
+      ["POST under /config", (api: typeof import("../api.js")) => api.configPost("apps/http/servers/s/routes", route)],
+    ])("gives up on a %s to a Caddy that stays down, fast", async (_label, call) => {
+      delete process.env.CADDY_MAX_RETRIES; // the default budget: 2 retries
+      const srv = await startServer("caddy");
+      const { port } = srv;
+      await srv.close();
+      let attempts = 0;
+      globalThis.fetch = (async (...args: Parameters<typeof fetch>) => {
+        attempts++;
+        return originalFetch(...args);
+      }) as typeof fetch;
+      const api = await import("../api.js");
+
+      const started = Date.now();
+      const res = await call(api);
+      const elapsed = Date.now() - started;
+
+      expect(res.ok).toBe(false);
+      expect(res.status).toBe(0);
+      expect(res.error).toBe(`Cannot connect to Caddy admin API at http://127.0.0.1:${port} — is Caddy running?`);
+      expect(attempts).toBe(3);
+      // Backoff is 100 ms then 200 ms, plus at most 50 ms jitter each: ~400 ms of
+      // sleeping. 2 s leaves room for slow connects on a loaded machine.
+      expect(elapsed).toBeLessThan(2000);
+    });
+
+    // fetch reports a refusal to a dual-stack name like `localhost` as an
+    // AggregateError holding one ECONNREFUSED per address, with no code of its own.
+    it("treats an AggregateError of refusals as a refusal", async () => {
+      process.env.CADDY_MAX_RETRIES = "1";
+      const api = await import("../api.js");
+      let calls = 0;
+      globalThis.fetch = vi.fn(async () => {
+        calls++;
+        if (calls === 1) {
+          const refusal = (address: string) =>
+            Object.assign(new Error(`connect ECONNREFUSED ${address}`), { code: "ECONNREFUSED" });
+          throw new TypeError("fetch failed", {
+            cause: new AggregateError([refusal("::1:2019"), refusal("127.0.0.1:2019")]),
+          });
+        }
+        return new Response("", { status: 200 });
+      }) as any;
+
+      const res = await api.configPost("apps/http/servers/s/routes", route);
+      expect(res.ok).toBe(true);
+      expect(calls).toBe(2);
+    });
+
+    // The other half of that classification: a transport failure that is NOT a
+    // refusal (here a reset) keeps a POST out of the retry loop.
+    it("does not treat a reset as a refusal", async () => {
+      process.env.CADDY_MAX_RETRIES = "3";
+      const api = await import("../api.js");
+      let calls = 0;
+      globalThis.fetch = vi.fn(async () => {
+        calls++;
+        throw new TypeError("fetch failed", {
+          cause: Object.assign(new Error("read ECONNRESET"), { code: "ECONNRESET" }),
+        });
+      }) as any;
+
+      const res = await api.configPost("apps/http/servers/s/routes", route);
+      expect(res.ok).toBe(false);
+      expect(calls).toBe(1);
     });
   });
 });
