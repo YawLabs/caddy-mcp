@@ -38,16 +38,16 @@
     "start": "node dist/index.js"
   },
   "dependencies": {
-    "@modelcontextprotocol/sdk": "^1.29.0",
+    "@modelcontextprotocol/sdk": "^1.30.0",
     "zod": "^4.3.6"
   },
   "overrides": {
-    "hono": "^4.12.21",
-    "@hono/node-server": "^1.19.13",
-    "postcss": "^8.5.10",
-    "ip-address": "^10.1.1",
-    "fast-uri": "^3.1.2",
-    "qs": "^6.15.2",
+    "hono": "^4.13.5",
+    "@hono/node-server": "^1.19.15",
+    "postcss": "^8.5.23",
+    "ip-address": "^10.3.1",
+    "fast-uri": "^3.1.6",
+    "qs": "^6.16.0",
     "esbuild": "^0.28.1"
   },
   "devDependencies": {
