@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [2.5.2] — 2026-09-14
+
 ### Changed
 - **`@modelcontextprotocol/sdk` moves from `^1.29.0` to `^1.30.0`, and
   `npm audit` is clean again (11 findings, 5 high, before).** The SDK is a runtime

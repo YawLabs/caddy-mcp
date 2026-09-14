@@ -9,12 +9,12 @@
     "id": "1205520006"
   },
   "websiteUrl": "https://yaw.sh/mcp-servers/caddy-mcp/",
-  "version": "2.5.1",
+  "version": "2.5.2",
   "packages": [
     {
       "registryType": "npm",
       "identifier": "@yawlabs/caddy-mcp",
-      "version": "2.5.1",
+      "version": "2.5.2",
       "transport": {
         "type": "stdio"
       }
