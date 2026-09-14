@@ -14,6 +14,37 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ### Changed
 - npm and MCP Registry listing metadata: bugs URL, core keywords, and
   server.json title/repository/websiteUrl
+- `release.sh` writes a `## [x.y.z]` changelog entry for every release —
+  promoting `[Unreleased]` when it has content, otherwise generating one from
+  the commit subjects since the previous tag — and takes the GitHub release
+  notes from that entry instead of from `git log` subjects. Before this, the
+  script never touched this file: promotion was a separate hand-written
+  commit when someone remembered, and otherwise the version got no entry at
+  all (2.5.0 below is backfilled; 2.4.1 and the versions the note at the top
+  admits to still have none), and every GitHub release page showed raw commit
+  subjects even when an entry existed. Keep-a-Changelog compare links are
+  moved along too, should this file ever gain them.
+
+## [2.5.0] — 2026-09-13
+
+Release tooling and documentation only; no change to the published package's
+behavior.
+
+### Changed
+- `release.sh` waits for npm to actually serve a freshly published version
+  before the MCP Registry step. `npm publish` returns as soon as the registry
+  accepts the tarball, but the version is not yet readable from npm's
+  CDN-backed read path, and the MCP Registry validates a submission by reading
+  it — so a registry publish straight after `npm publish` could fail with
+  `version 'x.y.z' was not found (status: 404)` and the release needed a second
+  run (ssh-mcp and aws-mcp both hit this). The wait polls the exact URL the
+  registry's validator fetches, `registry.npmjs.org/@yawlabs%2Fcaddy-mcp/<version>`,
+  with `curl` rather than `npm view`, whose 5-minute metadata cache can keep
+  reporting the pre-publish answer, and it warns rather than fails at its 300s
+  cap so `mcp-publisher` still gets to report its own precise error.
+  `SKIP_NPM_WAIT=1` bypasses the wait and `NPM_WAIT_TIMEOUT_S` retunes it (#51).
+- README: the X follow badge moved from the top of the page to the bottom, so
+  the description leads on npm and GitHub (#52).
 
 ## [2.4.4] — 2026-09-13
 

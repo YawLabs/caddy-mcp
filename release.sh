@@ -26,6 +26,151 @@ info() { echo -e "${GREEN}  - $1${NC}"; }
 warn() { echo -e "${YELLOW}  ! $1${NC}"; }
 fail() { echo -e "${RED}  x $1${NC}"; exit 1; }
 
+# --- CHANGELOG promotion (ported from aws-mcp) -----------------------------
+# This script never touched CHANGELOG.md. The [Unreleased] heading was promoted
+# by hand in a separate "docs: promote [Unreleased] to x.y.z" commit when
+# someone remembered, and otherwise not at all -- 2.4.1 and 2.5.0 shipped with
+# no entry, on top of the older gaps the note at the top of the file admits to
+# -- and step 6 built the GitHub release notes from commit subjects regardless,
+# so every release page showed raw subjects even when a hand-written entry
+# existed.
+#
+# Every release now gets a `## [<version>]` entry, and step 6 sources the
+# release notes from it:
+#   * [Unreleased] has content -> it becomes the version section, and a fresh,
+#     empty [Unreleased] heading is left above it for the next change.
+#   * [Unreleased] is empty or absent -> a version section is generated from
+#     the commit subjects since the previous tag. Raw subjects are less than a
+#     hand-written entry, but a version with no entry at all reads as a mistake.
+#   * The Keep-a-Changelog link references at the bottom, when the file has
+#     them, are moved along: [Unreleased] compares from the new tag, and the
+#     version gets its own compare link.
+
+changelog_section() {
+  [ -f CHANGELOG.md ] || return 0
+  awk -v heading="$1" '
+    index($0, "## [" heading "]") == 1 { capture=1; next }
+    capture && /^## \[/ { exit }
+    capture { print }
+  ' CHANGELOG.md
+}
+
+# True when a section body carries any non-whitespace content.
+changelog_nonempty() { [ -n "$(echo "$1" | tr -d '[:space:]')" ]; }
+
+# Reuse whatever separator this file already puts between version and date.
+# The fleet mixes an em-dash and "--"; promoting with a hardcoded one would
+# introduce a third style into whichever repos do not use it.
+changelog_dash() {
+  local d
+  d=$(sed -nE 's/^## \[[0-9][^]]*\][[:space:]]+([^[:space:]]+)[[:space:]]+[0-9]{4}-[0-9]{2}-[0-9]{2}.*/\1/p' CHANGELOG.md 2>/dev/null | head -1)
+  if [ -n "$d" ]; then printf '%s' "$d"; else printf '%s' '--'; fi
+}
+
+# The tag this release is compared against: the newest v* tag reachable from
+# HEAD other than this release's own (a re-run after tagging must not compare
+# the version with itself). Empty on a first release.
+changelog_prev_tag() {
+  git describe --tags --abbrev=0 --match 'v*' --exclude "v${VERSION}" 2>/dev/null || true
+}
+
+# The body of a generated entry: one bullet per commit subject since the
+# previous tag, newest first, with version-bump commits dropped.
+changelog_generated_body() {
+  local prev=$1 range subjects
+  if [ -n "$prev" ]; then range="${prev}..HEAD"; else range="HEAD"; fi
+  subjects=$(git log --no-merges --format='%s' "$range" 2>/dev/null \
+    | grep -vE '^v[0-9]+\.[0-9]+\.[0-9]+$' | sed 's/^/- /' || true)
+  [ -n "$subjects" ] || subjects="- Maintenance release; no changes since ${prev:-the previous release}."
+  printf '### Changed\n%s\n' "$subjects"
+}
+
+# Keep-a-Changelog link references, when the file uses them: [Unreleased]
+# compares from the new tag, and the version gets its own compare link (or a
+# tag link on a first release). A version link that already exists is kept.
+changelog_update_links() {
+  local prev=$1 tmp
+  grep -qE '^\[Unreleased\]: .*/compare/.*\.\.\.HEAD' CHANGELOG.md || return 0
+  tmp=$(mktemp)
+  awk -v ver="$VERSION" -v prev="$prev" -v have_link="$(grep -c "^\[${VERSION}\]: " CHANGELOG.md || true)" '
+    !done && /^\[Unreleased\]: .*\/compare\/.*\.\.\.HEAD/ {
+      url=$0; sub(/^\[Unreleased\]: /, "", url); sub(/\/compare\/.*$/, "", url)
+      print "[Unreleased]: " url "/compare/v" ver "...HEAD"
+      if (have_link == 0) {
+        if (prev != "") print "[" ver "]: " url "/compare/" prev "...v" ver
+        else print "[" ver "]: " url "/releases/tag/v" ver
+      }
+      done=1; next
+    }
+    { print }
+  ' CHANGELOG.md > "$tmp" || { rm -f "$tmp"; fail "CHANGELOG.md link update failed"; }
+  mv "$tmp" CHANGELOG.md
+}
+
+# Make sure `## [<version>] <dash> <today>` exists: promote [Unreleased] when it
+# has content, otherwise generate the section from the commit subjects.
+promote_changelog() {
+  [ -f CHANGELOG.md ] || return 0
+  local prev
+  prev=$(changelog_prev_tag)
+  if changelog_nonempty "$(changelog_section "$VERSION")"; then
+    info "CHANGELOG.md already has an entry for v${VERSION}"
+    changelog_update_links "$prev"
+    return 0
+  fi
+  local today tmp dash heading body
+  today=$(date +%F)
+  dash=$(changelog_dash)
+  heading="## [${VERSION}] ${dash} ${today}"
+  tmp=$(mktemp)
+  if changelog_nonempty "$(changelog_section "Unreleased")"; then
+    # Rewrite only the FIRST [Unreleased] heading: a stray later mention (a link
+    # reference, a quoted example) must not become a second, bogus heading.
+    awk -v repl="$heading" '
+      !promoted && index($0, "## [Unreleased]") == 1 { print "## [Unreleased]"; print ""; print repl; promoted=1; next }
+      { print }
+    ' CHANGELOG.md > "$tmp" || { rm -f "$tmp"; fail "CHANGELOG.md promotion failed"; }
+    info "CHANGELOG.md: promoted [Unreleased] -> [${VERSION}] ${dash} ${today}"
+  else
+    body=$(changelog_generated_body "$prev")
+    warn "CHANGELOG.md has no [Unreleased] content -- writing [${VERSION}] from the commit subjects since ${prev:-the first commit}; edit it if they undersell the release"
+    # Insert below an empty [Unreleased] heading, else above the first version
+    # heading, else at the end of the file.
+    awk -v heading="$heading" -v body="$body" '
+      !done && index($0, "## [Unreleased]") == 1 { print; print ""; print heading; print ""; print body; done=1; next }
+      !done && /^## \[/ { print heading; print ""; print body; print ""; done=1 }
+      { print }
+      END { if (!done) { print ""; print heading; print ""; print body } }
+    ' CHANGELOG.md > "$tmp" || { rm -f "$tmp"; fail "CHANGELOG.md entry generation failed"; }
+    info "CHANGELOG.md: added [${VERSION}] ${dash} ${today} from commit subjects"
+  fi
+  mv "$tmp" CHANGELOG.md
+  changelog_update_links "$prev"
+}
+
+# Backstop for the promotion above: every release has an entry now, so a
+# missing one means promote_changelog did not run or did not land, and the
+# release notes in step 6 would silently fall back to commit subjects.
+assert_changelog_promoted() {
+  [ -f CHANGELOG.md ] || return 0
+  changelog_nonempty "$(changelog_section "$VERSION")" && return 0
+  fail "CHANGELOG.md has no '## [${VERSION}]' entry -- promote_changelog did not run or did not land."
+}
+
+# Release notes for step 6: the version's changelog section, trimmed of the
+# blank lines around it; commit subjects only when there is no changelog.
+release_notes() {
+  local notes
+  notes=$(changelog_section "$VERSION" | sed -e '/./,$!d' | sed -e :a -e '/^\n*$/{$d;N;ba' -e '}')
+  if changelog_nonempty "$notes"; then
+    printf '%s\n' "$notes"
+  elif [ -n "${1:-}" ] && [ "$1" != "v${VERSION}" ]; then
+    git log --oneline "${1}..v${VERSION}" --no-decorate | sed 's/^[a-f0-9]* /- /'
+  else
+    printf 'Initial release\n'
+  fi
+}
+
 # SKIP_LINT=1 escape hatch -- wraps `npm`/`pnpm` so lint-related runs are
 # no-ops.
 #
@@ -223,11 +368,17 @@ if [ -f server.json ]; then
   fi
 fi
 
+# Promote the heading BEFORE the bump commit, so the rewrite is committed
+# with the version bump rather than left dirty in the working tree.
+promote_changelog
+assert_changelog_promoted
+
 step 3 "Commit and tag"
 if [ "$IS_CI" = "true" ]; then
   info "CI mode -- commit/tag already exist on the triggering ref, skipping"
 else
   BUMP_FILES="package.json package-lock.json"
+  [ -f CHANGELOG.md ] && BUMP_FILES="$BUMP_FILES CHANGELOG.md"
   [ -f server.json ] && BUMP_FILES="$BUMP_FILES server.json"
   if [ -n "$(git status --porcelain $BUMP_FILES 2>/dev/null)" ]; then
     git add $BUMP_FILES
@@ -403,13 +554,9 @@ if gh release view "v${VERSION}" >/dev/null 2>&1; then
   info "GitHub release v${VERSION} already exists -- skipping"
 else
   PREV_TAG=$(git tag --sort=-v:refname | grep -A1 "^v${VERSION}$" | tail -1)
-  if [ -n "$PREV_TAG" ] && [ "$PREV_TAG" != "v${VERSION}" ]; then
-    CHANGELOG=$(git log --oneline "${PREV_TAG}..v${VERSION}" --no-decorate | sed 's/^[a-f0-9]* /- /')
-  else
-    CHANGELOG="Initial release"
-  fi
-  gh release create "v${VERSION}" --title "v${VERSION}" --notes "$CHANGELOG"
-  info "GitHub release created"
+  NOTES=$(release_notes "$PREV_TAG")
+  gh release create "v${VERSION}" --title "v${VERSION}" --notes "$NOTES"
+  info "GitHub release created (notes from CHANGELOG.md [${VERSION}])"
 fi
 
 # --- npm propagation gate (part of step 7, deliberately not a step of its own) ---
