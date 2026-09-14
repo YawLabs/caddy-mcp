@@ -6,6 +6,18 @@ const RETRY_BASE_MS = 100;
 const RETRY_MAX_DELAY_MS = 2000;
 const RETRY_MAX_JITTER_MS = 50;
 const RETRY_HARD_CAP = 5;
+/**
+ * How long a config-changing request waits for Caddy to close the keep-alive
+ * sockets it holds before the request is reported complete (see
+ * settleAdminRestart). Caddy does it within a millisecond of the response --
+ * measured p99 0.3 ms over 200 changes against 2.11.4, with the admin server's
+ * shutdown goroutine running about 10 ms late on a saturated host -- so this
+ * bound is only ever reached when there is no restart to wait for: a `/load`
+ * whose config was byte-identical to the running one (Caddy reports 200 and
+ * changes nothing), or an admin endpoint reached through a proxy that keeps
+ * its own client connections open.
+ */
+const ADMIN_RESTART_SETTLE_MS = 250;
 
 export interface ApiResponse<T = any> {
   ok: boolean;
@@ -343,15 +355,50 @@ async function caddyRequest<T = any>(
   }
   const maxRetries = getMaxRetries();
   let attempt = 0;
-  let res: ApiResponse<T> = await attemptRequest<T>(method, path, body, contentType, timeout, rawStringBody);
-  while (isRetryableMethod(method, path) && isTransientFailure(res) && attempt < maxRetries) {
+  let { res, refused } = await attemptRequest<T>(method, path, body, contentType, timeout, rawStringBody);
+  // A refused connection is retried for EVERY method, including the POST and
+  // array-index PUT that isRetryableMethod excludes: the TCP handshake never
+  // completed, so not one byte of the request left this process and a replay
+  // cannot duplicate a write. That proof holds for ECONNREFUSED only -- a reset
+  // or a timeout can arrive after Caddy read and applied the request, so those
+  // stay behind isRetryableMethod. Same CADDY_MAX_RETRIES budget and backoff
+  // either way, so a Caddy that is genuinely down still fails in a few hundred
+  // ms at the default of 2, with the unchanged "is Caddy running?" message.
+  while (isTransientFailure(res) && (refused || isRetryableMethod(method, path)) && attempt < maxRetries) {
     attempt++;
     const backoff = Math.min(RETRY_BASE_MS * 2 ** (attempt - 1), RETRY_MAX_DELAY_MS);
     const delay = backoff + Math.random() * RETRY_MAX_JITTER_MS;
     await sleep(delay);
-    res = await attemptRequest<T>(method, path, body, contentType, timeout, rawStringBody);
+    ({ res, refused } = await attemptRequest<T>(method, path, body, contentType, timeout, rawStringBody));
   }
   return res;
+}
+
+/**
+ * Whether a transport error is a refused connection, anywhere in its cause chain.
+ *
+ * fetch wraps the socket error: TypeError("fetch failed") with `cause` set to an
+ * Error whose code is ECONNREFUSED -- or, for a hostname like `localhost` that
+ * resolves to both ::1 and 127.0.0.1, an AggregateError carrying one refused
+ * error per address. node:http (the unix-socket transport) rejects with the
+ * socket error itself. A refusal means the connect never succeeded, so the
+ * request was never written; that is what makes it safe to replay any method.
+ */
+function isConnectionRefused(err: unknown): boolean {
+  let current: unknown = err;
+  for (let depth = 0; depth < 5 && current !== null && typeof current === "object"; depth++) {
+    const e = current as { code?: unknown; errors?: unknown; cause?: unknown };
+    if (e.code === "ECONNREFUSED") return true;
+    if (
+      Array.isArray(e.errors) &&
+      e.errors.length > 0 &&
+      e.errors.every((inner) => (inner as { code?: unknown } | null)?.code === "ECONNREFUSED")
+    ) {
+      return true;
+    }
+    current = e.cause;
+  }
+  return false;
 }
 
 /** The transport-agnostic shape both send paths reduce to. */
@@ -384,28 +431,49 @@ function sendViaUnixSocket(
     // signal here keeps CADDY_TIMEOUT / CADDY_LOAD_TIMEOUT meaning one thing on
     // both transports. The resulting AbortError message contains "aborted",
     // which attemptRequest's catch already classifies as a timeout.
-    const req = httpRequest({ socketPath, path, method, headers, signal: AbortSignal.timeout(timeoutMs) }, (res) => {
-      const chunks: Buffer[] = [];
-      res.on("data", (chunk: Buffer) => chunks.push(chunk));
-      res.on("error", reject);
-      res.on("end", () => {
-        const status = res.statusCode ?? 0;
-        const etag = res.headers.etag;
-        resolve({
-          ok: status >= 200 && status < 300,
-          status,
-          text: Buffer.concat(chunks).toString("utf8"),
-          etag: typeof etag === "string" ? etag : undefined,
+    //
+    // agent: false gives every request its own connection. Since Node 19 the
+    // global agent keeps sockets alive, and Caddy closes them whenever a config
+    // change restarts its admin endpoint (see settleAdminRestart), so a pooled
+    // socket can be dead by the time the next request is written to it. Over a
+    // unix socket a connection per request is the right answer rather than the
+    // TCP path's wait: connecting is cheap, and Caddy hands the same socket to
+    // the new admin server by duplicating its descriptor (no unlink, no
+    // shared-listener deadline -- that bug is TCP on Windows only), so a fresh
+    // connect during the restart just queues in the backlog. A dedicated agent
+    // (keepAlive off) also sends `Connection: close`.
+    const req = httpRequest(
+      { socketPath, path, method, headers, agent: false, signal: AbortSignal.timeout(timeoutMs) },
+      (res) => {
+        const chunks: Buffer[] = [];
+        res.on("data", (chunk: Buffer) => chunks.push(chunk));
+        res.on("error", reject);
+        res.on("end", () => {
+          const status = res.statusCode ?? 0;
+          const etag = res.headers.etag;
+          resolve({
+            ok: status >= 200 && status < 300,
+            status,
+            text: Buffer.concat(chunks).toString("utf8"),
+            etag: typeof etag === "string" ? etag : undefined,
+          });
         });
-      });
-    });
+      },
+    );
     req.on("error", reject);
     if (body !== undefined) req.write(body);
     req.end();
   });
 }
 
-/** Send one request over TCP via the global fetch. */
+/**
+ * Send one request over TCP via the global fetch.
+ *
+ * Plain keep-alive: fetch pools its connections and the next request reuses
+ * one. That pooling is load-bearing -- see settleAdminRestart for the restart
+ * race it interacts with, and why the obvious alternative (`Connection: close`
+ * on every request) was measured and rejected.
+ */
 async function sendViaFetch(
   url: string,
   method: string,
@@ -413,12 +481,12 @@ async function sendViaFetch(
   body: string | undefined,
   timeoutMs: number,
 ): Promise<RawResponse> {
-  const res = await fetch(url, {
-    method,
-    headers,
-    body,
-    signal: AbortSignal.timeout(timeoutMs),
-  });
+  const pending = fetch(url, { method, headers, body, signal: AbortSignal.timeout(timeoutMs) });
+  // Node creates the global dispatcher synchronously inside the first fetch()
+  // call, so hooking here -- after the call, before the await -- still sees the
+  // `connect` event for the very first socket.
+  hookGlobalDispatcher();
+  const res = await pending;
   return {
     ok: res.ok,
     status: res.status,
@@ -427,7 +495,136 @@ async function sendViaFetch(
   };
 }
 
+/**
+ * The keep-alive sockets fetch currently holds, per origin, counted from the
+ * global dispatcher's `connect` / `disconnect` events. Node's fetch is undici,
+ * and undici's Agent emits one `connect` per socket it opens and one
+ * `disconnect` per socket that closes -- its own idle timeout, or the server
+ * hanging up -- with the origin as the first argument. The dispatcher lives at
+ * a well-known symbol (the same one Node's fetch reads on every call), so no
+ * import of undici is needed. If a future Node moves it, hookGlobalDispatcher
+ * finds nothing, the count stays empty, and settleAdminRestart is a no-op:
+ * the pre-fix behavior, never anything worse.
+ */
+const GLOBAL_DISPATCHER_KEY = Symbol.for("undici.globalDispatcher.1");
+interface DispatcherEvents {
+  on(event: "connect" | "disconnect", listener: (origin: unknown) => void): unknown;
+}
+const liveSockets = new Map<string, number>();
+const socketWaiters = new Set<() => void>();
+let dispatcherHooked = false;
+
+function hookGlobalDispatcher(): void {
+  if (dispatcherHooked) return;
+  const dispatcher = (globalThis as Record<symbol, unknown>)[GLOBAL_DISPATCHER_KEY] as DispatcherEvents | undefined;
+  if (!dispatcher || typeof dispatcher.on !== "function") return;
+  dispatcherHooked = true;
+  dispatcher.on("connect", (origin) => {
+    const key = originOf(origin);
+    if (key) liveSockets.set(key, (liveSockets.get(key) ?? 0) + 1);
+  });
+  dispatcher.on("disconnect", (origin) => {
+    const key = originOf(origin);
+    if (!key) return;
+    const left = Math.max(0, (liveSockets.get(key) ?? 0) - 1);
+    liveSockets.set(key, left);
+    if (left === 0) for (const wake of socketWaiters) wake();
+  });
+}
+
+/** undici passes the origin as a URL; normalize to the same form getAdminOrigin yields. */
+function originOf(origin: unknown): string | undefined {
+  try {
+    return new URL(String(origin)).origin;
+  } catch {
+    return undefined;
+  }
+}
+
+/**
+ * After a successful config change over TCP: wait until fetch holds no
+ * keep-alive socket to the admin origin, so the caller's NEXT request opens a
+ * fresh connection instead of reusing one Caddy is about to close.
+ *
+ * Why: Caddy restarts its admin endpoint after every config change (`POST
+ * /load`, and every POST/PUT/PATCH/DELETE under /config or /id). The old
+ * endpoint's shutdown closes each keep-alive connection -- the one that carried
+ * the change within a millisecond of its response (measured p99 0.3 ms on
+ * 2.11.4), the idle ones at the same moment. fetch pools those connections, so
+ * a request dispatched right after the response was written to a socket Caddy
+ * had just closed and came back as ECONNRESET / "other side closed", reported
+ * as "Cannot connect to Caddy admin API ... is Caddy running?" while Caddy was
+ * fine. Measured: 157 such failures in 15 runs of the live suite, every one on
+ * a reused socket with no response byte, none on a fresh connection.
+ *
+ * Why not retry the reset: GET/PATCH/DELETE already do, which is why those only
+ * ever looked slow. A POST under /config appends, and a reset does not prove
+ * Caddy never read the request -- only that no response arrived -- so replaying
+ * it risks a duplicate route. Waiting for the close means the POST is never
+ * written to a doomed socket in the first place, so there is nothing to replay.
+ *
+ * Why not `Connection: close` on every request: it also keeps requests off
+ * doomed sockets, but it makes the request after a config change open a fresh
+ * TCP connection the instant the response arrives, and on Windows that lands
+ * in a Caddy bug. Caddy stops the old admin server asynchronously; on platforms
+ * without SO_REUSEPORT the old and new servers share one listener, and the old
+ * server's Close() parks a past deadline on it that only the old accept loop
+ * clears -- and only if that loop is inside Accept() at that moment. A fresh
+ * connection accepted by the old loop right then leaves the deadline set for
+ * good, and the admin endpoint stops accepting until Caddy is restarted
+ * ("http: Accept error: accept tcp: i/o timeout; retrying" forever). Measured
+ * on a saturated host: two permanent wedges in about 1,400 restarts with
+ * `Connection: close`, none in 1,709 with keep-alive. Keep-alive never opens a
+ * fresh connection until Caddy has closed the pooled one, which happens after
+ * that Close() by construction, so the accept loop is parked when it matters.
+ *
+ * The wait is event-driven and short (the close arrives with the response);
+ * ADMIN_RESTART_SETTLE_MS caps it for the cases where no close is coming.
+ */
+function settleAdminRestart(origin: string | undefined): Promise<void> {
+  if (!origin || !dispatcherHooked || (liveSockets.get(origin) ?? 0) === 0) return Promise.resolve();
+  return new Promise((resolve) => {
+    const timer = setTimeout(done, ADMIN_RESTART_SETTLE_MS);
+    function check() {
+      if ((liveSockets.get(origin as string) ?? 0) === 0) done();
+    }
+    function done() {
+      clearTimeout(timer);
+      socketWaiters.delete(check);
+      resolve();
+    }
+    socketWaiters.add(check);
+  });
+}
+
+/** Whether a successful (method, path) makes Caddy load a new config and restart its admin endpoint. */
+function isConfigChange(method: string, path: string): boolean {
+  if (method === "GET") return false;
+  return path === "/load" || path.startsWith("/config/") || path.startsWith("/id/");
+}
+
+/** One attempt's result, plus the transport fact the retry policy needs. */
+interface Attempt<T> {
+  res: ApiResponse<T>;
+  /** The connection was refused: no byte of the request reached Caddy. */
+  refused: boolean;
+}
+
 async function attemptRequest<T = any>(
+  method: string,
+  path: string,
+  body?: unknown,
+  contentType?: string,
+  timeout?: number,
+  rawStringBody = false,
+): Promise<Attempt<T>> {
+  const transport = { refused: false };
+  const res = await sendOnce<T>(transport, method, path, body, contentType, timeout, rawStringBody);
+  return { res, refused: transport.refused };
+}
+
+async function sendOnce<T = any>(
+  transport: { refused: boolean },
   method: string,
   path: string,
   body?: unknown,
@@ -466,6 +663,11 @@ async function attemptRequest<T = any>(
     const res = socketPath
       ? await sendViaUnixSocket(socketPath, path, method, headers, serializedBody, effectiveTimeout)
       : await sendViaFetch(url, method, headers, serializedBody, effectiveTimeout);
+    // Caddy is now restarting its admin endpoint; hold the result until the
+    // pooled sockets it will close are gone, so the caller's next request
+    // cannot be written to one of them. Over a unix socket every request has
+    // its own connection (agent: false), so there is nothing to wait for.
+    if (!socketPath && res.ok && isConfigChange(method, path)) await settleAdminRestart(getAdminOrigin());
     const text = res.text;
 
     // Capture ETag from config GET responses
@@ -537,6 +739,7 @@ async function attemptRequest<T = any>(
       return { ok: true, status: res.status, data: text as T, etag };
     }
   } catch (err: unknown) {
+    transport.refused = isConnectionRefused(err);
     const msg = err instanceof Error ? err.message : String(err);
     // ENOENT is the unix-socket-specific shape: the socket file itself is not
     // there. Distinguish it from ECONNREFUSED (file present, nothing accepting)

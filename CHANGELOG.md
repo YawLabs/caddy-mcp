@@ -7,6 +7,23 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+- **A tool call right after a config change no longer fails with "Cannot
+  connect to Caddy admin API … is Caddy running?" while Caddy is fine.** Caddy
+  restarts its admin endpoint after every config load and closes the pooled
+  keep-alive connections; the next request could be written to a socket Caddy
+  had just closed. On Caddy 2.11.4 that hit 10 of 25 runs of the live suite
+  (157 failed requests in 15 runs, every one on a reused socket). After a
+  successful config change the client now waits — event-driven, capped at
+  250 ms — until no pooled socket to the admin origin remains, so the next
+  request opens a fresh connection; 50 of 50 runs pass with the change. A
+  refused connection is now retried for every method, including `POST` and
+  array-index `PUT`, because a refused connect proves nothing was sent; a reset
+  is still never replayed for a `POST`, which appends and would duplicate a
+  route. `Connection: close` on every request was measured and rejected: on
+  Windows it can leave Caddy's admin endpoint permanently refusing connections
+  (2 wedges in about 1,400 restarts, none with keep-alive).
+
 ### Changed
 - npm and MCP Registry listing metadata: bugs URL, core keywords, and
   server.json title/repository/websiteUrl
