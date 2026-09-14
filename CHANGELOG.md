@@ -7,6 +7,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed
+- **`@modelcontextprotocol/sdk` moves from `^1.29.0` to `^1.30.0`, and
+  `npm audit` is clean again (11 findings, 5 high, before).** The SDK is a runtime
+  dependency, so the new floor reaches everyone who installs this package; the
+  `overrides` floors, each raised to its advisories' first patched version,
+  shape only this repo's own tree. The SDK's transitive `fast-uri` 3.1.2 →
+  3.1.7, `hono` 4.12.26 → 4.13.7, `@hono/node-server` 1.19.13 → 1.19.17,
+  `ip-address` 10.2.0 → 10.7.0 (with `express-rate-limit` 8.3.2 → 8.7.0), `qs`
+  6.15.2 → 6.16.0 and `body-parser` 2.2.2 → 2.3.0 all clear their advisories,
+  as do the dev-only `vitest` 4.1.10 → 4.1.11, `postcss` 8.5.10 → 8.5.28 and
+  `nanoid` 3.3.11 → 3.3.19. The published `dist/` bundles none of these —
+  tsup leaves the SDK external — so no copy of `fast-uri` 3.1.2 shipped inside
+  this package; installs resolve the SDK's tree themselves.
+
 ## [2.5.1] — 2026-09-14
 
 ### Fixed
