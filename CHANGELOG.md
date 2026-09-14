@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [2.5.1] — 2026-09-14
+
 ### Fixed
 - **A tool call right after a config change no longer fails with "Cannot
   connect to Caddy admin API … is Caddy running?" while Caddy is fine.** Caddy
