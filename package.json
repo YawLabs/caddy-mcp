@@ -80,7 +80,8 @@
     "claude-code",
     "cursor",
     "devtools",
-    "ai"
+    "ai",
+    "ai-agents"
   ],
   "repository": {
     "type": "git",
