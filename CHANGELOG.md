@@ -5,10 +5,6 @@ All notable changes to this project are documented here.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-> **Note:** versions 1.1.0 through 1.2.4 were released without changelog
-> entries. See the [git tag list](https://github.com/YawLabs/caddy-mcp/tags)
-> and release notes for those versions.
-
 ## [Unreleased]
 
 ### Changed
@@ -20,9 +16,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   notes from that entry instead of from `git log` subjects. Before this, the
   script never touched this file: promotion was a separate hand-written
   commit when someone remembered, and otherwise the version got no entry at
-  all (2.5.0 below is backfilled; 2.4.1 and the versions the note at the top
-  admits to still have none), and every GitHub release page showed raw commit
-  subjects even when an entry existed. Keep-a-Changelog compare links are
+  all (2.5.0 below is backfilled, and 2.4.1 plus the twelve older versions
+  that had none have since been backfilled too), and every GitHub release page
+  showed raw commit subjects even when an entry existed. Keep-a-Changelog compare links are
   moved along too, should this file ever gain them.
 
 ## [2.5.0] — 2026-09-13
@@ -93,6 +89,34 @@ No functional changes. Republishes 2.4.2 under a new version.
   `CADDY_MCP_RUNTIME=auto` still falls back in-process without `--permission`, as
   it always has — set `CADDY_MCP_RUNTIME=oam` alongside the sandbox to make that
   a hard failure instead.
+
+## [2.4.1] — 2026-09-11
+
+Repository tooling, npm listing metadata and documentation only; no change to
+the server's behavior.
+
+### Changed
+- **`npm run lint` is a trustworthy gate on Windows ARM64.** Some
+  `@biomejs/cli-win32-arm64` builds crash on every check-shaped run — measured
+  on a win32-arm64 host, 2.5.4 exits 139 (while answering `--version` fine)
+  where 2.4.16 and 2.5.13 run correctly — and this repo has no CI to catch what
+  a crashed local lint let through. `lint` and `lint:fix` now route through
+  `scripts/lint.mjs`: when the host's native biome binary is unusable it
+  provisions the x64 build of the same version into a gitignored cache and
+  runs that under emulation, otherwise it is a passthrough, and the exit code
+  is biome's own. The version is read from `package-lock.json` (falling back
+  to the installed package), not from `biome.json`'s `$schema` — that pins
+  what the config validates against, not what the repo installs, and in most
+  sibling repos the lockfile is newer; on tailscale-mcp linting with the schema
+  version turned a release-blocking crash into a false pass. `release.sh`'s
+  `SKIP_LINT` comment no longer blames the npm wrapper or claims CI catches
+  lint regressions: there is no CI, so the hatch means publishing unlinted
+  (#45).
+- **npm listing metadata.** The package description leads with the noun people
+  search for and every claim in it is README-backed, the keyword list grew
+  from 8 to 18 terms, and `homepage` points at the server's page on yaw.sh
+  instead of the GitHub repo. Visible on npmjs.com from this version (#46).
+- README: a "Follow on X" badge in the top badge row (#42).
 
 ## [2.4.0] — 2026-08-31
 
@@ -307,6 +331,42 @@ No functional changes. Republishes 2.4.2 under a new version.
   the config has never been changed through the admin API — so the first write from
   caddy-mcp makes `systemctl reload caddy` a silent no-op.
 
+## [2.2.0] — 2026-08-08
+
+### Added
+- **Opt-in `--permission` sandbox.** `CADDY_MCP_SANDBOX=1` runs the server
+  under oam's permission model (oam 0.9.0+). The net grant is derived from
+  `CADDY_ADMIN_URL` (default `http://127.0.0.1:2019`) with host and port both
+  pinned, the environment allowlist is derived from what the shipped bundle
+  actually reads rather than hand-written, and filesystem and child-process
+  access stay denied — this server drives Caddy entirely over its admin HTTP
+  API and never shells out to the `caddy` binary. Opt-in rather than default
+  because a wrong grant does not fail loudly: oam denies a non-granted
+  environment variable by making it absent from `process.env` rather than
+  throwing, so an under-granted secret reads as "unauthenticated" rather than
+  "denied". (2.4.0 later found three faults that made the sandbox deny every
+  request; see that entry.)
+- **Tests that `server.json` and `package.json` agree.** `server.json` is what
+  the Official MCP Registry reads at publish time; it carries the version twice
+  (top-level and `packages[].version`) and `release.sh` bumps it separately
+  from `package.json`, so an edit that updates one and not the other ships a
+  desynced registry entry — visible to users, invisible to the release. Three
+  assertions now pin top-level version parity, per-package version parity, and
+  `mcpName` equal to `server.json`'s `name` (the registry keys on `name` while
+  npm consumers read `mcpName`, so disagreement puts discovery and install on
+  different identifiers). tailscale-mcp was the only server with this check,
+  and it caught a real skew during a release there (#28).
+
+### Changed
+- **The launcher requires oam 0.9.0.** It probes `oam --version`; below the
+  floor `CADDY_MCP_RUNTIME=auto` falls back to Node with a note on stderr and
+  `CADDY_MCP_RUNTIME=oam` is a hard error. Older oam ran
+  `child_process.execFile` arguments through a shell, accepted an `exec`
+  timeout and ignored it, truncated `spawnSync` at `maxBuffer` while reporting
+  success, and treated `stdio` `inherit`/`ignore` as `pipe`. (2.3.1 found that
+  the version check was defined but never called, so the floor was not
+  actually enforced until then; see that entry.)
+
 ## [2.1.0] — 2026-08-07
 
 ### Added
@@ -393,6 +453,150 @@ No functional changes. Republishes 2.4.2 under a new version.
   array-index semantics, and the ETag 412 path. Run with
   `CADDY_MCP_INTEGRATION=1` against a running Caddy.
 
+## [1.3.1] — 2026-06-11
+
+### Added
+
+- **Standalone single-file binaries.** Every release now builds a Node SEA
+  binary natively on each supported platform — linux-x64, win32-x64,
+  win32-arm64, darwin-arm64 and darwin-x64 — and attaches it to the GitHub
+  Release with a `.sha256` sidecar, so the server can run without a Node
+  install. Distribution is through the Scoop bucket (`scoop-yaw`) and the
+  Homebrew tap (`homebrew-yaw`), whose package-manager fetch sets no
+  quarantine or Mark-of-the-Web, so the unsigned (macOS: ad-hoc signed)
+  binaries run without Gatekeeper or SmartScreen friction;
+  `scripts/update-manifests.mjs` regenerates both manifests from the release's
+  hashes. Adopted from the shared `@yawlabs` binary pipeline, with everything
+  repo-specific derived from `package.json`.
+- **`caddy-mcp --version` (or `-V`)** prints the version and exits before the
+  stdio server starts, so the packaged binary and the CI smoke test can probe
+  it.
+
+### Changed
+
+- The version is substituted at build time in the single-binary bundle, and
+  read from `package.json` via `createRequire` only when unbundled. The SEA
+  bundle is CJS, where `import.meta.url` is empty, so the previous load-time
+  `createRequire(import.meta.url)` would have crashed the binary with
+  `ERR_INVALID_ARG_VALUE`. Behavior on Node is unchanged.
+
+## [1.3.0] — 2026-06-07
+
+### Changed
+
+- **`caddy_config_delete` and `caddy_config_by_id`'s `delete` action now
+  require `confirm=true`.** Deleting a parent path removes every descendant —
+  deleting `apps/http/servers/srv0` takes the server and all of its routes —
+  and these were the two destructive tools without a confirmation gate.
+  Callers that omit `confirm` now get a refusal naming the target instead of a
+  delete (#8).
+- Empty-body `401`/`403` errors hint `-- check CADDY_API_TOKEN` instead of a
+  bare `HTTP 401`; Caddy behind an auth proxy answers with no body, and the
+  bare code gave nothing to act on (#8).
+- `caddy_remove_route` by index distinguishes a missing `routes` key
+  (`no routes configured`, matching `caddy_list_routes`) from a malformed
+  non-array value (#8).
+- The "server does not exist" error names the tool that hit it, and the
+  metrics truncation footer reports `max_lines` so callers know the knob
+  exists (#8).
+- Bumped the `hono` override to `^4.12.21` (resolving 4.12.23) and added a
+  `qs` override at `^6.15.2`, regenerating the lockfile to clear five medium
+  Dependabot alerts in the MCP SDK's transitive tree: Set-Cookie injection via
+  the cookie helper, `app.mount()` undecoded-prefix routing, an IPv6 deny-rule
+  bypass, the JWT middleware accepting any auth scheme, and a `qs.stringify`
+  DoS on null/undefined entries in comma-format arrays. Dependabot's own
+  lockfile-only updates failed because they left the `overrides` block
+  inconsistent; bumping the floor and regenerating the lockfile together is
+  the working fix. These overrides scope to this repo's own dependency tree;
+  published consumers resolve their own from the two direct deps (#9).
+
+### Added
+
+- **`CADDY_TIMEOUT`** sets the timeout in ms for every admin API request other
+  than `/load` (which keeps `CADDY_LOAD_TIMEOUT`). The default is unchanged at
+  10s, with the same floor-then-bounds validation, so `0.5` cannot become an
+  instant-abort timeout (#8).
+- Ten tests for the new branches: the `CADDY_TIMEOUT` matrix including `/load`
+  isolation, the empty-body token hint, and missing-vs-malformed routes (#8).
+
+### Fixed
+
+- `caddy://config` and `caddy://upstreams` resource reads no longer emit
+  `text: undefined` on an empty body, matching the guard `caddy://servers`
+  already had (#8).
+
+## [1.2.9] — 2026-06-02
+
+Release tooling and README only; no change to the published package's
+behavior.
+
+### Fixed
+
+- **The README's "Add to Yaw MCP" badge is clickable again.** GitHub's Markdown
+  sanitizer strips `<a href>` values whose scheme is not on its allowlist, so a
+  badge linking straight to `yaw://install` rendered the image but dropped the
+  link — the click did nothing. It now points at `https://yaw.sh/mcp/install`,
+  which forwards the verbatim query to the `yaw://` install handler the app
+  registers.
+- **`release.sh` refuses to push when origin's tag has drifted from local.**
+  Before pushing the bump commit and tag it queries origin for the same tag
+  name and compares SHAs; if origin already has the tag at a different commit
+  (rewound elsewhere, or a parallel release race) it fails with a clear message
+  instead of continuing. `git push --follow-tags` silently skips a tag that
+  already exists on the remote, so without the guard the main push would
+  succeed, origin's tag would stay on the old SHA, and `gh release create`
+  would publish a GitHub release linked to that stale commit while npm carried
+  the new one. A follow-up compares tag-object SHAs on both sides, so a resume
+  run of the same release no longer false-aborts against its own tag, and the
+  comment describing the hazard was corrected to match the real failure mode.
+- `SKIP_LINT=1` escape hatch in `release.sh` for hosts where the lint runner is
+  broken: `npm`/`pnpm` `lint*` subcommands become no-ops for that run. Meant
+  for the MINGW64-ARM64 case at the time, and only for a broken runner, not
+  routine use.
+
+## [1.2.8] — 2026-05-28
+
+Release tooling and README only; no change to the published package's
+behavior.
+
+### Changed
+
+- **Releases run end-to-end from the workstation; GitHub Actions is out of the
+  release path.** The MCP Registry publish (`server.json` sync,
+  `mcp-publisher` install, login, publish) moved from `release.yml` into
+  `release.sh` as its own step between the GitHub release and verification,
+  authenticating with `MCP_REGISTRY_TOKEN` — or, when that is unset, the
+  `gh auth token` session, whose `admin:org` scope covers the `read:org` claim
+  the `io.github.YawLabs/*` namespace needs. `release.yml`, `ci.yml`,
+  `deprecate.yml` and the `.github/workflows` directory are deleted. Along the
+  way `release.sh` keeps `server.json`'s version in sync with `package.json` on
+  every invocation, not only on the bump branch: a resume run that skipped the
+  bump used to leave `server.json` on the previous version, and the registry
+  publish then failed with "cannot publish duplicate version".
+- Before that removal, `release.sh` learned to hand off to CI instead of racing
+  it: when a `v*` tag push triggers a CI publish, the workstation watches that
+  run and verifies with `npm view` rather than also publishing itself, which
+  had produced E409 "cannot publish over previously published" on a lost race
+  and E404 on a stale `~/.npmrc` session. A review pass then tightened the
+  handoff — the CI-detection grep no longer matches any workflow that merely
+  runs `release.sh`, the run-id lookup backs off exponentially, npm
+  propagation verification runs up to 60s and warns rather than fails, the tag
+  is verified on origin before the run lookup, and a resume warns if the most
+  recent Release run for the tag did not succeed. Superseded within this same
+  version by the workstation-only flow above.
+- `release.sh`'s "Continue?" prompt is gated on stdin being a TTY, so headless
+  invocations proceed (with an info line) instead of aborting under
+  `set -euo pipefail`; and `npm pkg fix` normalized the `bin` path to
+  `dist/index.js`, silencing the "script name ... was invalid and removed"
+  warning npm printed on every publish.
+- README: the install badge is an "Add to Yaw MCP" `yaw://install` deep link
+  that fires Yaw Terminal's local protocol handler (which shows a confirmation
+  dialog with the verbatim command, args, env keys and source before writing
+  `~/.yaw-mcp/config.json`), replacing the mcp.hosting cloud-account badge; and
+  the `npx` spawn is pinned to `@latest`, so each MCP session re-resolves
+  against the registry and picks up the newest published version instead of
+  whatever sits in the npx metadata cache.
+
 ## [1.2.7] — 2026-05-19
 
 ### Fixed
@@ -445,6 +649,178 @@ No functional changes. Republishes 2.4.2 under a new version.
   doesn't silently get 5.
 - **Dropped a stale doc claim** on `cleanUpstreamAddr` -- the helper strips
   scheme and trailing slashes, it does not validate host:port.
+
+## [1.2.4] — 2026-05-15
+
+### Added
+
+- **Published to the Official MCP Registry.** Each release is now submitted to
+  registry.modelcontextprotocol.io as `io.github.YawLabs/caddy-mcp`: a
+  `server.json` describes the server and its npm package, `package.json`
+  carries the matching `mcpName`, and the release workflow publishes it with
+  OIDC — the `id-token: write` permission already granted for npm provenance
+  covers the registry too, so there is no registry secret to manage. This
+  version exists to exercise that step end to end.
+
+### Changed
+
+- README documents the 1.2.3 behavior: `CADDY_MAX_RETRIES` notes that POSTs to
+  `/config/*` and `/id/*` skip retry, `caddy://metrics` notes its 500-line
+  cap, and the test count is 182.
+
+## [1.2.3] — 2026-05-15
+
+### Fixed
+
+- **Non-idempotent POSTs are no longer retried.** The retry policy is split by
+  method and path: a POST to `/config/*` or `/id/*` appends or creates, so
+  retrying a request whose first attempt may have landed could duplicate a
+  route or 409 a half-applied create. POSTs to `/load`, `/adapt` and `/stop`
+  still retry under the normal transient-failure rules.
+- **`caddy_reverse_proxy` strips an explicit `:port` from the `from` host.**
+  Caddy host matchers compare against the `Host` header with the port
+  removed, so `example.com:8080` produced a matcher that never fired. The IPv6
+  bracket form is handled and a non-numeric suffix is left alone.
+- **`caddy://metrics` is capped.** The resource dumped the unbounded metrics
+  body; it now goes through the same controls as `caddy_metrics` (500 lines by
+  default). When truncation drops the `# EOF` marker in the tail, the marker
+  is re-emitted so the output stays a well-formed Prometheus exposition.
+- **`caddy_load` snapshots the prior config only after the load succeeds**,
+  mirroring `caddy_revert apply`: a failed load changed nothing server-side,
+  so pushing a snapshot for it only consumed a slot in the 10-deep ring and
+  shifted the earlier rollback targets one position deeper.
+- `caddy_adapt`'s adapter-name check is case-sensitive: Caddy registers
+  adapters in lowercase, so `Caddyfile` is rejected up front rather than sent
+  on to fail.
+- README's "Add to mcp.hosting" install link dropped the sensitive env
+  parameter the `/install` parser rejects.
+
+### Added
+
+- `deprecate.yml`: a `workflow_dispatch` workflow that runs `npm deprecate`
+  from CI with the org `NPM_TOKEN`, so deprecating a version range needs no
+  local WebAuthn session; its verify step retries the public-registry view to
+  outlast CDN propagation lag.
+
+## [1.2.2] — 2026-05-13
+
+Documentation only; no change to the published package's behavior.
+
+### Changed
+
+- `caddy_adapt`'s description and the README say it accepts any adapter module
+  Caddy was built with — `caddyfile` (built in), `nginx` via
+  caddy-nginx-adapter, `yaml` via caddy-yaml — instead of implying Caddyfile
+  plus a vague "or other config format". Users porting from nginx or yaml did
+  not know one tool already covered it.
+
+## [1.2.1] — 2026-05-13
+
+### Changed
+
+- Bumped the `hono` override to `^4.12.18` and added a `fast-uri` override at
+  `^3.1.2`, regenerating the lockfile to clear seven Dependabot alerts (two
+  high in `fast-uri`, five medium/low in `hono`). Both are transitive — `hono`
+  via the MCP SDK and `@hono/node-server`, `fast-uri` via `ajv` — and the
+  existing `hono` override allowed the patch range while the lockfile stayed
+  pinned to 4.12.14. Runtime impact for this server is nil: the stdio
+  transport does not expose the affected surface.
+- README documents `CADDY_LOAD_TIMEOUT` in the environment-variable table. It
+  shipped in 1.2.0 but was missing there, so users hitting ACME-heavy `/load`
+  timeouts would not have found the escape hatch.
+
+## [1.2.0] — 2026-05-13
+
+### Added
+
+- **`CADDY_LOAD_TIMEOUT`** overrides the `/load` timeout (default 60s) for
+  ACME-heavy bring-ups, where provisioning many certificates can exceed the
+  default. The value is floored before it is bounds-checked, so
+  `CADDY_LOAD_TIMEOUT=0.5` falls back to the default instead of slipping past
+  the `n > 0` check as a 0ms instant-abort timeout.
+- Live-Caddy integration test for the `@id` contract `caddy_reverse_proxy`
+  depends on — a POST with `@id` embedded registers it, `GET /id/<unknown>` is
+  non-OK, `PUT /id/<known>` replaces in place — so a Caddy version that changes
+  `@id` semantics is caught.
+- `.github/workflows/ci.yml`: lint, typecheck, build and test on Node 20 and
+  22 for every push to `main` and every PR. The build step is deliberate:
+  vitest runs from source and never exercises tsup, so an explicit build
+  catches bundler errors at PR time rather than release time.
+- README covers the 1.1.0 tool surface: `caddy_reverse_proxy`'s `id` parameter,
+  `caddy_metrics`' `filter` and `max_lines`, and `caddy_tls`'s deep-merge and
+  refuse-on-shape behavior, with two new examples.
+
+### Fixed
+
+- **`caddy_revert apply` defers its pre-revert snapshot until `/load`
+  succeeds**, so a failed revert no longer shifts `apply 0` onto the failed
+  attempt's pre-state.
+- **`caddy_load` and `caddy_revert save` only snapshot non-null object
+  bodies.** Empty strings, arrays and primitives cannot be replayed through
+  `/load`; `save` now reports an empty or non-JSON-object body rather than the
+  misleading "no config loaded".
+- **`caddy_metrics` filter mode preserves `# EOF`**, including on CRLF input
+  and with trailing whitespace, so strict Prometheus parsers do not break on
+  filtered output.
+- `caddy_status` reads the ACME email strictly from
+  `policies[0].issuers[0].email`, the field `caddy_tls set_email` writes, so
+  the two agree.
+
+### Changed
+
+- **Publishing moved to CI on tag push.** The local-only path required an
+  active npm WebAuthn session in `~/.npmrc`, which expires silently and
+  produces a misleading 404 on publish; `release.yml` now fires on `v*` tags
+  and publishes with the org `NPM_TOKEN`, with `workflow_dispatch` as an
+  escape hatch, and `release.sh` learned a CI mode that derives the version
+  from the tag and gates `--provenance` on CI, where OIDC signing is
+  available. Tags are annotated so `git push --follow-tags` actually pushes
+  them (lightweight tags are silently skipped), `--follow-tags` replaces
+  `--tags` so stale local tags do not ride along, the npm idempotency check
+  pins the exact version instead of asking for `latest`, and the workflow's
+  concurrency group is a literal `release-npm` rather than a per-tag key that
+  serialized nothing.
+- Pinned `ip-address` to `>=10.1.1` (transitive via the MCP SDK and
+  `express-rate-limit`) to clear GHSA-v2v4-37r5-5v8g; the advisory is XSS in
+  `Address6`'s HTML-emitting methods and this server emits no HTML, so the
+  functional impact is nil.
+
+## [1.1.0] — 2026-05-06
+
+### Added
+
+- **`caddy_reverse_proxy` takes an optional `id`** for stable `@id`-keyed
+  routes. It reads first: when the `@id` resolves to a route it replaces in
+  place, when it resolves to something that is not a route it refuses rather
+  than clobbering it, and on first create it registers via POST. (2.0.0 later
+  found the in-place replace used `PUT`, which inserts at an array position,
+  and moved it to `PATCH`; see that entry.)
+- **`caddy_metrics` takes `filter`** (a metric-name substring) **and
+  `max_lines`** (default 500) to bound the output; `HELP`/`TYPE` lines for the
+  retained metrics are preserved.
+
+### Fixed
+
+- **`caddy_tls`'s PATCH fallback no longer clobbers an existing `apps/tls`.**
+  It deep-merges into the issuer path and writes the result back, preserving
+  siblings such as `on_demand`, `certificate_authorities` and additional
+  policies, and refuses with a shape-specific error when the structure is not
+  what it expects.
+- The ETag cache is refreshed per method on writes — `PATCH`/`PUT` refresh the
+  entry, `POST`/`DELETE` invalidate it — and path-traversal rejection is
+  extended to `caddy_config_by_id`'s `id` and the `ca` argument of the PKI
+  reads.
+- A bare trailing slash in `from` is dropped: `example.com/` is a host-only
+  matcher now, where before the `/` path matched only the literal root.
+
+### Changed
+
+- Releases run through `release.sh` alone — bump, commit, tag, push,
+  `npm publish --provenance`, `gh release create` — with the GitHub Actions
+  workflows removed; the README's CI and release badges went with them.
+  (Reinstated in 1.2.0.)
+- Pinned `postcss` to `>=8.5.10` (transitive via tsup and vitest) to clear a
+  moderate XSS advisory; `npm audit` reports 0 vulnerabilities.
 
 ## [1.0.1] — 2026-04-24
 
@@ -533,6 +909,46 @@ First stable release. API surface is now frozen under semver.
 - Credential scrubbing in connect-failed errors — only the origin is shown, not
   path or query.
 
+## [0.1.1] — 2026-04-10
+
+### Added
+
+- **Three new tools (13 → 16):** `caddy_config_by_id` (get/set/delete through
+  Caddy's `/id/<id>` endpoint), `caddy_list_servers` (server names, listen
+  addresses and route counts) and `caddy_metrics` (Prometheus metrics from
+  `/metrics`).
+- **ETag-based optimistic concurrency on config writes**, on `/id/` paths as
+  well as `/config/` paths, so a write on a stale read fails with 412 rather
+  than clobbering a concurrent change.
+- `caddy_load` accepts a Caddyfile via the `text/caddyfile` content type, with
+  a 60s timeout for certificate provisioning; `caddy_config_set`'s modes are
+  `append`, `overwrite` and `insert`, the last a new `PUT` mode for array
+  positions.
+- Regex input validation on the `server`, `ca` and `id` parameters.
+
+### Fixed
+
+- `normalizePath` no longer corrupts paths that start with `config`.
+- `caddy_tls` falls back to `POST` when `PATCH` fails on a fresh Caddy
+  instance that has no `apps/tls` yet.
+- No `Content-Type` header is sent on bodyless `GET`/`DELETE` requests.
+- `from` has its `http://`/`https://` scheme stripped before parsing, and
+  upstream addresses are stripped of schemes and trailing slashes.
+- Removed a duplicate entry-point auto-start in `server.ts`.
+- An actionable error when the target server does not exist, instead of
+  Caddy's raw body.
+
+### Changed
+
+- `caddy_list_routes` shows `@id`, `group`, and more matcher and handler
+  detail; `caddy_adapt` separates warnings from the adapted JSON;
+  `caddy_status` distinguishes enabled, automatic and HTTP-only TLS; an empty
+  response renders as `OK` instead of a blank result.
+- Dependencies moved to their latest majors — zod 3 → 4, TypeScript 5 → 6,
+  Biome 1 → 2, vitest 3 → 4 — and the README lists the three tools it was
+  missing with the corrected count.
+- Tests: 23 → 67, with behavioral tests for every tool handler.
+
 ## [0.1.0] — Initial release
 
 - 13 MCP tools covering the Caddy admin API: config get/set/delete/load, reverse
@@ -540,8 +956,21 @@ First stable release. API surface is now frozen under semver.
 - stdio transport, MCP tool annotations (`readOnlyHint`, `destructiveHint`,
   `idempotentHint`).
 
+[2.4.1]: https://github.com/YawLabs/caddy-mcp/releases/tag/v2.4.1
+[2.2.0]: https://github.com/YawLabs/caddy-mcp/releases/tag/v2.2.0
+[1.3.1]: https://github.com/YawLabs/caddy-mcp/releases/tag/v1.3.1
+[1.3.0]: https://github.com/YawLabs/caddy-mcp/releases/tag/v1.3.0
+[1.2.9]: https://github.com/YawLabs/caddy-mcp/releases/tag/v1.2.9
+[1.2.8]: https://github.com/YawLabs/caddy-mcp/releases/tag/v1.2.8
+[1.2.4]: https://github.com/YawLabs/caddy-mcp/releases/tag/v1.2.4
+[1.2.3]: https://github.com/YawLabs/caddy-mcp/releases/tag/v1.2.3
+[1.2.2]: https://github.com/YawLabs/caddy-mcp/releases/tag/v1.2.2
+[1.2.1]: https://github.com/YawLabs/caddy-mcp/releases/tag/v1.2.1
+[1.2.0]: https://github.com/YawLabs/caddy-mcp/releases/tag/v1.2.0
+[1.1.0]: https://github.com/YawLabs/caddy-mcp/releases/tag/v1.1.0
 [1.0.0]: https://github.com/YawLabs/caddy-mcp/releases/tag/v1.0.0
 [0.3.1]: https://github.com/YawLabs/caddy-mcp/releases/tag/v0.3.1
 [0.3.0]: https://github.com/YawLabs/caddy-mcp/releases/tag/v0.3.0
 [0.2.0]: https://github.com/YawLabs/caddy-mcp/releases/tag/v0.2.0
+[0.1.1]: https://github.com/YawLabs/caddy-mcp/releases/tag/v0.1.1
 [0.1.0]: https://github.com/YawLabs/caddy-mcp/releases/tag/v0.1.0
