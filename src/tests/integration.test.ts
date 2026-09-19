@@ -1,9 +1,14 @@
+import { mkdtempSync, rmSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import { beforeAll, beforeEach, describe, expect, it } from "vitest";
 import type { ApiResponse } from "../api.js";
 import * as api from "../api.js";
 import { registerAdaptTools } from "../tools/adapt.js";
+import { registerConfigTools } from "../tools/config.js";
 import { registerOperationalTools } from "../tools/operational.js";
 import { registerRouteTools } from "../tools/routes.js";
+import { registerTlsTools } from "../tools/tls.js";
 
 const RUN = process.env.CADDY_MCP_INTEGRATION === "1";
 
@@ -344,6 +349,144 @@ describe.skipIf(!RUN)("integration: live Caddy admin API", () => {
     expect(res.error).toContain("key does not exist");
   });
 
+  // THE FOOTGUN that hid a wrong config path for three minor versions. Caddy
+  // answers a GET of ANY missing final key with 200 null -- it does not 404, and
+  // it does not distinguish "a real key that is not set" from "a key that cannot
+  // exist". caddy_tls ech_status read apps/tls/ech, which is only the Caddyfile
+  // global option's name; the JSON key is encrypted_client_hello. Both come back
+  // as the same 200 null, so the action said "not configured" with ECH on or off
+  // and its mocked unit test, which pinned the wrong path, passed throughout.
+  //
+  // So this pins three things no mock can: a typo'd key is indistinguishable from
+  // an unset one on a GET; the wrong key can never be PRESENT either, because a
+  // load carrying it is rejected; and a missing PARENT is a 400, not a null.
+  it("GET of a missing final key is 200 null -- for the real ECH key AND for any unknown sibling", async () => {
+    const loadRes = await loadAndSettle({
+      apps: { tls: { automation: { policies: [{ issuers: [{ module: "acme", email: "a@b.test" }] }] } } },
+    });
+    assertOk(loadRes, "loadConfig apps/tls without ECH");
+
+    for (const key of ["encrypted_client_hello", "ech", "no_such_key_at_all"]) {
+      const res = await api.configGet(`apps/tls/${key}`);
+      assertOk(res, `configGet apps/tls/${key}`);
+      expect(res.status, key).toBe(200);
+      expect(res.data, key).toBeNull();
+    }
+
+    // The wrong key cannot be loaded, so reading it could only ever return null.
+    // (A failed load leaves the running config untouched, so no settle needed.)
+    const bad = await api.loadConfig({ apps: { tls: { ech: { configs: [{ public_name: "ech.example.test" }] } } } });
+    expect(bad.ok).toBe(false);
+    expect(bad.status).toBe(400);
+    // The error is Caddy's raw JSON body, so the quotes around the field name
+    // arrive backslash-escaped; tolerate either form.
+    expect(bad.error).toMatch(/unknown field \\?"ech\\?"/);
+  });
+
+  it("GET under a missing parent is a 400 traversal failure, not a null and not a 404", async () => {
+    // beforeEach left the config at {} -- no `apps` key.
+    const noApps = await api.configGet("apps/tls/encrypted_client_hello");
+    expect(noApps.ok).toBe(false);
+    expect(noApps.status).toBe(400);
+    expect(noApps.error).toContain("invalid traversal path at: config/apps/tls");
+    expect(api.isMissingConfigPath(noApps)).toBe(true);
+
+    // The most common real shape: apps.http only. apps/tls itself is a missing
+    // FINAL key (200 null); one level below it is a missing PARENT (400).
+    const loadRes = await loadAndSettle({ apps: { http: { servers: { srv0: { listen: [":18868"], routes: [] } } } } });
+    assertOk(loadRes, "loadConfig http-only");
+
+    const tls = await api.configGet("apps/tls");
+    assertOk(tls, "configGet apps/tls on an http-only config");
+    expect(tls.data).toBeNull();
+
+    const ech = await api.configGet("apps/tls/encrypted_client_hello");
+    expect(ech.ok).toBe(false);
+    expect(ech.status).toBe(400);
+    expect(ech.error).toContain("invalid traversal path at: config/apps/tls/encrypted_client_hello");
+    expect(api.isMissingConfigPath(ech)).toBe(true);
+  });
+
+  // Pins the verb semantics caddy_tls's CREATE branch depends on, and that the
+  // serverNotFoundError recipe depends on. POST walks the path and fails where a
+  // parent is missing; PUT makes the parents as it goes. This predates every
+  // Caddy the MCP supports (the branch dates from 2019) -- the MCP simply never
+  // used it, and told operators that caddy_config_set "cannot create the
+  // apps/http tree" when one mode:"insert" call does exactly that.
+  it("PUT creates missing parent objects; POST and PATCH cannot", async () => {
+    // A truly config-less instance: what a bare `caddy run` starts with. Loading
+    // {} is not the same state -- that leaves an object with no `apps` key.
+    const cleared = await api.configDelete("");
+    assertOk(cleared, "configDelete whole config");
+    const root = await api.configGet("");
+    assertOk(root, "configGet root");
+    expect(root.data).toBeNull();
+
+    const fresh = { automation: { policies: [{ issuers: [{ module: "acme", email: "a@b.test" }] }] } };
+
+    const getRes = await api.configGet("apps/tls");
+    expect(getRes.ok).toBe(false);
+    expect(getRes.status).toBe(400);
+    expect(getRes.error).toContain("invalid traversal path at: config/apps");
+
+    const postRes = await api.configPost("apps/tls", fresh);
+    expect(postRes.ok).toBe(false);
+    expect(postRes.status).toBe(500);
+    expect(api.isMissingConfigPath(postRes)).toBe(true);
+
+    const patchRes = await api.configPatch("apps/tls/automation/policies/0/issuers/0/email", "a@b.test");
+    expect(patchRes.ok).toBe(false);
+    expect(api.isMissingConfigPath(patchRes)).toBe(true);
+
+    const putRes = await api.configPut("apps/tls", fresh);
+    assertOk(putRes, "configPut apps/tls on a null config");
+
+    const after = await api.configGet("");
+    assertOk(after, "configGet root after PUT");
+    expect(after.data).toEqual({ apps: { tls: fresh } });
+
+    // Strictly-create: the second PUT conflicts instead of overwriting.
+    const again = await api.configPut("apps/tls", fresh);
+    expect(again.ok).toBe(false);
+    expect(again.status).toBe(409);
+    expect(again.error).toContain("key already exists: tls");
+  });
+
+  // Why the create-it recipes name mode "insert" and not "append": POST on an
+  // object key that already exists REPLACES it and reports success. For a server,
+  // that is every route gone behind a 200.
+  it("POST over an existing object key replaces it; PUT answers 409 and leaves it alone", async () => {
+    const loadRes = await loadAndSettle({
+      apps: {
+        http: {
+          servers: {
+            srv0: {
+              listen: [":18869"],
+              routes: [{ handle: [{ handler: "static_response", status_code: 204 }] }],
+            },
+          },
+        },
+      },
+    });
+    assertOk(loadRes, "loadConfig one server with a route");
+
+    const replacement = { listen: [":18869"], routes: [] };
+
+    const putRes = await api.configPut("apps/http/servers/srv0", replacement);
+    expect(putRes.ok).toBe(false);
+    expect(putRes.status).toBe(409);
+    expect(putRes.error).toContain("key already exists: srv0");
+    const afterPut = await api.configGet<unknown[]>("apps/http/servers/srv0/routes");
+    assertOk(afterPut, "configGet routes after the refused PUT");
+    expect(afterPut.data).toHaveLength(1);
+
+    const postRes = await api.configPost("apps/http/servers/srv0", replacement);
+    assertOk(postRes, "configPost over the existing server");
+    const afterPost = await api.configGet<unknown[]>("apps/http/servers/srv0/routes");
+    assertOk(afterPost, "configGet routes after the POST");
+    expect(afterPost.data).toEqual([]);
+  });
+
   // A config write's body is a JSON value, so a string must be JSON-encoded.
   // Sending it bare makes Caddy answer 500 "decoding request body: invalid
   // character ...". Mocked tests cannot see this, which is how every
@@ -442,7 +585,11 @@ describe.skipIf(!RUN)("integration: live Caddy admin API", () => {
       const result = await handler({ server: "does-not-exist" });
       expect(result.isError).toBe(true);
       expect(result.content[0].text).toContain('Server "does-not-exist" does not exist');
-      expect(result.content[0].text).toContain("caddy_load");
+      // The recipe must be one that works in THIS state. It used to send the
+      // operator to caddy_load, claiming caddy_config_set "cannot create the
+      // apps/http tree"; mode "insert" (PUT) creates it -- proven two tests down.
+      expect(result.content[0].text).toContain('mode: "insert"');
+      expect(result.content[0].text).not.toContain("caddy_load");
       expect(result.content[0].text).not.toContain("invalid traversal path");
       expect(result.content[0].text).not.toContain("no routes configured");
     });
@@ -467,24 +614,233 @@ describe.skipIf(!RUN)("integration: live Caddy admin API", () => {
 
     // The advice has to WORK, not merely read well: following it verbatim must
     // produce a server that accepts its first route. The original text omitted
-    // both `routes: []` and mode "append", so an operator who followed it hit
-    // "cannot unmarshal object into ... RouteList" on their very next call.
+    // both `routes: []` and the mode, so an operator who followed it hit
+    // "cannot unmarshal object into ... RouteList" on their very next call. Its
+    // successor named mode "append", and was only ever tested HERE -- beside a
+    // pre-seeded apps/http -- which is the one state where a POST can create the
+    // key. The recipe is reached on a traversal failure, i.e. precisely when the
+    // parents may be missing; the next test is the state that matters.
     it("the create-it advice actually produces a usable server", async () => {
       const loaded = await loadAndSettle({ apps: { http: { servers: { srv0: { listen: [":18876"], routes: [] } } } } });
       assertOk(loaded, "loadConfig seed server");
 
-      // Exactly what serverNotFoundError tells the operator to do.
-      const create = await api.configPost("apps/http/servers/fresh", {
-        listen: [":18877"],
-        routes: [],
-        automatic_https: { disable_redirects: true },
+      // Exactly what serverNotFoundError tells the operator to do, through the
+      // tool it names. (Handlers bypass zod, so every argument is explicit.)
+      const configSet = getHandler(registerConfigTools, "caddy_config_set");
+      const create = await configSet({
+        path: "apps/http/servers/fresh",
+        mode: "insert",
+        value: { listen: [":18877"], routes: [], automatic_https: { disable_redirects: true } },
       });
-      assertOk(create, "create server per the advice");
+      expect(create.isError, create.content?.[0]?.text).toBeFalsy();
 
       const handler = getHandler(registerRouteTools, "caddy_reverse_proxy");
       const added = await handler({ from: "/api", to: ["localhost:3000"], server: "fresh" });
       expect(added.isError, added.content?.[0]?.text).toBeFalsy();
       expect(added.content[0].text).toContain("Route added");
+
+      // And the safety half of the recipe: run it again and the existing server,
+      // route and all, is refused rather than replaced.
+      const repeat = await configSet({
+        path: "apps/http/servers/fresh",
+        mode: "insert",
+        value: { listen: [":18877"], routes: [] },
+      });
+      expect(repeat.isError).toBe(true);
+      expect(repeat.content[0].text).toContain("key already exists: fresh");
+      const routes = await api.configGet<unknown[]>("apps/http/servers/fresh/routes");
+      assertOk(routes, "configGet routes after the refused repeat");
+      expect(routes.data).toHaveLength(1);
+    });
+
+    // The state serverNotFoundError said caddy_config_set could not handle: "On
+    // an instance with no config at all, use caddy_load instead". False on
+    // 2.11.4 -- and the same recipe with mode "append" fails here with 500
+    // "invalid traversal path", so the old advice did not work where it was given.
+    it.each([
+      ["a config of {}", async () => {}],
+      [
+        "no config at all (null)",
+        async () => {
+          assertOk(await api.configDelete(""), "configDelete whole config");
+        },
+      ],
+    ])("the create-it advice works on %s, where mode 'append' cannot", async (_label, arrange) => {
+      await arrange();
+
+      const configSet = getHandler(registerConfigTools, "caddy_config_set");
+      const value = { listen: [":18878"], routes: [], automatic_https: { disable_redirects: true } };
+
+      const appended = await configSet({ path: "apps/http/servers/fresh", mode: "append", value });
+      expect(appended.isError).toBe(true);
+      expect(appended.content[0].text).toContain("invalid traversal path");
+
+      const inserted = await configSet({ path: "apps/http/servers/fresh", mode: "insert", value });
+      expect(inserted.isError, inserted.content?.[0]?.text).toBeFalsy();
+
+      const handler = getHandler(registerRouteTools, "caddy_reverse_proxy");
+      const added = await handler({ from: "/api", to: ["localhost:3000"], server: "fresh" });
+      expect(added.isError, added.content?.[0]?.text).toBeFalsy();
+      expect(added.content[0].text).toContain("Route added");
+    });
+
+    // "Works on both fresh and existing Caddy instances", the tool description
+    // says. It did not: on either fresh state below, every set_* action came back
+    // as two raw Go errors, because the fallback's GET fails the path walk with a
+    // 400 rather than the 404 it was written for -- and the POST it would have
+    // sent cannot create apps/tls without an `apps` parent anyway.
+    it.each([
+      ["a config of {}", async () => {}],
+      [
+        "no config at all (null)",
+        async () => {
+          assertOk(await api.configDelete(""), "configDelete whole config");
+          const root = await api.configGet("");
+          assertOk(root, "configGet root");
+          expect(root.data).toBeNull();
+        },
+      ],
+    ])("caddy_tls set_* builds apps/tls from %s", async (_label, arrange) => {
+      await arrange();
+      const handler = getHandler(registerTlsTools, "caddy_tls");
+
+      // 1. Nothing to PATCH, nothing to GET: the create-PUT makes `apps` too.
+      const email = await handler({ action: "set_email", email: "ops@example.test" });
+      expect(email.isError, email.content?.[0]?.text).toBeFalsy();
+      expect(email.content[0].text).toBe("ACME email set to: ops@example.test");
+
+      // 2. and 3. The issuer now exists but carries neither key, so these take
+      // the merge branch -- which must keep what step 1 wrote.
+      const ca = await handler({ action: "set_acme_ca", ca: "https://acme.example.test/directory" });
+      expect(ca.isError, ca.content?.[0]?.text).toBeFalsy();
+      const profile = await handler({ action: "set_acme_profile", profile: "shortlived" });
+      expect(profile.isError, profile.content?.[0]?.text).toBeFalsy();
+
+      const tls = await api.configGet("apps/tls");
+      assertOk(tls, "configGet apps/tls");
+      expect(tls.data).toEqual({
+        automation: {
+          policies: [
+            {
+              issuers: [
+                {
+                  module: "acme",
+                  email: "ops@example.test",
+                  ca: "https://acme.example.test/directory",
+                  profile: "shortlived",
+                },
+              ],
+            },
+          ],
+        },
+      });
+    });
+
+    it("caddy_tls set_email still creates apps/tls beside an existing apps/http", async () => {
+      // The one absent-state the old POST did handle (GET 200 null). It must keep
+      // working through the PUT, and must not disturb the sibling app.
+      const loaded = await loadAndSettle({ apps: { http: { servers: { srv0: { listen: [":18879"], routes: [] } } } } });
+      assertOk(loaded, "loadConfig http-only");
+
+      const handler = getHandler(registerTlsTools, "caddy_tls");
+      const result = await handler({ action: "set_email", email: "ops@example.test" });
+      expect(result.isError, result.content?.[0]?.text).toBeFalsy();
+
+      const apps = await api.configGet<{ http?: unknown; tls?: unknown }>("apps");
+      assertOk(apps, "configGet apps");
+      expect(apps.data?.http).toEqual({ servers: { srv0: { listen: [":18879"], routes: [] } } });
+      expect(apps.data?.tls).toEqual({
+        automation: { policies: [{ issuers: [{ module: "acme", email: "ops@example.test" }] }] },
+      });
+    });
+
+    // Every state in which ECH is off, and none of them is an error. The first
+    // two fail the GET outright (400 traversal) and used to reach the caller raw;
+    // the http-only one is the most common real config there is.
+    it("caddy_tls ech_status and status say 'not set' on every ECH-less state, never a Go error", async () => {
+      const handler = getHandler(registerTlsTools, "caddy_tls");
+
+      const expectNotConfigured = async (label: string) => {
+        const result = await handler({ action: "ech_status" });
+        expect(result.isError, `${label}: ${result.content?.[0]?.text}`).toBeFalsy();
+        expect(result.content[0].text, label).toContain("ECH (Encrypted ClientHello) is not configured");
+        expect(result.content[0].text, label).not.toContain("invalid traversal path");
+      };
+      const expectNoTlsConfig = async (label: string) => {
+        const result = await handler({ action: "status" });
+        expect(result.isError, `${label}: ${result.content?.[0]?.text}`).toBeFalsy();
+        expect(result.content[0].text, label).toContain("No TLS config is set");
+      };
+
+      // {} from beforeEach: no `apps` key.
+      await expectNotConfigured("config {}");
+      await expectNoTlsConfig("config {}");
+
+      assertOk(await api.configDelete(""), "configDelete whole config");
+      await expectNotConfigured("null config");
+      await expectNoTlsConfig("null config");
+
+      const httpOnly = await loadAndSettle({
+        apps: { http: { servers: { srv0: { listen: [":18880"], routes: [] } } } },
+      });
+      assertOk(httpOnly, "loadConfig http-only");
+      await expectNotConfigured("http-only config");
+      await expectNoTlsConfig("http-only config");
+
+      const tlsNoEch = await loadAndSettle({
+        apps: { tls: { automation: { policies: [{ issuers: [{ module: "acme", email: "a@b.test" }] }] } } },
+      });
+      assertOk(tlsNoEch, "loadConfig apps/tls without ECH");
+      await expectNotConfigured("apps/tls without ECH");
+      // ...and here `status` has a real config to show.
+      const status = await handler({ action: "status" });
+      expect(status.isError).toBeFalsy();
+      expect(status.content[0].text).toContain("a@b.test");
+    });
+
+    // The test that would have caught the bug: ECH actually ON. With the old
+    // path this action answered "not configured" right here.
+    //
+    // Self-contained on purpose. The internal issuer means no ACME traffic for
+    // the public name; install_trust:false means Caddy never touches the OS trust
+    // store (on Windows that is an interactive prompt); and the explicit storage
+    // root keeps the ECH keys and the local CA out of whatever data directory the
+    // Caddy under test normally uses.
+    it("caddy_tls ech_status reports an ECH config that is actually on", async () => {
+      const storageRoot = mkdtempSync(join(tmpdir(), "caddy-mcp-ech-"));
+      try {
+        const loaded = await loadAndSettle({
+          storage: { module: "file_system", root: storageRoot },
+          apps: {
+            pki: { certificate_authorities: { local: { install_trust: false } } },
+            tls: {
+              automation: { policies: [{ issuers: [{ module: "internal" }] }] },
+              encrypted_client_hello: { configs: [{ public_name: "ech.example.test" }] },
+            },
+          },
+        });
+        assertOk(loaded, "loadConfig with ECH on");
+
+        const handler = getHandler(registerTlsTools, "caddy_tls");
+        const result = await handler({ action: "ech_status" });
+        expect(result.isError, result.content?.[0]?.text).toBeFalsy();
+        expect(result.content[0].text).not.toContain("not configured");
+        expect(JSON.parse(result.content[0].text)).toEqual({ configs: [{ public_name: "ech.example.test" }] });
+
+        // The old path, on the same ECH-enabled instance: still 200 null.
+        const wrongKey = await api.configGet("apps/tls/ech");
+        assertOk(wrongKey, "configGet apps/tls/ech");
+        expect(wrongKey.data).toBeNull();
+      } finally {
+        // Drop the config first so Caddy lets go of the storage directory; a
+        // leftover temp dir is not worth failing a test over.
+        await loadAndSettle({}, "application/json");
+        try {
+          rmSync(storageRoot, { recursive: true, force: true, maxRetries: 3, retryDelay: 100 });
+        } catch {
+          // best effort
+        }
+      }
     });
 
     // The live half of the null-body bug. Only a real Caddy produces this shape,
@@ -569,6 +925,77 @@ describe.skipIf(!RUN)("integration: live Caddy admin API", () => {
       const unknownAdapter = await handler({ config: "server {}", adapter: "nginx" });
       expect(unknownAdapter.isError).toBe(true);
       expect(unknownAdapter.content[0].text).toContain("unrecognized config adapter");
+    });
+
+    // The false success. Caddy writes a Caddyfile's adapter warnings into the
+    // /load response BEFORE it runs the load, which fixes the status at 200; when
+    // the load then fails, its error object is appended to a body that already
+    // went out as a success (caddyconfig/load.go at v2.11.4, caddyserver/caddy#7246).
+    // Two spaces of indentation are enough for the warning -- "Caddyfile input is
+    // not formatted" fires on anything `caddy fmt` would change -- and a `tls`
+    // directive naming a certificate that does not exist is enough for the
+    // failure, which happens at provision, after adaptation. 2.5.2 reported this
+    // load as a success, pushed a "pre-load" snapshot of a config that was never
+    // replaced, and printed Caddy's error as if it were the result.
+    //
+    // Only the outcome is pinned, not the 200: caddyserver/caddy#7267 (milestoned
+    // v2.11.5) moves this failure to a 400 with both parts in one object, and the
+    // tool must report failure, with the error and the warning, on either Caddy.
+    it("caddy_load reports a Caddyfile load that failed behind a 200 as a failure, and changes nothing", async () => {
+      const known = {
+        apps: {
+          http: {
+            servers: {
+              srv0: {
+                listen: [":18897"],
+                routes: [{ handle: [{ handler: "static_response", body: "still the old config" }] }],
+                ...noAutoHttps,
+              },
+            },
+          },
+        },
+      };
+      assertOk(await loadAndSettle(known), "loadConfig known config");
+      const before = await api.configGet();
+      assertOk(before, "configGet before the failing load");
+
+      // Forward slashes: Windows accepts them, and Caddy's error echoes the path
+      // inside a JSON string, where a backslash would arrive doubled and the
+      // containment check below would miss it.
+      const missing = join(tmpdir(), `caddy-mcp-no-such-cert-${process.pid}-${Date.now()}`).replace(/\\/g, "/");
+      const caddyfile = [
+        "{",
+        "  auto_https off",
+        "}",
+        "",
+        "https://127.0.0.1:18898 {",
+        `  tls ${missing}/cert.pem ${missing}/key.pem`,
+        '  respond "never served"',
+        "}",
+        "",
+      ].join("\n");
+
+      const { listSnapshots } = await import("../snapshots.js");
+      const ringBefore = listSnapshots().length;
+
+      const handler = getHandler(registerConfigTools, "caddy_load");
+      const result = await handler({ config: caddyfile, format: "caddyfile", confirm: true });
+
+      expect(result.isError).toBe(true);
+      const text = result.content[0].text;
+      // Caddy's own error, naming the certificate it could not open...
+      expect(text).toContain(`${missing}/cert.pem`);
+      // ...and the adapter warning that came with it, both in the one item.
+      expect(text).toContain("Caddyfile input is not formatted");
+
+      // A failed load restarts Caddy's admin endpoint too (it is replaced ahead
+      // of provisioning the apps), so wait for it the way loadAndSettle would.
+      await waitForAdmin();
+      const after = await api.configGet();
+      assertOk(after, "configGet after the failing load");
+      expect(after.data).toEqual(before.data);
+      // No "pre-load" snapshot for a load that replaced nothing.
+      expect(listSnapshots()).toHaveLength(ringBefore);
     });
   });
 });

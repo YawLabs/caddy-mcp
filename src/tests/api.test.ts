@@ -8,6 +8,10 @@ describe("api", () => {
   const savedLoadTimeout = process.env.CADDY_LOAD_TIMEOUT;
   const savedTimeout = process.env.CADDY_TIMEOUT;
 
+  type Api = typeof import("../api.js");
+  /** One exported api call, reduced to the fields the policy tests assert on. */
+  type Call = (api: Api) => Promise<{ ok: boolean; status: number; error?: string; outcomeUnknown?: boolean }>;
+
   beforeEach(() => {
     delete process.env.CADDY_ADMIN_URL;
     delete process.env.CADDY_API_TOKEN;
@@ -155,7 +159,10 @@ describe("api", () => {
   });
 
   describe("retry behavior", () => {
-    it("retries transient 5xx up to CADDY_MAX_RETRIES times", async () => {
+    // 503 throughout this block, deliberately: it is a GATEWAY status, which only
+    // a proxy in front of Caddy can produce. Caddy's own 500s are not retried --
+    // see "which 5xx statuses are transient" below.
+    it("retries a gateway 503 up to CADDY_MAX_RETRIES times", async () => {
       process.env.CADDY_MAX_RETRIES = "2";
       const api = await import("../api.js");
       let calls = 0;
@@ -361,7 +368,7 @@ describe("api", () => {
 
     // POST to /load is an atomic full-config replace -- same input yields the
     // same end state. Retrying on a flaky server is safe and useful.
-    it("retries POST to /load on 5xx (idempotent full-config replace)", async () => {
+    it("retries POST to /load on a gateway 503 (idempotent full-config replace)", async () => {
       process.env.CADDY_MAX_RETRIES = "2";
       const api = await import("../api.js");
       let calls = 0;
@@ -378,7 +385,7 @@ describe("api", () => {
 
     // POST to /adapt is a pure transformation (Caddyfile/etc -> JSON), no side
     // effects, safe to retry.
-    it("retries POST to /adapt on 5xx (pure transformation)", async () => {
+    it("retries POST to /adapt on a gateway 503 (pure transformation)", async () => {
       process.env.CADDY_MAX_RETRIES = "2";
       const api = await import("../api.js");
       let calls = 0;
@@ -393,7 +400,7 @@ describe("api", () => {
       expect(calls).toBe(3);
     });
 
-    it("still retries PATCH on 5xx (idempotent method)", async () => {
+    it("still retries PATCH on a gateway 503 (idempotent method)", async () => {
       process.env.CADDY_MAX_RETRIES = "2";
       const api = await import("../api.js");
       let calls = 0;
@@ -408,7 +415,11 @@ describe("api", () => {
       expect(calls).toBe(3);
     });
 
-    it("still retries DELETE on 5xx (idempotent method)", async () => {
+    // A map KEY, not an array index: deleting a key twice is harmless (the
+    // replay 404s), so DELETE keeps its retry here. This test used to delete
+    // `.../routes/0` and so pinned the double-delete hazard as intended
+    // behavior; the array-index half now lives in the DELETE block below.
+    it("still retries DELETE of a key on a gateway 503 (idempotent there)", async () => {
       process.env.CADDY_MAX_RETRIES = "2";
       const api = await import("../api.js");
       let calls = 0;
@@ -418,12 +429,12 @@ describe("api", () => {
         return new Response("", { status: 200 });
       }) as any;
 
-      const res = await api.configDelete("apps/http/servers/srv0/routes/0");
+      const res = await api.configDelete("apps/http/servers/srv0");
       expect(res.ok).toBe(true);
       expect(calls).toBe(3);
     });
 
-    it("still retries PUT to a non-array path on 5xx (idempotent there)", async () => {
+    it("still retries PUT to a non-array path on a gateway 503 (idempotent there)", async () => {
       process.env.CADDY_MAX_RETRIES = "2";
       const api = await import("../api.js");
       let calls = 0;
@@ -485,22 +496,313 @@ describe("api", () => {
       expect(calls).toBe(1);
     });
 
-    // No array-index tail, so the carve-out doesn't apply and the retry loop
-    // runs. (Separately: the TOOLS use PATCH for @id replaces -- PUT at /id/
-    // inserts a duplicate. This test is about the retry policy, not the verb.)
-    it("still retries PUT to /id/<id> with no subpath", async () => {
-      process.env.CADDY_MAX_RETRIES = "2";
+    // A bare `PUT /id/<id>` carries no index in the path it SENDS, but Caddy
+    // expands the id to the path it indexes -- `.../routes/2` for a route -- and
+    // PUT there inserts before that element. The id index is rebuilt after the
+    // write, so a replay resolves to the element's new position and inserts a
+    // second copy. This used to be pinned as retried (3 sends on a 503).
+    describe("PUT to a bare /id/<id>", () => {
+      const reset = () =>
+        new TypeError("fetch failed", { cause: Object.assign(new Error("read ECONNRESET"), { code: "ECONNRESET" }) });
+      const refusal = () =>
+        new TypeError("fetch failed", {
+          cause: Object.assign(new Error("connect ECONNREFUSED 127.0.0.1:2019"), { code: "ECONNREFUSED" }),
+        });
+
+      it.each([
+        ["a gateway 503", () => new Response("upstream down", { status: 503 })],
+        ["a gateway 504", () => new Response("gateway timeout", { status: 504 })],
+      ])("is sent exactly once on %s", async (_label, respond) => {
+        process.env.CADDY_MAX_RETRIES = "3";
+        const api = await import("../api.js");
+        const sent: string[] = [];
+        globalThis.fetch = vi.fn(async (url: any, opts: any) => {
+          sent.push(`${opts.method} ${new URL(String(url)).pathname}`);
+          return respond();
+        }) as any;
+
+        const res = await api.configByIdSet("r2", { handle: [] }, "PUT");
+        expect(res.ok).toBe(false);
+        expect(sent).toEqual(["PUT /id/r2"]);
+      });
+
+      it.each([
+        ["r2", "/id/r2"],
+        ["r2/", "/id/r2/"],
+      ])("is sent exactly once when the response is lost to a reset (id %p)", async (id, path) => {
+        process.env.CADDY_MAX_RETRIES = "3";
+        const api = await import("../api.js");
+        const sent: string[] = [];
+        globalThis.fetch = vi.fn(async (url: any, opts: any) => {
+          sent.push(`${opts.method} ${new URL(String(url)).pathname}`);
+          throw reset();
+        }) as any;
+
+        const res = await api.configByIdSet(id, { handle: [] }, "PUT");
+        expect(res.ok).toBe(false);
+        expect(res.status).toBe(0);
+        expect(sent).toEqual([`PUT ${path}`]);
+      });
+
+      // Rule 2 of shouldRetry runs ahead of isRetryableMethod: a refused connect
+      // wrote nothing, so there is nothing to duplicate.
+      it("IS replayed when the connection was refused", async () => {
+        process.env.CADDY_MAX_RETRIES = "2";
+        const api = await import("../api.js");
+        const sent: string[] = [];
+        globalThis.fetch = vi.fn(async (url: any, opts: any) => {
+          sent.push(`${opts.method} ${new URL(String(url)).pathname}`);
+          if (sent.length === 1) throw refusal();
+          return new Response("", { status: 200 });
+        }) as any;
+
+        const res = await api.configByIdSet("r2", { handle: [] }, "PUT");
+        expect(res.ok).toBe(true);
+        expect(sent).toEqual(["PUT /id/r2", "PUT /id/r2"]);
+      });
+
+      // Only the BARE form is excluded: a subpath that names a key under the
+      // identified object is an ordinary strictly-create PUT, as under /config.
+      it("leaves a PUT to a keyed /id/ subpath retryable", async () => {
+        process.env.CADDY_MAX_RETRIES = "2";
+        const api = await import("../api.js");
+        let calls = 0;
+        globalThis.fetch = vi.fn(async () => {
+          calls++;
+          if (calls < 3) return new Response("upstream down", { status: 503 });
+          return new Response("", { status: 200 });
+        }) as any;
+
+        const res = await api.configByIdSet("r2", true, "PUT", "terminal");
+        expect(res.ok).toBe(true);
+        expect(calls).toBe(3);
+      });
+    });
+
+    // Caddy trims slashes off a config path before walking it (admin.go:1178),
+    // so ".../routes/0/" is the same array position as ".../routes/0". The
+    // carve-out used to anchor on a bare `$` and let that spelling through.
+    it.each([
+      "apps/http/servers/srv0/routes/0/",
+      "apps/http/servers/srv0/routes/0//",
+    ])("does NOT retry PUT at an array-index path spelled with a trailing slash (%s)", async (path) => {
+      process.env.CADDY_MAX_RETRIES = "3";
       const api = await import("../api.js");
       let calls = 0;
       globalThis.fetch = vi.fn(async () => {
         calls++;
-        if (calls < 3) return new Response("upstream down", { status: 503 });
-        return new Response("", { status: 200 });
+        return new Response("upstream down", { status: 503 });
       }) as any;
 
-      const res = await api.configByIdSet("my-route", { handle: [] }, "PUT");
-      expect(res.ok).toBe(true);
-      expect(calls).toBe(3);
+      const res = await api.configPut(path, {});
+      expect(res.ok).toBe(false);
+      expect(calls).toBe(1);
+    });
+
+    // Caddy removes an array element by RE-PACKING the array (admin.go:1251), so
+    // by the time a replayed `DELETE .../routes/<n>` arrives, <n> names whatever
+    // slid into the gap, and the replay removes that instead. Same carve-out as
+    // PUT, for the mirror-image reason (PUT there inserts a second element).
+    describe("DELETE at an array index", () => {
+      const indexDeletes: Array<[string, Call, string]> = [
+        [
+          "a /config array index",
+          (api) => api.configDelete("apps/http/servers/srv0/routes/0"),
+          "/config/apps/http/servers/srv0/routes/0",
+        ],
+        [
+          "a /config array index with a trailing slash",
+          (api) => api.configDelete("apps/http/servers/srv0/routes/0/"),
+          "/config/apps/http/servers/srv0/routes/0/",
+        ],
+        ["an /id subpath array index", (api) => api.configByIdDelete("my-route", "handle/0"), "/id/my-route/handle/0"],
+      ];
+
+      /** A transport failure that is NOT a refusal: Caddy may have read the request. */
+      const reset = () =>
+        new TypeError("fetch failed", { cause: Object.assign(new Error("read ECONNRESET"), { code: "ECONNRESET" }) });
+      const refusal = () =>
+        new TypeError("fetch failed", {
+          cause: Object.assign(new Error("connect ECONNREFUSED 127.0.0.1:2019"), { code: "ECONNREFUSED" }),
+        });
+
+      it.each(indexDeletes)("is NOT replayed when no response arrives (status 0): %s", async (_label, call, path) => {
+        process.env.CADDY_MAX_RETRIES = "3";
+        const api = await import("../api.js");
+        const sent: string[] = [];
+        globalThis.fetch = vi.fn(async (url: any, opts: any) => {
+          sent.push(`${opts.method} ${new URL(String(url)).pathname}`);
+          throw reset();
+        }) as any;
+
+        const res = await call(api);
+        expect(res.ok).toBe(false);
+        expect(res.status).toBe(0);
+        expect(sent).toEqual([`DELETE ${path}`]);
+      });
+
+      it.each(indexDeletes)("is NOT replayed on a gateway 503: %s", async (_label, call, path) => {
+        process.env.CADDY_MAX_RETRIES = "3";
+        const api = await import("../api.js");
+        const sent: string[] = [];
+        globalThis.fetch = vi.fn(async (url: any, opts: any) => {
+          sent.push(`${opts.method} ${new URL(String(url)).pathname}`);
+          return new Response("upstream down", { status: 503 });
+        }) as any;
+
+        const res = await call(api);
+        expect(res.ok).toBe(false);
+        expect(res.status).toBe(503);
+        expect(sent).toEqual([`DELETE ${path}`]);
+      });
+
+      // The one failure that PROVES the request never reached Caddy: the connect
+      // was refused, so nothing was written and there is nothing to double-apply.
+      it.each(indexDeletes)("IS replayed when the connection was refused: %s", async (_label, call, path) => {
+        process.env.CADDY_MAX_RETRIES = "2";
+        const api = await import("../api.js");
+        const sent: string[] = [];
+        globalThis.fetch = vi.fn(async (url: any, opts: any) => {
+          sent.push(`${opts.method} ${new URL(String(url)).pathname}`);
+          if (sent.length === 1) throw refusal();
+          return new Response("", { status: 200 });
+        }) as any;
+
+        const res = await call(api);
+        expect(res.ok).toBe(true);
+        expect(sent).toEqual([`DELETE ${path}`, `DELETE ${path}`]);
+      });
+
+      // The other direction: everything that is not an array position keeps its
+      // retry. A map key deleted twice 404s on the replay, and so does a bare
+      // `DELETE /id/<id>` (Caddy rebuilds its id index after the first delete).
+      // "srv0" and "route-10" END in digits without BEING an index -- the
+      // carve-out must match a whole numeric segment, not a numeric suffix.
+      it.each<[string, Call]>([
+        ["a map key", (api) => api.configDelete("apps/http/servers/srv0")],
+        ["a key that ends in digits", (api) => api.configDelete("apps/tls/certificates/route-10")],
+        ["a bare /id/<id>", (api) => api.configByIdDelete("my-route")],
+        ["an /id subpath that is a key", (api) => api.configByIdDelete("my-route", "terminal")],
+      ])("still retries DELETE of %s when no response arrives", async (_label, call) => {
+        process.env.CADDY_MAX_RETRIES = "2";
+        const api = await import("../api.js");
+        let calls = 0;
+        globalThis.fetch = vi.fn(async () => {
+          calls++;
+          if (calls < 3) throw reset();
+          return new Response("", { status: 200 });
+        }) as any;
+
+        const res = await call(api);
+        expect(res.ok).toBe(true);
+        expect(calls).toBe(3);
+      });
+    });
+
+    // Caddy's admin API never emits 502 / 503 / 504 -- only a proxy in front of
+    // it can -- and the 500s it DOES emit are deterministic rejections: Caddy
+    // maps every non-APIError to 500, which is how a config that fails
+    // validation, a bad body, an out-of-range index and a missing traversal
+    // segment all arrive. None of them changes the config, so a replay gets the
+    // same answer. What a replay cost depends on where Caddy refused it: a bad
+    // body, an out-of-range index or a missing traversal segment is refused
+    // before any load runs (nothing to roll back), so each replay was one more
+    // ERROR line; a config that fails while provisioning the apps -- the body
+    // below -- has already restarted the admin endpoint, so each replay was an
+    // ERROR line AND an admin-endpoint restart. Verified against Caddy 2.11.4:
+    // a PATCH naming an unknown handler answers 500 with the body below, and
+    // 2.5.2 sent it three times (3 ERROR lines, 3 admin restarts, 378 ms) where
+    // one send takes 20 ms; the traversal, index and decode 500s leave the
+    // admin endpoint running.
+    describe("which 5xx statuses are transient", () => {
+      const caddy500 =
+        '{"error":"loading new config: loading http app module: provision http: server s: setting up route ' +
+        "handlers: route 0: loading handler modules: position 0: loading module 'no_such_handler': unknown " +
+        'module: http.handlers.no_such_handler"}\n';
+
+      it.each<[string, Call]>([
+        ["PATCH", (api) => api.configPatch("apps/http/servers/srv0", { listen: [":443"] })],
+        ["DELETE of a key", (api) => api.configDelete("apps/http/servers/srv0")],
+        ["PUT to a key", (api) => api.configPut("apps/http/servers/srv0", {})],
+        ["GET", (api) => api.configGet("apps/http/servers/srv0")],
+        ["POST /load", (api) => api.loadConfig({ apps: {} })],
+        ["POST /adapt", (api) => api.adapt("example.com { }")],
+      ])("sends a %s that answers 500 exactly once and returns the body verbatim", async (_label, call) => {
+        process.env.CADDY_MAX_RETRIES = "3";
+        const api = await import("../api.js");
+        let calls = 0;
+        globalThis.fetch = vi.fn(async () => {
+          calls++;
+          return new Response(caddy500, { status: 500 });
+        }) as any;
+
+        const res = await call(api);
+        expect(res.ok).toBe(false);
+        expect(res.status).toBe(500);
+        expect(res.error).toBe(caddy500);
+        expect(calls).toBe(1);
+      });
+
+      it.each([501, 505, 507, 599])("does not retry a %i either -- only gateway statuses are", async (status) => {
+        process.env.CADDY_MAX_RETRIES = "3";
+        const api = await import("../api.js");
+        let calls = 0;
+        globalThis.fetch = vi.fn(async () => {
+          calls++;
+          return new Response("nope", { status });
+        }) as any;
+
+        const res = await api.configGet();
+        expect(res.status).toBe(status);
+        expect(calls).toBe(1);
+      });
+
+      it.each([502, 503, 504])("still retries a gateway %i on a GET", async (status) => {
+        process.env.CADDY_MAX_RETRIES = "2";
+        const api = await import("../api.js");
+        let calls = 0;
+        globalThis.fetch = vi.fn(async () => {
+          calls++;
+          if (calls < 3) return new Response("bad gateway", { status });
+          return new Response("{}", { status: 200 });
+        }) as any;
+
+        const res = await api.configGet();
+        expect(res.ok).toBe(true);
+        expect(calls).toBe(3);
+      });
+
+      it.each([502, 504])("still retries a gateway %i on a PATCH and on POST /load", async (status) => {
+        process.env.CADDY_MAX_RETRIES = "2";
+        const api = await import("../api.js");
+        let calls = 0;
+        globalThis.fetch = vi.fn(async () => {
+          calls++;
+          if (calls % 3 !== 0) return new Response("bad gateway", { status });
+          return new Response("", { status: 200 });
+        }) as any;
+
+        expect((await api.configPatch("apps/http/servers/srv0", { listen: [":443"] })).ok).toBe(true);
+        expect(calls).toBe(3);
+        expect((await api.loadConfig({ apps: {} })).ok).toBe(true);
+        expect(calls).toBe(6);
+      });
+
+      it("gives up on a persistent gateway status with that status, after the full budget", async () => {
+        process.env.CADDY_MAX_RETRIES = "2";
+        const api = await import("../api.js");
+        let calls = 0;
+        globalThis.fetch = vi.fn(async () => {
+          calls++;
+          return new Response("gateway timeout", { status: 504 });
+        }) as any;
+
+        const res = await api.configGet();
+        expect(res.ok).toBe(false);
+        expect(res.status).toBe(504);
+        expect(res.error).toBe("gateway timeout");
+        expect(calls).toBe(3);
+      });
     });
   });
 
@@ -1070,7 +1372,7 @@ describe("api", () => {
   });
 
   describe("retries POST to /stop (safe per policy)", () => {
-    it("retries POST to /stop on 5xx (second-call is a no-op against an already-stopped server)", async () => {
+    it("retries POST to /stop on a gateway 503 (second-call is a no-op against an already-stopped server)", async () => {
       // /stop is documented in isRetryableMethod as benign to retry -- a
       // second call against an already-stopped server is a no-op.
       process.env.CADDY_MAX_RETRIES = "2";
@@ -1089,13 +1391,16 @@ describe("api", () => {
   });
 
   describe("CADDY_LOAD_TIMEOUT", () => {
-    it("defaults to 60000 when env unset", async () => {
+    // 55000, not 60000: the MCP SDK's client abandons a tool call at 60000 ms by
+    // default and its timer starts first, so a 60 s deadline here meant the
+    // outcome-unknown error for a timed-out config change was never delivered.
+    it("defaults to 55000 when env unset -- below the MCP SDK's 60000 ms client timeout", async () => {
       const api = await import("../api.js");
       const timeoutSpy = vi.spyOn(AbortSignal, "timeout");
       globalThis.fetch = vi.fn(async () => new Response("", { status: 200 })) as any;
 
       await api.loadConfig({});
-      expect(timeoutSpy).toHaveBeenCalledWith(60000);
+      expect(timeoutSpy).toHaveBeenCalledWith(55000);
       timeoutSpy.mockRestore();
     });
 
@@ -1116,14 +1421,14 @@ describe("api", () => {
       "-100",
       "0.5",
       "0.999",
-    ])("falls back to 60000 for invalid value %p", async (invalid) => {
+    ])("falls back to 55000 for invalid value %p", async (invalid) => {
       process.env.CADDY_LOAD_TIMEOUT = invalid;
       const api = await import("../api.js");
       const timeoutSpy = vi.spyOn(AbortSignal, "timeout");
       globalThis.fetch = vi.fn(async () => new Response("", { status: 200 })) as any;
 
       await api.loadConfig({});
-      expect(timeoutSpy).toHaveBeenCalledWith(60000);
+      expect(timeoutSpy).toHaveBeenCalledWith(55000);
       timeoutSpy.mockRestore();
     });
   });
@@ -1168,8 +1473,265 @@ describe("api", () => {
       globalThis.fetch = vi.fn(async () => new Response("", { status: 200 })) as any;
 
       await api.loadConfig({});
-      expect(timeoutSpy).toHaveBeenCalledWith(60000);
+      expect(timeoutSpy).toHaveBeenCalledWith(55000);
       timeoutSpy.mockRestore();
+    });
+  });
+
+  // Every non-GET under /config or /id runs the SAME synchronous full reload
+  // inside Caddy as POST /load -- one changeConfig, one lock, provision and
+  // start the whole new config before the response goes out -- so they share
+  // /load's budget. They used to sit on CADDY_TIMEOUT, which reported a slow
+  // reload as a failure while Caddy carried on applying it.
+  const configChanges: Array<[string, Call]> = [
+    ["PATCH /config", (api) => api.configPatch("apps/http", {})],
+    ["PUT /config", (api) => api.configPut("apps/http/servers/s", {})],
+    ["POST /config", (api) => api.configPost("apps/http/servers/s/routes", {})],
+    ["DELETE /config", (api) => api.configDelete("apps/http/servers/s")],
+    ["PATCH /id", (api) => api.configByIdSet("r1", {})],
+    ["PUT /id", (api) => api.configByIdSet("r1", {}, "PUT")],
+    ["POST /id", (api) => api.configByIdSet("r1", {}, "POST")],
+    ["DELETE /id", (api) => api.configByIdDelete("r1")],
+    ["POST /load", (api) => api.loadConfig({ apps: {} })],
+  ];
+  // Nothing here makes Caddy reload, so nothing here can be left half-applied.
+  const nonChanges: Array<[string, Call]> = [
+    ["GET /config", (api) => api.configGet("apps")],
+    ["GET /id", (api) => api.configByIdGet("r1")],
+    ["POST /adapt", (api) => api.adapt("example.com { }")],
+    ["POST /stop", (api) => api.stop()],
+    ["GET /reverse_proxy/upstreams", (api) => api.getUpstreams()],
+    ["GET /pki/ca/local", (api) => api.getPki()],
+    ["GET /metrics", (api) => api.getMetrics()],
+  ];
+
+  describe("timeout budget by request kind", () => {
+    it.each(configChanges)("%s runs on CADDY_LOAD_TIMEOUT", async (_label, call) => {
+      process.env.CADDY_TIMEOUT = "5000";
+      process.env.CADDY_LOAD_TIMEOUT = "45000";
+      const api = await import("../api.js");
+      const timeoutSpy = vi.spyOn(AbortSignal, "timeout");
+      globalThis.fetch = vi.fn(async () => new Response("", { status: 200 })) as any;
+
+      try {
+        expect((await call(api)).ok).toBe(true);
+        expect(timeoutSpy.mock.calls).toEqual([[45000]]);
+      } finally {
+        timeoutSpy.mockRestore();
+      }
+    });
+
+    it.each(nonChanges)("%s runs on CADDY_TIMEOUT", async (_label, call) => {
+      process.env.CADDY_TIMEOUT = "5000";
+      process.env.CADDY_LOAD_TIMEOUT = "45000";
+      const api = await import("../api.js");
+      const timeoutSpy = vi.spyOn(AbortSignal, "timeout");
+      globalThis.fetch = vi.fn(async () => new Response("{}", { status: 200 })) as any;
+
+      try {
+        expect((await call(api)).ok).toBe(true);
+        expect(timeoutSpy.mock.calls).toEqual([[5000]]);
+      } finally {
+        timeoutSpy.mockRestore();
+      }
+    });
+
+    it("gives a config write the 55000 default when neither variable is set", async () => {
+      const api = await import("../api.js");
+      const timeoutSpy = vi.spyOn(AbortSignal, "timeout");
+      globalThis.fetch = vi.fn(async () => new Response("", { status: 200 })) as any;
+
+      try {
+        await api.configPatch("apps/http", {});
+        await api.configGet("apps/http");
+        expect(timeoutSpy.mock.calls).toEqual([[55000], [10000]]);
+      } finally {
+        timeoutSpy.mockRestore();
+      }
+    });
+  });
+
+  // A deadline that fires on a config change does not mean the change failed:
+  // Caddy applies it synchronously inside the request, under its config lock,
+  // and takes no request context -- so it carries on after the client hangs up.
+  // A replay therefore cannot overtake the first request; it queues behind it
+  // and then runs against a config the first request already changed (a 412 or
+  // 404 for a change that in fact landed, a second removal at an array index),
+  // and when the reload outlasts the deadline every replay times out too.
+  describe("a fired timeout", () => {
+    const timeoutError = () => new DOMException("The operation was aborted due to timeout", "TimeoutError");
+
+    it.each(configChanges)("on %s is NOT retried", async (_label, call) => {
+      process.env.CADDY_MAX_RETRIES = "3";
+      const api = await import("../api.js");
+      let calls = 0;
+      globalThis.fetch = vi.fn(async () => {
+        calls++;
+        throw timeoutError();
+      }) as any;
+
+      const res = await call(api);
+      expect(res.ok).toBe(false);
+      expect(res.status).toBe(0);
+      expect(res.error).toContain("Request timed out after 55000ms");
+      // The flag caddy_load / caddy_revert key on to keep their snapshot.
+      expect(res.outcomeUnknown).toBe(true);
+      expect(calls).toBe(1);
+    });
+
+    // oam -- which bin/caddy-mcp.mjs serves on by default when a recent one is
+    // installed -- rejects a fired AbortSignal.timeout with DOMException
+    // TimeoutError "The operation timed out": the same error NAME as Node, but
+    // a message with neither "abort" nor "timeout" in it. Classified by message
+    // alone, it fell through to the generic transport branch, so these writes
+    // were replayed up to 1 + CADDY_MAX_RETRIES times and the caller got the
+    // bare runtime text. Observed under oam 0.16.2 with the old classifier:
+    // configPatch, configDelete of a key and loadConfig each reached a server
+    // that never answered 3 times.
+    describe("with oam's wording", () => {
+      const oamTimeout = () => new DOMException("The operation timed out", "TimeoutError");
+
+      it.each<[string, Call]>([
+        ["PATCH", (api) => api.configPatch("apps/http/servers/srv0", { listen: [":443"] })],
+        ["DELETE of a key", (api) => api.configDelete("apps/http/servers/srv0")],
+        ["POST /load", (api) => api.loadConfig({ apps: {} })],
+      ])("a timed-out %s is delivered once and reports the outcome as unknown", async (_label, call) => {
+        process.env.CADDY_MAX_RETRIES = "2";
+        const api = await import("../api.js");
+        let calls = 0;
+        globalThis.fetch = vi.fn(async () => {
+          calls++;
+          throw oamTimeout();
+        }) as any;
+
+        const res = await call(api);
+        expect(calls).toBe(1);
+        expect(res.ok).toBe(false);
+        expect(res.status).toBe(0);
+        expect(res.outcomeUnknown).toBe(true);
+        expect(res.error).toMatch(/^Request timed out after 55000ms -- the outcome is unknown/);
+        expect(res.error).not.toContain("The operation timed out");
+      });
+
+      it("a timed-out GET still retries, and reports the budget rather than the runtime's text", async () => {
+        process.env.CADDY_MAX_RETRIES = "2";
+        const api = await import("../api.js");
+        let calls = 0;
+        globalThis.fetch = vi.fn(async () => {
+          calls++;
+          throw oamTimeout();
+        }) as any;
+
+        const res = await api.configGet("apps");
+        expect(calls).toBe(3);
+        expect(res.error).toBe("Request timed out after 10000ms");
+        expect(res.outcomeUnknown).toBeUndefined();
+      });
+
+      // By name, wherever it sits in the chain -- node:http wraps a signal
+      // abort in an AbortError whose cause is the TimeoutError, and a runtime
+      // may word either however it likes.
+      it.each([
+        ["an AbortError with unrelated text", () => new DOMException("request cancelled", "AbortError")],
+        [
+          "a TimeoutError two causes down",
+          () =>
+            new Error("request failed", {
+              cause: new Error("wrapped", { cause: new DOMException("deadline", "TimeoutError") }),
+            }),
+        ],
+      ])("recognises %s as a timeout", async (_label, make) => {
+        process.env.CADDY_MAX_RETRIES = "2";
+        const api = await import("../api.js");
+        let calls = 0;
+        globalThis.fetch = vi.fn(async () => {
+          calls++;
+          throw make();
+        }) as any;
+
+        const res = await api.configPatch("apps/http", {});
+        expect(calls).toBe(1);
+        expect(res.outcomeUnknown).toBe(true);
+        expect(res.error).toContain("the outcome is unknown");
+      });
+    });
+
+    // Nothing is left running inside Caddy behind a read or a pure
+    // transformation, so these keep the ordinary transient-failure retry.
+    it.each(nonChanges)("on %s is still retried", async (_label, call) => {
+      process.env.CADDY_MAX_RETRIES = "2";
+      const api = await import("../api.js");
+      let calls = 0;
+      globalThis.fetch = vi.fn(async () => {
+        calls++;
+        if (calls < 3) throw timeoutError();
+        return new Response("{}", { status: 200 });
+      }) as any;
+
+      const res = await call(api);
+      expect(res.ok).toBe(true);
+      expect(calls).toBe(3);
+    });
+
+    it("on a GET that never answers reports the bare timeout after the full retry budget", async () => {
+      process.env.CADDY_MAX_RETRIES = "2";
+      const api = await import("../api.js");
+      let calls = 0;
+      globalThis.fetch = vi.fn(async () => {
+        calls++;
+        throw timeoutError();
+      }) as any;
+
+      const res = await api.configGet("apps");
+      expect(res.status).toBe(0);
+      expect(res.error).toBe("Request timed out after 10000ms");
+      expect(calls).toBe(3);
+    });
+
+    // The rule is per attempt, not per call: a write that WAS retryable on its
+    // first failure (a proxy's 503) stops the moment an attempt times out.
+    it("stops a retry sequence at the first attempt that times out", async () => {
+      process.env.CADDY_MAX_RETRIES = "3";
+      const api = await import("../api.js");
+      let calls = 0;
+      globalThis.fetch = vi.fn(async () => {
+        calls++;
+        if (calls === 1) return new Response("upstream down", { status: 503 });
+        throw timeoutError();
+      }) as any;
+
+      const res = await api.configPatch("apps/http", {});
+      expect(res.ok).toBe(false);
+      expect(res.status).toBe(0);
+      expect(calls).toBe(2);
+    });
+
+    // Deliberately NOT invalidated on a timeout. If the timed-out change did
+    // land, the path's hash moved, and an operator (or model) who re-issues the
+    // write without re-reading gets Caddy's 412 instead of a second blind write.
+    // Dropping the entry "to be safe" would remove exactly that guard.
+    it("keeps the cached ETag across a timed-out write, so a blind re-issue still carries If-Match", async () => {
+      process.env.CADDY_MAX_RETRIES = "3";
+      const api = await import("../api.js");
+      const target = "timed-out-write-keeps-etag";
+      const sent: Array<{ method: string; ifMatch: string | null }> = [];
+      globalThis.fetch = vi.fn(async (_url: any, opts: any) => {
+        const method = opts?.method ?? "GET";
+        sent.push({ method, ifMatch: opts?.headers?.["If-Match"] ?? null });
+        if (method === "GET") return new Response("{}", { status: 200, headers: { ETag: '"/config/x abc"' } });
+        if (sent.filter((s) => s.method === "PATCH").length === 1) throw timeoutError();
+        return new Response("", { status: 200 });
+      }) as any;
+
+      await api.configGet(target);
+      expect((await api.configPatch(target, { a: 1 })).ok).toBe(false);
+      await api.configPatch(target, { a: 1 });
+
+      expect(sent).toEqual([
+        { method: "GET", ifMatch: null },
+        { method: "PATCH", ifMatch: '"/config/x abc"' },
+        { method: "PATCH", ifMatch: '"/config/x abc"' },
+      ]);
     });
   });
 
@@ -1190,6 +1752,11 @@ describe("api", () => {
       expect(res.error).toBe("Request timed out after 1234ms");
     });
 
+    // The bare "Request timed out after Nms" this used to pin read as "it
+    // failed", which is the one thing a timed-out config change does not say.
+    // The message still leads with the budget that fired; what follows states
+    // the ambiguity and the safe next step, and names no cause and no outcome.
+    // Pinned whole, so rewording it is a deliberate act.
     it("reports the /load timeout budget, not the per-request one, when /load aborts", async () => {
       process.env.CADDY_TIMEOUT = "1000";
       process.env.CADDY_LOAD_TIMEOUT = "45000";
@@ -1199,7 +1766,51 @@ describe("api", () => {
       }) as any;
 
       const res = await api.loadConfig({ apps: {} });
-      expect(res.error).toBe("Request timed out after 45000ms");
+      expect(res.ok).toBe(false);
+      expect(res.status).toBe(0);
+      expect(res.error).toBe(
+        "Request timed out after 45000ms -- the outcome is unknown: Caddy may still be applying this change. " +
+          "A config change blocks until Caddy finishes reloading, and a client timeout does not cancel it, so it " +
+          "may have applied, may yet apply, or may not apply at all; caddy-mcp never replays a timed-out config " +
+          "change. Re-read the config before retrying. If reloads on this instance legitimately take this long, " +
+          "raise CADDY_LOAD_TIMEOUT, keeping it below your MCP client's request timeout (60 s by default in the " +
+          "MCP SDK), or this error never reaches the client.",
+      );
+      expect(res.outcomeUnknown).toBe(true);
+    });
+
+    it.each<[string, Call]>([
+      ["PATCH", (api) => api.configPatch("apps/http/servers/srv0", { listen: [":443"] })],
+      ["DELETE at an array index", (api) => api.configDelete("apps/http/servers/srv0/routes/2")],
+      ["POST under /id", (api) => api.configByIdSet("r1", {}, "POST")],
+    ])("tells the operator a timed-out %s may still be applying, without claiming an outcome", async (_l, call) => {
+      process.env.CADDY_TIMEOUT = "1000";
+      process.env.CADDY_LOAD_TIMEOUT = "45000";
+      const api = await import("../api.js");
+      globalThis.fetch = vi.fn(async () => {
+        throw new DOMException("The operation was aborted due to timeout", "TimeoutError");
+      }) as any;
+
+      const res = await call(api);
+      // The reload budget, not CADDY_TIMEOUT: a config write is a reload.
+      expect(res.error).toMatch(/^Request timed out after 45000ms -- /);
+      expect(res.error).toContain("the outcome is unknown");
+      expect(res.error).toContain("Caddy may still be applying this change");
+      expect(res.error).toContain("Re-read the config before retrying");
+    });
+
+    it("keeps the bare message for a request that changes nothing", async () => {
+      // No hint on a read: nothing is left half-applied behind it, and "re-read
+      // the config" would be advice about a change nobody made.
+      process.env.CADDY_TIMEOUT = "1234";
+      const api = await import("../api.js");
+      globalThis.fetch = vi.fn(async () => {
+        throw new DOMException("The operation was aborted due to timeout", "TimeoutError");
+      }) as any;
+
+      for (const call of [() => api.adapt("example.com { }"), () => api.stop(), () => api.getMetrics()]) {
+        expect((await call()).error).toBe("Request timed out after 1234ms");
+      }
     });
 
     it("surfaces an unrecognized transport error verbatim", async () => {
@@ -1214,6 +1825,28 @@ describe("api", () => {
       expect(res.ok).toBe(false);
       expect(res.status).toBe(0);
       expect(res.error).toBe("socket hang up");
+    });
+
+    // outcomeUnknown marks this client's own deadline firing on a config change
+    // and nothing else -- it is not a synonym for status 0. Other transport
+    // failures keep the plain shape they always had.
+    it.each([
+      [
+        "a reset",
+        () =>
+          new TypeError("fetch failed", { cause: Object.assign(new Error("read ECONNRESET"), { code: "ECONNRESET" }) }),
+      ],
+      ["an unrecognized transport error", () => new Error("socket hang up")],
+    ])("does not set outcomeUnknown for %s on a config change", async (_label, make) => {
+      const api = await import("../api.js");
+      globalThis.fetch = vi.fn(async () => {
+        throw make();
+      }) as any;
+
+      const res = await api.loadConfig({ apps: {} });
+      expect(res.ok).toBe(false);
+      expect(res.status).toBe(0);
+      expect(res.outcomeUnknown).toBeUndefined();
     });
 
     it("stringifies a non-Error throw", async () => {
@@ -1413,6 +2046,292 @@ describe("api", () => {
       await api.configPatch(target, { foo: 1 });
       expect(calls[2]?.method).toBe("PATCH");
       expect(calls[2]?.ifMatch).toBe("survives-failed-load");
+    });
+  });
+
+  // Caddy writes a Caddyfile load's adapter warnings to the response BEFORE it
+  // runs the load, which commits the status at 200; a load that then fails has
+  // its error object appended to a body that already went out as a success.
+  // The fixtures below are the bytes Caddy 2.11.4 sent, captured live, trailing
+  // newline included -- hand-simplified bodies are how this client came to
+  // report a failed load as a success in the first place.
+  describe("the body of a /load response", () => {
+    const WARNING = {
+      file: "Caddyfile",
+      line: 2,
+      message: "Caddyfile input is not formatted; run 'caddy fmt --overwrite' to fix inconsistencies",
+    };
+    const WARNINGS_JSON = JSON.stringify([WARNING]);
+    const ERROR_JSON =
+      '{"error":"loading config: loading new config: loading http app module: provision http: getting tls app: ' +
+      "loading tls app module: provision tls: loading certificates: open C:/nonexistent-caddy-mcp/cert.pem: " +
+      'The system cannot find the path specified."}';
+    /** 200 OK, text/plain: warnings, then the error object, then json.Encoder's newline. */
+    const FAILED_BEHIND_A_200 = `${WARNINGS_JSON}${ERROR_JSON}\n`;
+    const caddyfile = 'example.test {\n  respond "hi"\n}\n';
+
+    /** Answer every POST /load with one canned response, and count the sends. */
+    function answerLoadWith(body: string, status = 200) {
+      const sends: string[] = [];
+      globalThis.fetch = vi.fn(async (url: any, opts: any) => {
+        sends.push(`${opts?.method ?? "GET"} ${new URL(String(url)).pathname}`);
+        return new Response(body, { status });
+      }) as any;
+      return sends;
+    }
+
+    it("reports a load that failed behind a 200 as a failure, with Caddy's error and the warnings", async () => {
+      const api = await import("../api.js");
+      answerLoadWith(FAILED_BEHIND_A_200);
+
+      const res = await api.loadConfig(caddyfile, "text/caddyfile");
+
+      expect(res.ok).toBe(false);
+      // Caddy's error object, byte for byte, leads the message.
+      expect(res.error?.startsWith(ERROR_JSON)).toBe(true);
+      // The warnings are kept, structured, not folded away or dropped.
+      expect(res.warnings).toEqual([WARNING]);
+      expect(res.data).toBeUndefined();
+    });
+
+    it("keeps the 200 Caddy sent and says so, rather than reporting a status it never sent", async () => {
+      const api = await import("../api.js");
+      answerLoadWith(FAILED_BEHIND_A_200);
+
+      const res = await api.loadConfig(caddyfile, "text/caddyfile");
+
+      expect(res.status).toBe(200);
+      expect(res.error).toContain("Caddy answered HTTP 200");
+      expect(res.error).toContain("load error");
+    });
+
+    it("sends a load that failed behind a 200 once, whatever the retry budget", async () => {
+      process.env.CADDY_MAX_RETRIES = "5";
+      const api = await import("../api.js");
+      const sends = answerLoadWith(FAILED_BEHIND_A_200);
+
+      const res = await api.loadConfig(caddyfile, "text/caddyfile");
+
+      expect(res.ok).toBe(false);
+      expect(sends).toEqual(["POST /load"]);
+    });
+
+    it("keeps cached ETags when the load failed behind a 200, as it does for a 400", async () => {
+      // The 200 used to read as a success and wipe the whole cache, so the next
+      // write went out with no If-Match against a config that had not changed.
+      const api = await import("../api.js");
+      const target = "load-failed-behind-200-keeps-cache";
+      const calls: Array<{ method: string; ifMatch: string | null }> = [];
+      globalThis.fetch = vi.fn(async (url: any, opts: any) => {
+        const method = opts?.method ?? "GET";
+        calls.push({ method, ifMatch: opts?.headers?.["If-Match"] ?? null });
+        if (method === "GET") return new Response("{}", { status: 200, headers: { ETag: "survives-false-200" } });
+        if (String(url).endsWith("/load")) return new Response(FAILED_BEHIND_A_200, { status: 200 });
+        return new Response("", { status: 200 });
+      }) as any;
+
+      await api.configGet(target);
+      expect((await api.loadConfig(caddyfile, "text/caddyfile")).ok).toBe(false);
+      await api.configPatch(target, { foo: 1 });
+
+      expect(calls[2]?.method).toBe("PATCH");
+      expect(calls[2]?.ifMatch).toBe("survives-false-200");
+    });
+
+    it("keeps a load that applied with warnings a success, and surfaces the warnings", async () => {
+      const api = await import("../api.js");
+      // Exactly what 2.11.4 sends: json.Marshal output, no trailing newline.
+      answerLoadWith(WARNINGS_JSON);
+
+      const res = await api.loadConfig(caddyfile, "text/caddyfile");
+
+      expect(res.ok).toBe(true);
+      expect(res.status).toBe(200);
+      expect(res.error).toBeUndefined();
+      expect(res.warnings).toEqual([WARNING]);
+      // Not ALSO left in `data`, where formatResult would print them twice.
+      expect(res.data).toBeUndefined();
+    });
+
+    it("still clears the ETag cache after a load that applied with warnings", async () => {
+      const api = await import("../api.js");
+      const target = "load-with-warnings-clears-cache";
+      const calls: Array<{ method: string; ifMatch: string | null }> = [];
+      globalThis.fetch = vi.fn(async (url: any, opts: any) => {
+        const method = opts?.method ?? "GET";
+        calls.push({ method, ifMatch: opts?.headers?.["If-Match"] ?? null });
+        if (method === "GET") return new Response("{}", { status: 200, headers: { ETag: "pre-load" } });
+        if (String(url).endsWith("/load")) return new Response(WARNINGS_JSON, { status: 200 });
+        return new Response("", { status: 200 });
+      }) as any;
+
+      await api.configGet(target);
+      expect((await api.loadConfig(caddyfile, "text/caddyfile")).ok).toBe(true);
+      await api.configPatch(target, { foo: 1 });
+
+      expect(calls[2]?.ifMatch).toBe(null);
+    });
+
+    it("leaves a plain successful load -- 200, empty body -- exactly as it was", async () => {
+      const api = await import("../api.js");
+      answerLoadWith("");
+
+      const res = await api.loadConfig({ apps: {} });
+
+      expect(res).toEqual({ ok: true, status: 200, etag: undefined });
+    });
+
+    it("leaves an ordinary 400 load failure exactly as it was: Caddy's body, verbatim", async () => {
+      const api = await import("../api.js");
+      answerLoadWith(`${ERROR_JSON}\n`, 400);
+
+      const res = await api.loadConfig({ apps: {} });
+
+      expect(res).toEqual({ ok: false, status: 400, error: `${ERROR_JSON}\n` });
+    });
+
+    // caddyserver/caddy#7267 (open, milestoned v2.11.5): the failure becomes a
+    // real 400 whose one JSON object carries both parts. Read from the PR's
+    // diff, never run. A non-2xx needs no special handling -- the body comes
+    // through verbatim -- so this pins that both parts stay visible.
+    it("passes the post-#7267 failure shape through with the error and the warnings both visible", async () => {
+      const api = await import("../api.js");
+      const body = `{"error":"loading config: loading new config: provision tls: open cert.pem: no such file or directory","warnings":${WARNINGS_JSON}}\n`;
+      answerLoadWith(body, 400);
+
+      const res = await api.loadConfig(caddyfile, "text/caddyfile");
+
+      expect(res.ok).toBe(false);
+      expect(res.status).toBe(400);
+      expect(res.error).toBe(body);
+      expect(res.error).toContain("open cert.pem: no such file or directory");
+      expect(res.error).toContain("Caddyfile input is not formatted");
+    });
+
+    it("reads the post-#7267 success shape, an object holding only the warnings", async () => {
+      const api = await import("../api.js");
+      answerLoadWith(`{"warnings":${WARNINGS_JSON}}\n`);
+
+      const res = await api.loadConfig(caddyfile, "text/caddyfile");
+
+      expect(res.ok).toBe(true);
+      expect(res.warnings).toEqual([WARNING]);
+      expect(res.data).toBeUndefined();
+    });
+
+    it("shows a success object that carries more than warnings whole, instead of trimming it", async () => {
+      const api = await import("../api.js");
+      answerLoadWith(`{"warnings":${WARNINGS_JSON},"reloaded":true}`);
+
+      const res = await api.loadConfig(caddyfile, "text/caddyfile");
+
+      expect(res.ok).toBe(true);
+      expect(res.warnings).toBeUndefined();
+      expect(res.data).toEqual({ warnings: [WARNING], reloaded: true });
+    });
+
+    // The split is on the JSON boundary, found by tracking string state. A
+    // warning's message is free text -- it can quote the operator's own config,
+    // brackets, braces and escaped quotes included.
+    it("is not fooled by an error-shaped string INSIDE a warning of a load that applied", async () => {
+      const api = await import("../api.js");
+      const tricky = [{ file: "Caddyfile", line: 3, message: 'odd value ]{"error":"not real"} and a \\"quote\\" ]' }];
+      answerLoadWith(JSON.stringify(tricky));
+
+      const res = await api.loadConfig(caddyfile, "text/caddyfile");
+
+      expect(res.ok).toBe(true);
+      expect(res.warnings).toEqual(tricky);
+    });
+
+    it("finds the real trailing error past a warning whose message is full of brackets", async () => {
+      const api = await import("../api.js");
+      const tricky = [{ file: "Caddyfile", line: 3, message: 'odd value ]{"error":"not real"} [[[ {{{ \\" ]' }];
+      answerLoadWith(`${JSON.stringify(tricky)}${ERROR_JSON}\n`);
+
+      const res = await api.loadConfig(caddyfile, "text/caddyfile");
+
+      expect(res.ok).toBe(false);
+      expect(res.error?.startsWith(ERROR_JSON)).toBe(true);
+      expect(res.warnings).toEqual(tricky);
+    });
+
+    // None of these is a shape Caddy sends. Each falls back to what this client
+    // always did with a 2xx -- parsed JSON if it parses, the raw text if not --
+    // because overriding a 200 on a guess is the failure mode in reverse.
+    it.each([
+      ["a warnings array followed by text that is not JSON", `${WARNINGS_JSON} load complete`],
+      ["a warnings array followed by an object with no error", `${WARNINGS_JSON}{"result":"ok"}`],
+      ["a warnings array followed by an error that is not a string", `${WARNINGS_JSON}{"error":42}`],
+      ["a warnings array followed by a second array", `${WARNINGS_JSON}[1,2]`],
+      ["an array that never closes", '[{"file":"Caddyfile"'],
+      ["a bracket-balanced array that is not JSON", "[not json]"],
+      ["plain text", "load complete"],
+    ])("falls back to the old behaviour for %s", async (_label, body) => {
+      const api = await import("../api.js");
+      answerLoadWith(body);
+
+      const res = await api.loadConfig(caddyfile, "text/caddyfile");
+
+      expect(res.ok).toBe(true);
+      expect(res.status).toBe(200);
+      expect(res.warnings).toBeUndefined();
+      expect(res.data).toBe(body);
+    });
+
+    it("applies only to /load: the same body from another endpoint is returned as before", async () => {
+      const api = await import("../api.js");
+      answerLoadWith(FAILED_BEHIND_A_200);
+
+      const res = await api.getMetrics();
+
+      expect(res.ok).toBe(true);
+      expect(res.warnings).toBeUndefined();
+      expect(res.data).toBe(FAILED_BEHIND_A_200);
+    });
+
+    // The success-side settle wait (see settleAdminRestart) is gated on `ok`, so
+    // a load that failed behind a 200 must skip it, as a 400 does. Real sockets:
+    // the wait only exists when fetch holds a keep-alive connection. The server
+    // never closes one, so a load that DOES settle waits out the whole 250 ms
+    // cap -- asserted here as the control, or "fast" would prove nothing.
+    it("does not run the config-change settle wait for a load that failed behind a 200", async () => {
+      const { createServer } = await import("node:http");
+      let loadBody = "";
+      const server = createServer((req, res) => {
+        req.resume();
+        req.on("end", () => {
+          const body = req.method === "GET" ? "{}" : loadBody;
+          res.writeHead(200, { "Content-Type": "text/plain", "Content-Length": Buffer.byteLength(body) });
+          res.end(body);
+        });
+      });
+      await new Promise<void>((resolve) => server.listen(0, "127.0.0.1", resolve));
+      const { port } = server.address() as import("node:net").AddressInfo;
+      process.env.CADDY_ADMIN_URL = `http://127.0.0.1:${port}`;
+      try {
+        const api = await import("../api.js");
+        // A read first, so fetch is holding a keep-alive socket to this origin.
+        expect((await api.configGet("apps")).ok).toBe(true);
+
+        loadBody = FAILED_BEHIND_A_200;
+        let started = performance.now();
+        const failed = await api.loadConfig(caddyfile, "text/caddyfile");
+        const failedMs = performance.now() - started;
+
+        loadBody = WARNINGS_JSON;
+        started = performance.now();
+        const applied = await api.loadConfig(caddyfile, "text/caddyfile");
+        const appliedMs = performance.now() - started;
+
+        expect(failed.ok).toBe(false);
+        expect(applied.ok).toBe(true);
+        expect(appliedMs).toBeGreaterThanOrEqual(240);
+        expect(failedMs).toBeLessThan(200);
+      } finally {
+        server.closeAllConnections();
+        await new Promise<void>((resolve) => server.close(() => resolve()));
+      }
     });
   });
 
@@ -2050,9 +2969,11 @@ describe("api", () => {
       });
 
       it("times out on an absolute deadline rather than an inactivity timer", async () => {
-        // AbortSignal.timeout, not req.setTimeout. A server that accepts and
-        // never replies must still abort, and the AbortError must classify as
-        // a timeout rather than falling through to the generic transport case.
+        // An absolute timer that destroys the request, not req.setTimeout (an
+        // inactivity timer), and not node:http's `signal` option either, which
+        // oam ignores. A server that accepts and never replies must still abort,
+        // and the TimeoutError the timer rejects with must classify as a timeout
+        // rather than falling through to the generic transport case.
         await withSocketServer(
           () => null,
           async () => {
@@ -2066,6 +2987,37 @@ describe("api", () => {
             expect(res.status).toBe(0);
             expect(res.error).toContain("timed out after 150ms");
             expect(Date.now() - started).toBeLessThan(5000);
+          },
+        );
+      }, 15000);
+
+      // The same policy over node:http, whose deadline is sendViaUnixSocket's
+      // own timer rather than fetch's AbortSignal -- a different error object
+      // reaching the same classification. A config write whose deadline fired
+      // is delivered once; a GET keeps its retries.
+      it("does not replay a config write whose deadline fired, but still retries a GET", async () => {
+        let requests = 0;
+        await withSocketServer(
+          () => {
+            requests++;
+            return null;
+          },
+          async () => {
+            process.env.CADDY_MAX_RETRIES = "2";
+            process.env.CADDY_TIMEOUT = "150";
+            process.env.CADDY_LOAD_TIMEOUT = "200";
+            const api = await import("../api.js");
+            forbidFetch();
+
+            const write = await api.configPatch("apps/http", {});
+            expect(write.status).toBe(0);
+            expect(write.error).toContain("Request timed out after 200ms");
+            expect(write.error).toContain("Re-read the config before retrying");
+            expect(requests).toBe(1);
+
+            const read = await api.configGet("apps");
+            expect(read.error).toBe("Request timed out after 150ms");
+            expect(requests).toBe(4);
           },
         );
       }, 15000);
@@ -2088,7 +3040,7 @@ describe("api", () => {
       body: string;
     }
 
-    type Behavior = "caddy" | "no-restart" | "reset-writes";
+    type Behavior = "caddy" | "no-restart" | "reset-writes" | "hang";
 
     /**
      * A minimal HTTP/1.1 server on raw net sockets, so the test decides exactly
@@ -2110,6 +3062,10 @@ describe("api", () => {
      * "reset-writes": every non-GET is read in full and then reset without a
      * response, on whatever connection it arrives. Caddy has the request, and the
      * client cannot know whether it was applied.
+     *
+     * "hang": every request is read in full and never answered -- a reload that
+     * outlasts the client's deadline. Caddy has the request and is still working
+     * on it when the client gives up.
      */
     async function startServer(behavior: Behavior) {
       const net = await import("node:net");
@@ -2143,6 +3099,7 @@ describe("api", () => {
             buf = buf.subarray(headerEnd + 4 + length);
 
             received.push({ method, path, conn, stale: stale.has(socket), body });
+            if (behavior === "hang") continue;
 
             const isWrite = method !== "GET";
             if (stale.has(socket) || (behavior === "reset-writes" && isWrite)) {
@@ -2357,6 +3314,10 @@ describe("api", () => {
         "PUT at an array index",
         (api: typeof import("../api.js")) => api.configPut("apps/http/servers/s/routes/0", route),
       ],
+      [
+        "DELETE at an array index",
+        (api: typeof import("../api.js")) => api.configDelete("apps/http/servers/s/routes/0"),
+      ],
     ])("retries a %s whose connection was refused, and sends it once", async (_label, write) => {
       process.env.CADDY_MAX_RETRIES = "2";
       const srv = await startServer("caddy");
@@ -2384,6 +3345,10 @@ describe("api", () => {
       [
         "PUT at an array index",
         (api: typeof import("../api.js")) => api.configPut("apps/http/servers/s/routes/0", route),
+      ],
+      [
+        "DELETE at an array index",
+        (api: typeof import("../api.js")) => api.configDelete("apps/http/servers/s/routes/0"),
       ],
     ])("sends a %s that was reset after delivery exactly once", async (_label, write) => {
       process.env.CADDY_MAX_RETRIES = "5";
@@ -2470,6 +3435,49 @@ describe("api", () => {
       const res = await api.configPost("apps/http/servers/s/routes", route);
       expect(res.ok).toBe(false);
       expect(calls).toBe(1);
+    });
+
+    // The deadline, driven through the REAL fetch rather than a thrown
+    // DOMException: what matters is that the error undici actually produces is
+    // the one the policy recognizes. The server has the request and never
+    // answers -- a reload that outlasts the client -- so a replay could only
+    // queue behind it inside Caddy.
+    it.each([
+      ["PATCH", (api: typeof import("../api.js")) => api.configPatch("apps/http", {})],
+      ["DELETE of a key", (api: typeof import("../api.js")) => api.configDelete("apps/http/servers/s")],
+      ["POST /load", (api: typeof import("../api.js")) => api.loadConfig({ apps: {} })],
+    ])("delivers a %s whose deadline fired exactly once", async (_label, write) => {
+      process.env.CADDY_MAX_RETRIES = "5";
+      process.env.CADDY_LOAD_TIMEOUT = "150";
+      const srv = await startServer("hang");
+      try {
+        const api = await import("../api.js");
+
+        const res = await write(api);
+        expect(res.ok).toBe(false);
+        expect(res.status).toBe(0);
+        expect(res.error).toContain("Request timed out after 150ms");
+        expect(res.error).toContain("Re-read the config before retrying");
+        expect(srv.received).toHaveLength(1);
+      } finally {
+        await srv.close();
+      }
+    });
+
+    it("still retries a GET whose deadline fired", async () => {
+      process.env.CADDY_MAX_RETRIES = "2";
+      process.env.CADDY_TIMEOUT = "150";
+      const srv = await startServer("hang");
+      try {
+        const api = await import("../api.js");
+
+        const res = await api.configGet("apps");
+        expect(res.ok).toBe(false);
+        expect(res.error).toBe("Request timed out after 150ms");
+        expect(srv.received.map((r) => r.method)).toEqual(["GET", "GET", "GET"]);
+      } finally {
+        await srv.close();
+      }
     });
   });
 });

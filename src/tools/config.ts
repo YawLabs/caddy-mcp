@@ -15,7 +15,7 @@ export function registerConfigTools(server: McpServer) {
 
   server.tool(
     "caddy_config_set",
-    "Write config at a JSON path. Mode 'overwrite' (default) replaces existing values (PATCH) — safe and idempotent. Mode 'append' adds to arrays or creates keys (POST) — NOT idempotent: calling twice with the same route duplicates it. Mode 'insert' places at a specific array index (PUT) — useful for route ordering.",
+    "Write config at a JSON path. Mode 'overwrite' (default) replaces existing values (PATCH) — safe and idempotent. Mode 'append' (POST) adds to an array — NOT idempotent: calling twice with the same route duplicates it — but on a non-array key it REPLACES whatever is there, and it cannot create missing parent objects. Mode 'insert' (PUT) inserts at an array index (useful for route ordering), or strictly creates an object key together with any missing parents and fails with 409 if the key already exists — the safe way to create a server or app, including on an instance with no config at all.",
     {
       path: z.string().describe("Config path to write to (e.g., 'apps/http/servers/srv0/routes')"),
       value: z.any().describe("The JSON value to set at the path"),
@@ -24,7 +24,7 @@ export function registerConfigTools(server: McpServer) {
         .optional()
         .default("overwrite")
         .describe(
-          "'overwrite' = PATCH (replace existing, default, idempotent), 'append' = POST (add to arrays / create keys, NOT idempotent), 'insert' = PUT (insert at array index)",
+          "'overwrite' = PATCH (replace existing, default, idempotent; 404 if the key does not exist), 'append' = POST (appends to arrays, NOT idempotent; REPLACES an existing non-array key; cannot create missing parents), 'insert' = PUT (inserts at an array index, or strictly creates an object key and any missing parents; 409 if the key exists)",
         ),
     },
     { readOnlyHint: false, destructiveHint: false, idempotentHint: false, openWorldHint: false },
@@ -77,7 +77,7 @@ export function registerConfigTools(server: McpServer) {
 
   server.tool(
     "caddy_load",
-    "Replace the entire Caddy configuration atomically. Accepts a JSON config object, or a Caddyfile string with format='caddyfile'. This is the safest way to make large config changes. Has a 60-second timeout to allow for TLS provisioning. Requires confirm=true: this DISCARDS the entire running config, including servers and routes not present in the supplied config. The prior config is snapshotted first and can be restored with caddy_revert.",
+    "Replace the entire Caddy configuration atomically. Accepts a JSON config object, or a Caddyfile string with format='caddyfile'. This is the safest way to make large config changes. Runs on CADDY_LOAD_TIMEOUT (55 s by default), like every config change; a load that times out is not retried and may still apply, so re-read the config before loading again. Requires confirm=true: this DISCARDS the entire running config, including servers and routes not present in the supplied config. The prior config is snapshotted first and can be restored with caddy_revert.",
     {
       config: z
         .union([z.record(z.string(), z.any()), z.string()])
@@ -114,10 +114,36 @@ export function registerConfigTools(server: McpServer) {
       // load did not change anything server-side, so pushing a "pre-load"
       // snapshot would just consume a slot in the 10-deep ring and shift the
       // user's earlier rollback targets one position deeper for no gain.
+      //
+      // "Failed" is api.loadConfig's verdict, not the HTTP status: Caddy answers
+      // 200 for a Caddyfile load that adapted with warnings and then failed, and
+      // the api layer reports that as ok:false (see readLoadBody in api.ts). It
+      // used to arrive here as a success and burn a ring slot on a config that
+      // had not been replaced -- so this guard must keep keying on `res.ok` and
+      // never on `res.status`. Adapter warnings ride on the response either way
+      // and formatResult prints them.
+      //
+      // The one failure that DOES keep the snapshot is a load whose deadline
+      // fired (`res.outcomeUnknown`). A timed-out config change is never
+      // replayed (shouldRetry rule 3 in api.ts), and Caddy goes on applying a
+      // load it has read after the client hangs up -- so this load may have
+      // replaced the running config after all. Dropping the pre-load config
+      // already read into `current` would leave nothing to revert to in exactly
+      // the case where the old config may be gone. If the load never applied,
+      // the cost is the one this deferral otherwise avoids: a ring slot, holding
+      // the config read just before the load was sent.
       const current = await api.configGet();
       const res = await api.loadConfig(config, contentType);
-      if (res.ok && current.ok && isSnapshotableConfig(current.data)) {
-        saveSnapshot(current.data, "caddy_load");
+      const kept = (res.ok || res.outcomeUnknown === true) && current.ok && isSnapshotableConfig(current.data);
+      if (kept) saveSnapshot(current.data, "caddy_load");
+      if (res.outcomeUnknown && kept) {
+        return formatResult({
+          ...res,
+          error:
+            `${res.error}\nThe pre-load config was kept anyway, as snapshot [0] (trigger=caddy_load): if this ` +
+            `load did apply, caddy_revert { action: "apply", index: 0, confirm: true } restores what it ` +
+            `replaced. If it did not, that snapshot is simply the config read just before the load was sent.`,
+        });
       }
       return formatResult(res);
     },
@@ -202,7 +228,33 @@ export function registerConfigTools(server: McpServer) {
       // snapshot the user meant to apply, silently shifting the target by one.
       const current = await api.configGet();
       const res = await api.loadConfig(snap.config, "application/json");
-      if (!res.ok) return formatResult(res);
+      if (!res.ok) {
+        // Except when the load's deadline fired (`res.outcomeUnknown`): then the
+        // revert may have applied (see the same exception in caddy_load), and
+        // the config it replaced is recorded nowhere else. Keep it -- and since
+        // keeping it causes exactly the shift the deferral above avoids, SAY so,
+        // with the target's new index, rather than let a retried `apply` quietly
+        // load something else.
+        if (res.outcomeUnknown && current.ok && isSnapshotableConfig(current.data)) {
+          saveSnapshot(current.data, "caddy_revert");
+          // Located by identity, not computed as index + 1: the ring is capped,
+          // so the target can have fallen off the end.
+          const now = listSnapshots().indexOf(snap);
+          const target =
+            now === -1
+              ? `the snapshot you asked to apply ([${index}]) has dropped out of the ring`
+              : `the snapshot you asked to apply is now [${now}]`;
+          return formatResult({
+            ...res,
+            error:
+              `${res.error}\nThe pre-revert config was kept anyway, as snapshot [0] (trigger=caddy_revert), so ` +
+              `this revert can still be rolled back if it did apply. That moved every older snapshot down one ` +
+              `index: ${target}, so re-running apply with index ${index} would load a different snapshot. List ` +
+              `the snapshots before retrying.`,
+          });
+        }
+        return formatResult(res);
+      }
       const capturedRollforward = current.ok && isSnapshotableConfig(current.data);
       if (capturedRollforward) {
         saveSnapshot(current.data, "caddy_revert");
@@ -253,7 +305,7 @@ export function registerConfigTools(server: McpServer) {
         .optional()
         .default("overwrite")
         .describe(
-          "For 'set' action: 'overwrite' = PATCH (replace existing, default), 'append' = POST (add to arrays, create on objects), 'insert' = PUT (insert at array index)",
+          "For 'set' action: 'overwrite' = PATCH (replace the identified object, or the value at subpath; default). 'append' = POST and 'insert' = PUT behave as in caddy_config_set at the resolved path: with a subpath into an array, POST appends and PUT inserts at the index; PUT also strictly creates an object key (409 if it exists). With NO subpath: for an array element (a route) neither replaces it — POST adds the value as a new element at the end of that array, PUT inserts it just before the identified one, and both are rejected with 'duplicate ID' if the value carries the same @id; for an object held under a key (a server) POST REPLACES it wholesale and PUT fails with 409. Use 'overwrite' to replace in place.",
         ),
       confirm: z
         .boolean()

@@ -570,45 +570,74 @@ describe("caddy-mcp tools", () => {
       return calls.find((c) => c[0] === "caddy_tls")?.[4];
     }
 
-    it("surfaces both PATCH and POST errors when GET says absent and POST fallback fails", async () => {
+    // The wire shape of a fresh instance, as Caddy 2.11.4 actually sends it: the
+    // GET of apps/tls fails the path walk with a 400, it does not 404. These two
+    // used to fake a 404 and a POST; the create is a PUT now (it makes the missing
+    // parents, and is strictly-create), so an unexpected POST fails loudly below.
+    const TRAVERSAL = '{"error":"invalid traversal path at: config/apps"}';
+
+    it("creates apps/tls with a PUT on a config-less instance, through the real api layer", async () => {
+      const handler = await getTlsHandler();
+      const sent: Array<{ method: string; path: string; body?: any }> = [];
+      globalThis.fetch = vi.fn(async (url: any, opts: any) => {
+        const path = new URL(url.toString()).pathname;
+        sent.push({ method: opts?.method, path, body: opts?.body ? JSON.parse(opts.body) : undefined });
+        if (opts?.method === "PATCH") return new Response(TRAVERSAL, { status: 500 });
+        if (opts?.method === "GET") return new Response(TRAVERSAL, { status: 400 });
+        if (opts?.method === "PUT") return new Response("", { status: 200 });
+        return new Response(`unexpected ${opts?.method} ${path}`, { status: 500 });
+      }) as any;
+      const result = await handler({ action: "set_email", email: "foo@bar.com" });
+      expect(result.isError).toBeFalsy();
+      expect(result.content[0].text).toBe("ACME email set to: foo@bar.com");
+      const puts = sent.filter((r) => r.method === "PUT");
+      expect(puts).toHaveLength(1);
+      expect(puts[0].path).toBe("/config/apps/tls");
+      expect(puts[0].body).toEqual({
+        automation: { policies: [{ issuers: [{ module: "acme", email: "foo@bar.com" }] }] },
+      });
+      expect(sent.some((r) => r.method === "POST")).toBe(false);
+    });
+
+    it("surfaces both PATCH and PUT errors when apps/tls is not set and the PUT fallback fails", async () => {
       const handler = await getTlsHandler();
       globalThis.fetch = vi.fn(async (_url: any, opts: any) => {
         if (opts?.method === "PATCH") {
           return new Response("patch-reason-unique", { status: 500 });
         }
         if (opts?.method === "GET") {
-          // Simulate fresh instance — apps/tls absent.
-          return new Response("not found", { status: 404 });
+          // Simulate fresh instance — no config, so the path walk fails.
+          return new Response(TRAVERSAL, { status: 400 });
         }
-        if (opts?.method === "POST") {
-          return new Response("post-reason-unique", { status: 500 });
+        if (opts?.method === "PUT") {
+          return new Response("put-reason-unique", { status: 500 });
         }
         return new Response("{}", { status: 200 });
       }) as any;
       const result = await handler({ action: "set_email", email: "foo@bar.com" });
       expect(result.isError).toBe(true);
       expect(result.content[0].text).toContain("patch-reason-unique");
-      expect(result.content[0].text).toContain("post-reason-unique");
+      expect(result.content[0].text).toContain("put-reason-unique");
     });
 
-    it("surfaces both PATCH and POST errors for set_acme_ca too", async () => {
+    it("surfaces both PATCH and PUT errors for set_acme_ca too", async () => {
       const handler = await getTlsHandler();
       globalThis.fetch = vi.fn(async (_url: any, opts: any) => {
         if (opts?.method === "PATCH") {
           return new Response("acme-patch-err", { status: 500 });
         }
         if (opts?.method === "GET") {
-          return new Response("not found", { status: 404 });
+          return new Response(TRAVERSAL, { status: 400 });
         }
-        if (opts?.method === "POST") {
-          return new Response("acme-post-err", { status: 500 });
+        if (opts?.method === "PUT") {
+          return new Response("acme-put-err", { status: 500 });
         }
         return new Response("{}", { status: 200 });
       }) as any;
       const result = await handler({ action: "set_acme_ca", ca: "https://ca.example.com/directory" });
       expect(result.isError).toBe(true);
       expect(result.content[0].text).toContain("acme-patch-err");
-      expect(result.content[0].text).toContain("acme-post-err");
+      expect(result.content[0].text).toContain("acme-put-err");
     });
 
     it("refuses to clobber when GET returns existing config with unexpected shape", async () => {

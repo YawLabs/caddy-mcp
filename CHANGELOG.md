@@ -7,6 +7,236 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+- **`caddy_remove_route` by index can no longer remove more than one route.** A
+  `DELETE` at an array index was retried like any other `DELETE` when no response
+  arrived, but Caddy removes an element by re-packing the array, so a replay removed
+  whatever had slid into that index — and replays of a change Caddy was still
+  applying queued on its config lock and each ran against the re-packed array, so
+  one call could remove up to 1 + `CADDY_MAX_RETRIES` routes (3 by default, 6 at the
+  cap) and still report a failure. Nothing guarded it: `caddy_remove_route` reads
+  `.../routes` and deletes `.../routes/<n>`, so no cached ETag matched the path and no
+  `If-Match` went with the replay. Reproduced against Caddy 2.11.4 with another
+  reload holding the config lock for 4 s and a 1 s deadline: 2.5.2 sent
+  `DELETE .../routes/0` three times and routes r0, r1 and r2 were all gone, under a
+  "Request timed out" error; Caddy now receives it once and only r0 goes. A `DELETE`
+  at an array index is now held to the rule a `PUT` there already was — never
+  replayed after a lost response or a gateway status — which also covers
+  `caddy_config_delete` on a path ending in an index and a `caddy_config_by_id`
+  delete with an index subpath; and a config change whose deadline fired is never
+  replayed at all (see Changed). A refused connection is still retried for every
+  method, since nothing was sent. The index match now also catches a path with
+  trailing slashes, which Caddy trims (`DELETE .../routes/0/` removes element 0 on
+  2.11.4) and which walked straight past both the `DELETE` and the `PUT` carve-out.
+- **`caddy_load` no longer reports a failed Caddyfile load as a success.** Caddy
+  2.11.4 writes the config adapter's warnings to the response before it runs the
+  load, which fixes the status at 200; if the load then fails, its error object is
+  appended after the warnings — `[..warnings..]{"error":"..."}` — and the previous
+  config keeps running
+  ([caddyserver/caddy#7246](https://github.com/caddyserver/caddy/issues/7246)). The
+  adapter warns about any Caddyfile `caddy fmt` would change — a space-indented one,
+  for instance — so this is the common shape of a failed load, not a corner. 2.5.2
+  printed that body as the result with no error flag, saved a "pre-load" snapshot of
+  a config that had not been replaced, and cleared the ETag cache. The tool now
+  returns an error that starts with Caddy's `{"error":...}` object verbatim, says
+  Caddy answered HTTP 200 but the body carries a load error, and lists the warnings;
+  no snapshot is saved, the ETag cache is kept and nothing is retried, exactly as for
+  the 400 Caddy sends for the same failure when there are no warnings. Reproduced
+  against Caddy 2.11.4 with a space-indented Caddyfile whose `tls` directive names a
+  certificate file that does not exist; a live integration test now loads it.
+- **`caddy_tls ech_status` read the wrong key, so it always said "not
+  configured".** It read `apps/tls/ech`; the TLS app's JSON key is
+  `encrypted_client_hello`, and `ech` is only the Caddyfile global option. Caddy
+  answers a GET of an unknown final key with 200 `null`, so the wrong path failed
+  silently even with ECH on, and the not-configured hint told operators to load
+  `apps.tls.ech`, which Caddy rejects with 400 `json: unknown field "ech"`. Verified
+  against Caddy 2.11.4 with ECH on: `apps/tls/ech` reads 200 `null`, and
+  `apps/tls/encrypted_client_hello` reads the ECH config. The action now reads the
+  right key, and a live integration test pins it. It reports "not configured" for a
+  200 `null` and for a 400 `invalid traversal path` (no `apps/tls`, no `apps` key, or
+  no config at all — previously a raw Go error), and its hint names
+  `apps.tls.encrypted_client_hello`. A 404 is no longer read as "not configured":
+  Caddy does not answer a config GET with 404, so one comes from some other layer
+  and is now surfaced as an error. The 2.3.0 entry below records the wrong path as
+  it shipped; this entry is the correction.
+- **`caddy_tls set_email` / `set_acme_ca` / `set_acme_profile` work on a fresh
+  instance.** The tool said they did, but on a null config (`caddy run` with no
+  config), a config of `{}`, or any config without an `apps` key they failed with two
+  raw Go errors. The fallback expected its GET of `apps/tls` to answer 404; Caddy
+  answers 400 `invalid traversal path` when a parent is missing, and the `POST` the
+  fallback would then have sent cannot create `apps/tls` without an `apps` parent
+  either (500, the same error). The fallback now treats a traversal failure as "not
+  set" and creates `apps/tls` with `PUT`, which creates missing parents and is
+  strictly-create. Verified against Caddy 2.11.4 from both `{}` and a null config,
+  where live tests now run all three actions. Two visible differences: the fallback
+  line of an error reads `PUT fallback:` instead of `POST fallback:`, and if
+  `apps/tls` appears between the read and the write, the call now fails with Caddy's
+  409 `key already exists: tls` verbatim plus a hint naming both ways that can happen
+  (another writer, or an earlier attempt of the same write that landed and lost its
+  response). Nothing is overwritten, and re-running merges; a `POST` there would have
+  replaced the whole TLS config with a one-issuer stub. A 404 from the read no longer
+  counts as "not set": Caddy never answers a config GET with 404, so one comes from
+  some other layer (a proxy, a wrong `CADDY_ADMIN_URL`) and says nothing about
+  `apps/tls`. The fallback now shows that 404 verbatim, as `GET apps/tls fallback:`,
+  next to the `PATCH` error and writes nothing. It used to go on to create `apps/tls`,
+  so where `apps/tls` did exist it got a 409 whose hint named two causes that were
+  both false, and every re-run hit the same 404 and the same 409.
+- **`caddy_tls status` on an instance with no TLS config says so.** It returned a
+  raw `invalid traversal path` error when there was no `apps` key or no config, and
+  the bare word `null` when `apps` existed without `tls`. It now answers "No TLS
+  config is set on this instance (apps/tls is not set), so Caddy's TLS defaults
+  apply." and names the actions that create it. Any other read failure is still an
+  error.
+- **The "server does not exist" advice names the mode that works.**
+  `caddy_reverse_proxy`, `caddy_add_route` and `caddy_list_routes` now say
+  `caddy_config_set { path: "apps/http/servers/<srv>", mode: "insert", value: {
+  "listen": [":443"], "routes": [] } }`. They said `mode: "append"`, and that on an
+  instance with no config at all `caddy_config_set` "cannot create the apps/http
+  tree", which sent operators to `caddy_load` — a confirm-gated replace of the whole
+  config — for a one-key write. Both were wrong. Verified against Caddy 2.11.4 on an
+  instance with no config: `POST` answers 500 `invalid traversal path at:
+  config/apps`, `PUT` answers 200 and creates the parents, the same `PUT` again
+  answers 409, and a `POST` over an existing server replaces it, routes and all. The
+  live test now follows the recipe through `caddy_config_set`. The
+  `caddy_list_routes` error for a server that is "not configured, or its config is
+  null" names `mode: "insert"` too. It explains that a 409 from that insert means only
+  that the key exists now: it may hold a null config, or it may have been created after
+  the read, by another writer or by an earlier attempt of the same write whose response
+  was lost. So it says to re-read the key with `caddy_config_get` first, and to use
+  `mode: "overwrite"` only if the key still reads null, because overwrite replaces the
+  whole server, routes included. Verified against Caddy 2.11.4: a server another
+  client created after the null read made the insert fail with 409 `key already
+  exists`, and the re-read showed that server with its route. This supersedes the
+  recipe the 2.4.0 entry below describes.
+- **A `caddy_config_by_id` `set` with `mode: "insert"` and no subpath can no longer
+  insert a route twice.** It sends `PUT /id/<id>`, which was retried after a reset or a
+  gateway status like any `PUT` to a key. Caddy expands the id to the path it indexes,
+  and for a route that path ends in an array index, so the `PUT` inserts the value just
+  before that element. Caddy then rebuilds its id index, so a replay resolved the id
+  to the element's new position and inserted a second copy (a value with no `@id` is
+  accepted twice), up to 1 + `CADDY_MAX_RETRIES` copies. Verified against Caddy
+  2.11.4: the same `PUT /id/<route id>` sent twice answered 200 both times and left
+  two copies in front of the route. A bare `PUT /id/<id>` is now
+  treated like a `PUT` at an array index: never replayed after a lost response or a
+  gateway status, though still retried when the connection was refused. An id that
+  names a server loses nothing, since a `PUT` there answers 409 anyway.
+
+### Changed
+- **Behavior change: only 502, 503 and 504 are retried, not every 5xx.** Caddy's
+  admin API never sends a gateway status itself, so one can only come from a proxy
+  in front of it — the case the retry exists for. What Caddy sends is 500, and its
+  500s are deterministic rejections: `loading new config: ...` (the new config failed
+  validation or provisioning), an undecodable body, `array index out of bounds`,
+  `invalid traversal path`. None of them changes the config, so a replay got the same
+  500, and each one cost another ERROR line in Caddy's log. A load that failed while
+  provisioning the apps (an unknown handler, say) had also restarted Caddy's admin
+  endpoint, so each replay of that one restarted it again. The others are refused
+  before any load runs and restart nothing. Measured against Caddy 2.11.4: a `PATCH`
+  naming an unknown handler went out 3 times at the default `CADDY_MAX_RETRIES`
+  (3 ERROR lines, 3 admin restarts) and now goes out once, with Caddy's body
+  unchanged; the traversal, index, undecodable-body and unknown-field 500s left the
+  admin endpoint running. The cheap kind was also the ordinary path for `caddy_tls
+  set_*` on an instance with no `apps/tls`, whose first `PATCH` fails with a 500
+  `invalid traversal path` by design: each call spent two wasted round trips and two
+  ERROR lines on replays before it got to the write. What an operator sees: a proxy that
+  answers 500, 501 or any 5xx other than 502/503/504 during an outage is no longer
+  retried. 4xx, including 412, still never is.
+- **Behavior change: every config write now runs on `CADDY_LOAD_TIMEOUT`, not
+  `CADDY_TIMEOUT` (default 10 s), and `CADDY_LOAD_TIMEOUT` now defaults to 55 s, not
+  60 s.** That is every `POST`, `PUT`, `PATCH`
+  and `DELETE` under `/config/` and `/id/`, alongside `POST /load`, which already
+  did. Inside Caddy each of them is the same synchronous full reload — it takes the
+  config lock, provisions and starts the whole new config and stops the old one
+  before it answers — so a reload `/load` would have waited out was reported as a
+  timeout on a write. One documented way there is `apps.http.shutdown_delay`, which
+  Caddy sleeps through inside the reload whenever a change closes a listener
+  (deleting a server, editing `listen`); a change waiting on the config lock behind
+  another reloader is another. Reproduced against Caddy 2.11.4 with `shutdown_delay:
+  4s` and `CADDY_TIMEOUT=2000`: deleting a server took 4.0 s and applied, and 2.5.2
+  timed out, replayed, and reported `404 key does not exist` for its own successful
+  delete; the same call now answers 200. What an operator sees: `CADDY_TIMEOUT` now
+  covers only requests that change nothing — GETs, `/adapt`, `/stop`, PKI, upstreams
+  and metrics — so a value set to lengthen or shorten config writes has to move to
+  `CADDY_LOAD_TIMEOUT`; and a write that gets no answer now waits up to 55 s by
+  default before it fails, where it used to give up after 10 s per attempt. The
+  default is below 60 s because the MCP SDK's client abandons a tool call after 60 s
+  unless the host sets its own timeout, and its timer starts first. With a 60 s
+  deadline the client always gave up first, so the outcome-unknown error described
+  below was never delivered. We reproduced this with an MCP SDK client on its default
+  options, pointed at a stand-in admin endpoint that never answered: the client threw
+  `MCP error -32001: Request timed out` at 60.01 s, and caddy-mcp's deadline fired at
+  60.07 s. The same goes for `POST /load`, which had 60 s on its own before. Keep
+  `CADDY_LOAD_TIMEOUT` below your MCP client's request timeout. `caddy_load`'s tool
+  description no longer says it has "a 60-second timeout to allow for TLS
+  provisioning": ACME issuance runs in the background and does not hold up a reload.
+- **Behavior change: a config change whose timeout fires is never retried, and the
+  error says the outcome is unknown.** Before, a timed-out `PATCH`, `DELETE`, `PUT` to
+  a key or `POST /load` was replayed up to `CADDY_MAX_RETRIES` times — three 60 s
+  attempts for a `/load` at the defaults. Caddy does not cancel a change when the
+  client hangs up, so a replay does not race the first request: it queues behind it
+  and then runs against the config the first request already changed. That is where
+  the false 404 above came from, and it could as easily produce a false 412 (when an
+  `If-Match` was cached) or remove a second route at an array index. The error now
+  reads `Request timed out after Nms -- the outcome is unknown: Caddy may still be
+  applying this change.`, explains why, and ends by saying to re-read the config
+  before retrying and, if reloads on the instance legitimately take that long, to
+  raise `CADDY_LOAD_TIMEOUT` while keeping it below the MCP client's request timeout;
+  it names no cause. The ETag cached for the path is kept, so a re-issued write still
+  sends `If-Match` and gets Caddy's 412 if the first attempt changed that value. GETs,
+  `/adapt`, `/stop`, PKI, upstreams and metrics still retry after a timeout and keep
+  the bare `Request timed out after Nms`.
+- **Timeouts are recognised by the error's name, so the rule above holds on oam
+  too.** A timeout was recognised by the words "abort" or "timeout" in the error
+  message. oam's fetch says `The operation timed out`, which has neither. oam is the
+  runtime `bin/caddy-mcp.mjs` picks when oam 0.15.2 or newer is installed, so there a
+  timed-out write was still replayed and came back with that bare runtime message. A
+  timeout is now recognised by the error's name (`TimeoutError` or `AbortError`,
+  anywhere in its cause chain), with the text match kept as a fallback. We ran the
+  bundled client against a stand-in endpoint that never answered, with a 300 ms
+  budget. Under oam 0.16.2, a `PATCH`, a `DELETE` of a key, a bare `PUT /id/<id>` and a
+  `POST /load` each reached the endpoint once and came back with the outcome-unknown
+  error, as they do under Node 22. Over a unix socket, the deadline is now an explicit
+  timer that destroys the request. It used to be node:http's `signal` option, which
+  oam ignores.
+- **`caddy_load` and `caddy_revert` keep their snapshot when the outcome is
+  unknown.** Both saved it only when the load succeeded. With no replay after a
+  timeout (see above), a timed-out load that went on to apply dropped the config it
+  replaced, and `caddy_revert` had nothing to restore. In 2.5.2 a replay covered this
+  whenever the reload finished inside the retry window: Caddy answers an identical load
+  200 once the first one finishes, and that 200 saved the snapshot. The api layer now flags a config change whose deadline
+  fired (`outcomeUnknown` on the response), and in that case both tools keep the
+  config they read before the load. The error says it was kept as snapshot `[0]`. For
+  a revert, keeping it moves every older snapshot down one index, so the error also
+  gives the new index of the snapshot being applied, or says it has dropped out of the
+  10-deep ring. Other failures still keep nothing.
+- **`caddy_load` prints Caddyfile adapter warnings readably.** A load that applied
+  with warnings used to print Caddy's raw JSON array. It now prints `OK`, then
+  `Adapter warnings (N):` and one line per warning in the form Caddy's own
+  `Warning.String()` uses, e.g. `- Caddyfile:2: Caddyfile input is not formatted;
+  run 'caddy fmt --overwrite' to fix inconsistencies`; a warning of any other shape
+  is printed as its JSON rather than trimmed. A failed load carries the same block
+  after its error. The response shapes
+  [caddyserver/caddy#7267](https://github.com/caddyserver/caddy/pull/7267)
+  introduces (open, milestoned v2.11.5; read from its diff, not run) are handled
+  too: a 400 `{"error","warnings"}` comes through verbatim, and a 200
+  `{"warnings":[..]}` is read like the 2.11.4 array.
+- **`caddy_config_set` and `caddy_config_by_id` describe `append` and `insert` the
+  way Caddy behaves.** `append` (`POST`) appends to an array, but on a non-array key
+  it replaces whatever is there, and it cannot create missing parent objects; the
+  old text said it "creates keys". `insert` (`PUT`) inserts at an array index, or
+  strictly creates an object key together with any missing parents and answers 409
+  if the key exists — the safe way to create a server or app, including on an
+  instance with no config; the old text mentioned array indexes only.
+  `caddy_config_by_id` now spells out what the two do with no subpath: on a route,
+  `POST` adds a new element at the end of the array and `PUT` inserts one before it
+  (both rejected with `duplicate ID` if the value carries the same `@id`); on a
+  server, `POST` replaces it wholesale and `PUT` answers 409. Each of those was
+  checked against Caddy 2.11.4.
+- README: the `CADDY_MAX_RETRIES`, `CADDY_TIMEOUT` and `CADDY_LOAD_TIMEOUT` rows,
+  and the `caddy_config_set`, `caddy_load` and `caddy_tls` entries, match the
+  above; `caddy_tls` now lists `set_acme_profile` and `ech_status`, which it had
+  omitted since 2.3.0.
+
 ## [2.5.2] — 2026-09-14
 
 ### Changed

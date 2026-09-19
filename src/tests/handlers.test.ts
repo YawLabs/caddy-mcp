@@ -281,20 +281,31 @@ describe("tool handler behavior", () => {
     });
 
     it("gives create-it advice that actually works", async () => {
-      // Every clause here was live-verified, and the ORIGINAL advice failed on two
-      // of them: mode "append" (POST) creates the key while the default
-      // "overwrite" (PATCH) answers "key does not exist", and "routes": [] must be
-      // present or the first route POST dies with "cannot unmarshal object into
-      // ... RouteList" -- POST creates a missing routes key as an object, not an
-      // array. Advice that does not work is worse than no advice: it costs the
-      // operator a round of debugging before they distrust it.
+      // Every clause here was live-verified, and the advice has now been wrong
+      // twice. The ORIGINAL omitted the mode and "routes": [] -- the default
+      // "overwrite" (PATCH) answers "key does not exist", and without "routes": []
+      // the first route POST dies with "cannot unmarshal object into ...
+      // RouteList", because POST creates a missing routes key as an object, not an
+      // array. The SECOND named mode "append" (POST) and claimed that on an
+      // instance with no config "caddy_config_set cannot create the apps/http
+      // tree". Verified on 2.11.4: POST there is 500 "invalid traversal path at:
+      // config/apps", but PUT (mode "insert") creates the missing parents and
+      // answers 200 -- and POST over a server that DOES exist replaces it, where
+      // PUT answers 409. Advice that does not work is worse than no advice: it
+      // costs the operator a round of debugging before they distrust it, and this
+      // one sent them to caddy_load, a whole-config replace, for a one-key write.
       api.configPost.mockResolvedValue(err(404, "Not Found"));
 
       const text = (await handler({ from: "app.local", to: ["localhost:3000"], server: "srv99" })).content[0].text;
 
       expect(text).toContain('"routes": []');
-      expect(text).toContain('mode: "append"');
-      expect(text).toContain("caddy_load");
+      expect(text).toContain('mode: "insert"');
+      // "append" may be NAMED -- as the verb to avoid -- but never recommended.
+      expect(text).not.toContain('mode: "append"');
+      // The false limitation, and the detour it sent operators on, are gone.
+      // (POST "cannot create missing parents" is still said, because it is true.)
+      expect(text).not.toContain("cannot create the apps/http tree");
+      expect(text).not.toContain("caddy_load");
     });
 
     it("surfaces an ordinary validation failure verbatim, NOT as server-not-found", async () => {
@@ -717,6 +728,22 @@ describe("tool handler behavior", () => {
       // wire, and naming the likelier one is the 1.2.5 mistake.
       expect(result.content[0].text).toContain("is not configured, or its config is null");
       expect(result.content[0].text).toContain("caddy_list_servers");
+      // The recipe names its mode. Left unnamed, the caller lands on the default
+      // "overwrite" -- a PATCH, which 404s on an unknown server. "insert" (PUT) is
+      // strictly-create, so it cannot damage either case.
+      expect(result.content[0].text).toContain('mode: "insert"');
+      expect(result.content[0].text).toContain("409");
+      // But a 409 from that PUT proves only that the key exists NOW: it may have
+      // held null all along, or been created after this read (another writer, or
+      // a replay of this same PUT whose first response was lost). The text used to
+      // name the first cause alone and prescribe "overwrite" -- a PATCH that would
+      // wipe a real server's routes in the other two cases. It must cover every
+      // cause and send the caller to re-read before overwriting.
+      expect(result.content[0].text).not.toContain("the server is present with a null config");
+      expect(result.content[0].text).toContain("created after this read");
+      expect(result.content[0].text).toContain("an earlier attempt of this same write");
+      expect(result.content[0].text).toContain('caddy_config_get { path: "apps/http/servers/typo" }');
+      expect(result.content[0].text).toContain('mode "overwrite" only if that read still shows null');
     });
 
     it("answers a config-less instance with the create-it recipe, not a Go error", async () => {
@@ -731,7 +758,11 @@ describe("tool handler behavior", () => {
 
       expect(result.isError).toBe(true);
       expect(result.content[0].text).toContain('Server "srv0" does not exist');
-      expect(result.content[0].text).toContain("caddy_load");
+      // This IS the config-less state, so the recipe has to be one that works
+      // there: mode "insert" (PUT) creates the missing apps/http/servers parents.
+      // It used to say caddy_load was the only way, which is false on 2.11.4.
+      expect(result.content[0].text).toContain('mode: "insert"');
+      expect(result.content[0].text).not.toContain("caddy_load");
       // The raw Go error must not be what the operator reads.
       expect(result.content[0].text).not.toContain("invalid traversal path");
     });
@@ -1099,41 +1130,143 @@ describe("tool handler behavior", () => {
       expect(result.content[0].text).toContain("test@example.com");
     });
 
-    // Branch 1: apps/tls absent — POST a fresh structure.
-    it("PATCH fails + apps/tls 404 -> POSTs fresh apps/tls", async () => {
-      api.configPatch.mockResolvedValue(err(500, "key does not exist"));
-      api.configGet.mockResolvedValue(err(404, "not found"));
-      api.configPost.mockResolvedValue(ok());
+    // Branch 1: apps/tls not set -- create it, with PUT.
+    //
+    // These fixtures are the three shapes a live Caddy 2.11.4 actually answers
+    // with. The originals mocked a GET 404, which Caddy never sends for a config
+    // path (every GET error is wrapped as 400), so the suite stayed green while
+    // set_* failed on every fresh instance: the traversal 400s below fell through
+    // to "any other GET failure" and came back as two raw Go errors.
+    const FRESH_STATES: Array<[string, ApiResponse, ApiResponse]> = [
+      [
+        "a null config (bare `caddy run`)",
+        err(500, '{"error":"invalid traversal path at: config/apps"}'),
+        err(400, '{"error":"invalid traversal path at: config/apps"}'),
+      ],
+      [
+        "a config of {} / no `apps` key",
+        err(500, '{"error":"invalid traversal path at: config/apps/tls"}'),
+        err(400, '{"error":"invalid traversal path at: config/apps/tls"}'),
+      ],
+      [
+        "`apps` present without tls (200 null)",
+        err(500, '{"error":"invalid traversal path at: config/apps/tls/automation"}'),
+        ok(null),
+      ],
+    ];
+
+    it.each(FRESH_STATES)("set_email on %s -> PUTs a fresh apps/tls", async (_label, patchRes, getRes) => {
+      api.configPatch.mockResolvedValue(patchRes);
+      api.configGet.mockResolvedValue(getRes);
+      api.configPut.mockResolvedValue(ok());
 
       const result = await handler({ action: "set_email", email: "test@example.com" });
 
       expect(api.configGet).toHaveBeenCalledWith("apps/tls");
-      expect(api.configPost).toHaveBeenCalledWith("apps/tls", {
+      expect(api.configPut).toHaveBeenCalledTimes(1);
+      expect(api.configPut).toHaveBeenCalledWith("apps/tls", {
         automation: {
           policies: [{ issuers: [{ module: "acme", email: "test@example.com" }] }],
         },
       });
-      expect(api.configPut).not.toHaveBeenCalled();
-      expect(result.content[0].text).toContain("test@example.com");
+      // Never POST: on the first two states it cannot create the missing parents
+      // (500, the same traversal failure), and on any state it REPLACES an
+      // apps/tls that appeared since the GET, where PUT answers 409.
+      expect(api.configPost).not.toHaveBeenCalled();
+      expect(mergeCall()).toBeUndefined();
+      expect(result.isError).toBeFalsy();
+      expect(result.content[0].text).toBe("ACME email set to: test@example.com");
+      // The Go error is handled, not leaked.
+      expect(result.content[0].text).not.toContain("invalid traversal path");
     });
 
-    it("PATCH fails + GET returns undefined data -> POSTs fresh apps/tls", async () => {
+    it.each([
+      ["set_acme_ca", { ca: "https://acme.example.com/dir" }],
+      ["set_acme_profile", { profile: "shortlived" }],
+    ])("%s on a null config also PUTs a fresh apps/tls", async (action, args) => {
+      // All three set_* actions share setIssuerField, so the fresh-instance fix
+      // must hold for each of them, not just the one that was reported.
+      api.configPatch.mockResolvedValue(err(500, '{"error":"invalid traversal path at: config/apps"}'));
+      api.configGet.mockResolvedValue(err(400, '{"error":"invalid traversal path at: config/apps"}'));
+      api.configPut.mockResolvedValue(ok());
+
+      const result = await handler({ action, ...(args as Record<string, string>) });
+
+      expect(api.configPut).toHaveBeenCalledWith("apps/tls", {
+        automation: { policies: [{ issuers: [{ module: "acme", ...(args as Record<string, string>) }] }] },
+      });
+      expect(api.configPost).not.toHaveBeenCalled();
+      expect(result.isError).toBeFalsy();
+    });
+
+    it("PATCH fails + GET 404 -> surfaces the GET's 404 verbatim and writes nothing", async () => {
+      // Caddy never answers a config GET with 404 (every readConfig error is a 400),
+      // so this is some other layer -- a proxy, a wrong CADDY_ADMIN_URL -- and says
+      // nothing about apps/tls. It used to be read as "absent": when apps/tls did
+      // exist, the create-PUT got a 409 whose hint named two causes that were both
+      // false, and a re-run met the same 404 and the same 409 every time.
+      api.configPatch.mockResolvedValue(err(404, "key does not exist"));
+      api.configGet.mockResolvedValue(err(404, "404 page not found"));
+
+      const result = await handler({ action: "set_acme_profile", profile: "shortlived" });
+
+      expect(api.configPut).not.toHaveBeenCalled();
+      expect(api.configPost).not.toHaveBeenCalled();
+      expect(mergeCall()).toBeUndefined();
+      expect(result.isError).toBe(true);
+      const text = result.content[0].text;
+      expect(text).toContain("PATCH attempt: key does not exist");
+      expect(text).toContain("GET apps/tls fallback: 404 page not found");
+      // No create was attempted, so no create-conflict story is told.
+      expect(text).not.toContain("something else created it");
+    });
+
+    it("PATCH fails + GET returns undefined data -> PUTs fresh apps/tls", async () => {
       api.configPatch.mockResolvedValue(err(500, "key does not exist"));
       api.configGet.mockResolvedValue(ok(undefined));
-      api.configPost.mockResolvedValue(ok());
+      api.configPut.mockResolvedValue(ok());
 
       const result = await handler({ action: "set_acme_ca", ca: "https://acme.example.com/dir" });
 
-      expect(api.configPost).toHaveBeenCalledWith("apps/tls", {
+      expect(api.configPut).toHaveBeenCalledWith("apps/tls", {
         automation: {
           policies: [{ issuers: [{ module: "acme", ca: "https://acme.example.com/dir" }] }],
         },
       });
-      expect(api.configPut).not.toHaveBeenCalled();
+      expect(api.configPost).not.toHaveBeenCalled();
       expect(result.content[0].text).toContain("https://acme.example.com/dir");
     });
 
-    // Branch 2: shape OK — deep-merge into existing config and PUT it back.
+    it("a create that loses the race surfaces Caddy's 409 verbatim, and writes nothing else", async () => {
+      // apps/tls read as not set, then something created it before our PUT. POST
+      // would have replaced that whole TLS config with a one-issuer stub and
+      // reported success; PUT is strictly-create, so Caddy answers 409 -- verified
+      // on 2.11.4: {"error":"[/config/apps/tls] key already exists: tls"}.
+      api.configPatch.mockResolvedValue(err(500, '{"error":"invalid traversal path at: config/apps/tls"}'));
+      api.configGet.mockResolvedValue(err(400, '{"error":"invalid traversal path at: config/apps/tls"}'));
+      api.configPut.mockResolvedValue(err(409, '{"error":"[/config/apps/tls] key already exists: tls"}'));
+
+      const result = await handler({ action: "set_email", email: "test@example.com" });
+
+      expect(result.isError).toBe(true);
+      const text = result.content[0].text;
+      // Both of Caddy's errors, untranslated.
+      expect(text).toContain("invalid traversal path at: config/apps/tls");
+      expect(text).toContain("PUT fallback:");
+      expect(text).toContain("key already exists: tls");
+      // The hint is appended, and names both ways the key can have appeared
+      // rather than picking one: a concurrent writer, or our own replayed PUT.
+      expect(text).toContain("nothing was overwritten");
+      expect(text).toContain("something else created it");
+      expect(text).toContain("an earlier attempt of this same write landed");
+      // No second write of any kind -- in particular no "helpful" PATCH over
+      // whatever is there now.
+      expect(api.configPut).toHaveBeenCalledTimes(1);
+      expect(api.configPost).not.toHaveBeenCalled();
+      expect(mergeCall()).toBeUndefined();
+    });
+
+    // Branch 2: shape OK — deep-merge into existing config and PATCH it back.
     // PATCH, never PUT. Caddy's PUT on a non-array key is strictly-create and
     // returns 409 "key already exists: tls" whenever apps/tls is present --
     // which is precisely the condition this branch runs under. Verified against
@@ -1327,16 +1460,19 @@ describe("tool handler behavior", () => {
       expect(result.content[0].text).toContain("get-err-here");
     });
 
-    it("PATCH fails + GET 404 + POST fails -> surfaces both PATCH and POST errors", async () => {
+    it("PATCH fails + apps/tls not set + PUT fails -> surfaces both PATCH and PUT errors", async () => {
       api.configPatch.mockResolvedValue(err(500, "patch-fail"));
-      api.configGet.mockResolvedValue(err(404, "not found"));
-      api.configPost.mockResolvedValue(err(500, "post-fail"));
+      api.configGet.mockResolvedValue(ok(null));
+      api.configPut.mockResolvedValue(err(500, "put-fail"));
 
       const result = await handler({ action: "set_email", email: "test@example.com" });
 
       expect(result.isError).toBe(true);
       expect(result.content[0].text).toContain("patch-fail");
-      expect(result.content[0].text).toContain("post-fail");
+      expect(result.content[0].text).toContain("PUT fallback: put-fail");
+      // The race hint belongs to a 409 only. On any other failure it would be a
+      // guess at a cause, so the two errors go out with nothing appended.
+      expect(result.content[0].text).not.toContain("nothing was overwritten");
     });
 
     it("PATCH fails + shape OK + merge write fails -> surfaces both errors", async () => {
@@ -1375,6 +1511,40 @@ describe("tool handler behavior", () => {
       expect(result.content[0].text).toContain("automation");
     });
 
+    // An instance with no TLS config is an ordinary state. On a fresh one the GET
+    // does not even succeed -- verified on 2.11.4: a null config answers 400
+    // "invalid traversal path at: config/apps", a config of {} answers
+    // ".../config/apps/tls" -- and `status` used to hand that Go error straight
+    // to the caller. With `apps` present and no tls key it is a 200 null.
+    it.each([
+      ["a null config", err(400, '{"error":"invalid traversal path at: config/apps"}')],
+      ["a config with no `apps` key", err(400, '{"error":"invalid traversal path at: config/apps/tls"}')],
+      ["`apps` present without tls (200 null)", ok(null)],
+    ])("status on %s says no TLS config is set, not an error", async (_label, getRes) => {
+      api.configGet.mockResolvedValue(getRes);
+
+      const result = await handler({ action: "status" });
+
+      expect(result.isError).toBeFalsy();
+      expect(result.content[0].text).toContain("No TLS config is set");
+      expect(result.content[0].text).not.toContain("invalid traversal path");
+    });
+
+    it.each([
+      ["a 500", err(500, "internal error")],
+      // Caddy does not 404 a config GET, so a 404 is some other layer answering
+      // and says nothing about the config. It must not read as "not set".
+      ["a 404", err(404, "not found")],
+    ])("status still surfaces %s verbatim as an error", async (_label, getRes) => {
+      api.configGet.mockResolvedValue(getRes);
+
+      const result = await handler({ action: "status" });
+
+      expect(result.isError).toBe(true);
+      expect(result.content[0].text).toContain(getRes.error);
+      expect(result.content[0].text).not.toContain("No TLS config is set");
+    });
+
     // ACME profiles landed in Caddy 2.10; the issuer field is `profile`.
     it("set_acme_profile PATCHes the issuer's profile field", async () => {
       api.configPatch.mockResolvedValue(ok());
@@ -1387,15 +1557,16 @@ describe("tool handler behavior", () => {
     });
 
     it("set_acme_profile falls back to a fresh apps/tls carrying the profile", async () => {
-      api.configPatch.mockResolvedValue(err(500, "key does not exist"));
-      api.configGet.mockResolvedValue(err(404, "not found"));
-      api.configPost.mockResolvedValue(ok());
+      api.configPatch.mockResolvedValue(err(500, '{"error":"invalid traversal path at: config/apps/tls/automation"}'));
+      api.configGet.mockResolvedValue(ok(null));
+      api.configPut.mockResolvedValue(ok());
 
       const result = await handler({ action: "set_acme_profile", profile: "shortlived" });
 
-      expect(api.configPost).toHaveBeenCalledWith("apps/tls", {
+      expect(api.configPut).toHaveBeenCalledWith("apps/tls", {
         automation: { policies: [{ issuers: [{ module: "acme", profile: "shortlived" }] }] },
       });
+      expect(api.configPost).not.toHaveBeenCalled();
       expect(result.isError).toBeFalsy();
     });
 
@@ -1432,35 +1603,69 @@ describe("tool handler behavior", () => {
       expect(api.configPatch).not.toHaveBeenCalled();
     });
 
-    it("ech_status reads apps/tls/ech and never writes", async () => {
-      api.configGet.mockResolvedValue(ok({ publication: [{ domains: ["example.com"] }] }));
+    // The JSON key is `encrypted_client_hello`. This test pinned "apps/tls/ech"
+    // until 2.5.3 and passed the whole time, because a mock answers whatever path
+    // it is asked: `ech` is only the Caddyfile global option, Caddy rejects
+    // apps.tls.ech on load as an unknown field, and a GET of any unknown final key
+    // is 200 null -- so against a real Caddy the old path could only ever say "not
+    // configured", ECH on or off. A mock cannot catch a wrong path; the live
+    // assertions in integration.test.ts are what actually hold this one down.
+    it("ech_status reads apps/tls/encrypted_client_hello and never writes", async () => {
+      // The body a live 2.11.4 returns with ECH on.
+      api.configGet.mockResolvedValue(ok({ configs: [{ public_name: "ech.example.test" }] }));
 
       const result = await handler({ action: "ech_status" });
 
-      expect(api.configGet).toHaveBeenCalledWith("apps/tls/ech");
+      expect(api.configGet).toHaveBeenCalledTimes(1);
+      expect(api.configGet).toHaveBeenCalledWith("apps/tls/encrypted_client_hello");
       expect(api.configPatch).not.toHaveBeenCalled();
       expect(api.configPost).not.toHaveBeenCalled();
       expect(api.configPut).not.toHaveBeenCalled();
-      expect(result.content[0].text).toContain("example.com");
-    });
-
-    // ECH is rarely enabled, so this is the ordinary answer, not a failure.
-    it("ech_status reports 'not configured' rather than a 404 error", async () => {
-      api.configGet.mockResolvedValue(err(404, "not found"));
-
-      const result = await handler({ action: "ech_status" });
-
       expect(result.isError).toBeFalsy();
-      expect(result.content[0].text).toContain("not configured");
+      expect(result.content[0].text).toContain("ech.example.test");
     });
 
-    it("ech_status treats an empty body as 'not configured' too", async () => {
+    // ECH is rarely enabled, so this is the ordinary answer, not a failure. With
+    // apps/tls present, the missing final key is a 200 null.
+    it("ech_status treats a null body as 'not configured'", async () => {
       api.configGet.mockResolvedValue(ok(null));
 
       const result = await handler({ action: "ech_status" });
 
       expect(result.isError).toBeFalsy();
       expect(result.content[0].text).toContain("not configured");
+    });
+
+    // The MOST common real config -- apps.http only, no apps/tls -- does not
+    // answer with a null at all: the missing parent fails the path walk. Verified
+    // on 2.11.4. This used to reach the caller as a raw isError.
+    it.each([
+      ["no apps/tls", '{"error":"invalid traversal path at: config/apps/tls/encrypted_client_hello"}'],
+      ["no `apps` key", '{"error":"invalid traversal path at: config/apps/tls"}'],
+      ["a null config", '{"error":"invalid traversal path at: config/apps"}'],
+    ])("ech_status reports 'not configured' on a 400 traversal failure (%s)", async (_label, body) => {
+      api.configGet.mockResolvedValue(err(400, body));
+
+      const result = await handler({ action: "ech_status" });
+
+      expect(result.isError).toBeFalsy();
+      expect(result.content[0].text).toContain("not configured");
+      expect(result.content[0].text).not.toContain("invalid traversal path");
+    });
+
+    it("ech_status's not-configured hint names the key Caddy accepts", async () => {
+      // The old hint told the operator to load a config with apps/tls/ech, which
+      // Caddy rejects: 400 ... tls: json: unknown field "ech" (verified on 2.11.4).
+      api.configGet.mockResolvedValue(ok(null));
+
+      const text = (await handler({ action: "ech_status" })).content[0].text;
+
+      expect(text).toContain("apps.tls.encrypted_client_hello");
+      // The wrong key is never offered as a config path. It is NAMED once, in
+      // dotted form, as the key Caddy rejects -- which is the useful half of the
+      // correction for anyone who learned `ech` from the Caddyfile.
+      expect(text).not.toContain("apps/tls/ech");
+      expect(text).toContain("rejects apps.tls.ech as an unknown field");
     });
 
     it("ech_status still surfaces a real read failure as an error", async () => {
@@ -1470,6 +1675,20 @@ describe("tool handler behavior", () => {
 
       expect(result.isError).toBe(true);
       expect(result.content[0].text).toContain("internal error");
+    });
+
+    it("ech_status does not read a 404 as 'not configured'", async () => {
+      // Caddy wraps every config GET error as 400, so it never sends this. A 404
+      // here is another layer answering (a proxy in front of the admin API, a
+      // wrong CADDY_ADMIN_URL) and says nothing about whether ECH is on --
+      // translating it would be naming a cause the response does not establish.
+      api.configGet.mockResolvedValue(err(404, "not found"));
+
+      const result = await handler({ action: "ech_status" });
+
+      expect(result.isError).toBe(true);
+      expect(result.content[0].text).toContain("not found");
+      expect(result.content[0].text).not.toContain("not configured");
     });
   });
 
@@ -2211,6 +2430,177 @@ describe("tool handler behavior", () => {
       const { listSnapshots } = await import("../snapshots.js");
       expect(listSnapshots()).toHaveLength(0);
     });
+
+    // A load whose deadline fired is never replayed, and Caddy goes on applying
+    // a load it has read after the client hangs up -- so it may have replaced
+    // the running config. Dropping the pre-load config here would leave nothing
+    // to revert to in exactly that case.
+    describe("a load whose outcome is unknown", () => {
+      const prior = { apps: { http: { servers: { srv0: { listen: [":80"] } } } } };
+      const timedOut: ApiResponse = {
+        ok: false,
+        status: 0,
+        outcomeUnknown: true,
+        error: "Request timed out after 55000ms -- the outcome is unknown: Caddy may still be applying this change.",
+      };
+      const originalFetch = globalThis.fetch;
+
+      afterEach(() => {
+        globalThis.fetch = originalFetch;
+        api.loadConfig.mockReset();
+      });
+
+      it("keeps the pre-load snapshot, reports the failure, and says the snapshot was kept", async () => {
+        api.configGet.mockResolvedValue(ok(prior));
+        api.loadConfig.mockResolvedValue(timedOut);
+
+        const result = await handler({ config: { apps: {} }, format: "json", confirm: true });
+
+        expect(result.isError).toBe(true);
+        const text = result.content[0].text;
+        // Caddy-mcp's own timeout message leads, untouched.
+        expect(text.startsWith(`Error: ${timedOut.error}`)).toBe(true);
+        expect(text).toContain("The pre-load config was kept anyway, as snapshot [0] (trigger=caddy_load)");
+        const { listSnapshots } = await import("../snapshots.js");
+        const snaps = listSnapshots();
+        expect(snaps).toHaveLength(1);
+        expect(snaps[0].trigger).toBe("caddy_load");
+        expect(snaps[0].config).toEqual(prior);
+      });
+
+      it("claims no snapshot when the pre-load read failed", async () => {
+        api.configGet.mockResolvedValue(err(503, "down"));
+        api.loadConfig.mockResolvedValue(timedOut);
+
+        const result = await handler({ config: { apps: {} }, format: "json", confirm: true });
+
+        expect(result.isError).toBe(true);
+        expect(result.content[0].text).not.toContain("kept anyway");
+        const { listSnapshots } = await import("../snapshots.js");
+        expect(listSnapshots()).toHaveLength(0);
+      });
+
+      // The flag, not the status: a status-0 failure that is NOT this client's
+      // deadline (a refused or reset connection) still keeps nothing.
+      it("still keeps nothing for a status-0 failure that is not a timeout", async () => {
+        api.configGet.mockResolvedValue(ok(prior));
+        api.loadConfig.mockResolvedValue(err(0, "Cannot connect to Caddy admin API at http://localhost:2019"));
+
+        const result = await handler({ config: { apps: {} }, format: "json", confirm: true });
+
+        expect(result.isError).toBe(true);
+        expect(result.content[0].text).not.toContain("kept anyway");
+        const { listSnapshots } = await import("../snapshots.js");
+        expect(listSnapshots()).toHaveLength(0);
+      });
+
+      // End to end through the REAL api.loadConfig, only fetch stubbed: a fired
+      // deadline must reach the tool as the flag, so this pins the api layer and
+      // the tool agreeing, not just the tool's reading of a hand-built response.
+      it("keeps the snapshot when the real api layer's deadline fires, sending the load once", async () => {
+        const actual = await vi.importActual<typeof import("../api.js")>("../api.js");
+        api.loadConfig.mockImplementation(actual.loadConfig);
+        api.configGet.mockResolvedValue(ok(prior));
+        const fetchMock = vi.fn(async () => {
+          throw new DOMException("The operation timed out", "TimeoutError");
+        });
+        globalThis.fetch = fetchMock as any;
+
+        const result = await handler({ config: { apps: {} }, format: "json", confirm: true });
+
+        expect(fetchMock).toHaveBeenCalledTimes(1);
+        expect(result.isError).toBe(true);
+        expect(result.content[0].text).toContain("the outcome is unknown");
+        expect(result.content[0].text).toContain("kept anyway, as snapshot [0]");
+        const { listSnapshots } = await import("../snapshots.js");
+        expect(listSnapshots()).toHaveLength(1);
+        expect(listSnapshots()[0].config).toEqual(prior);
+      });
+    });
+
+    // Caddy answers 200 for a Caddyfile load that adapted with a warning and
+    // then failed: it writes the warnings first, which commits the status, and
+    // appends the error object to a body that already went out as a success.
+    // The bytes below are what Caddy 2.11.4 sent, captured live.
+    describe("a load that failed behind a 200", () => {
+      const WARNING_TEXT = "Caddyfile input is not formatted; run 'caddy fmt --overwrite' to fix inconsistencies";
+      const ERROR_JSON =
+        '{"error":"loading config: loading new config: loading http app module: provision http: getting tls app: ' +
+        "loading tls app module: provision tls: loading certificates: open C:/nonexistent-caddy-mcp/cert.pem: " +
+        'The system cannot find the path specified."}';
+      const WARNINGS_JSON = JSON.stringify([{ file: "Caddyfile", line: 2, message: WARNING_TEXT }]);
+      const prior = { apps: { http: { servers: { srv0: { listen: [":80"] } } } } };
+      const caddyfile = "example.test {\n  tls C:/nonexistent-caddy-mcp/cert.pem C:/nonexistent-caddy-mcp/key.pem\n}\n";
+      const originalFetch = globalThis.fetch;
+
+      afterEach(() => {
+        globalThis.fetch = originalFetch;
+        // The file-level vi.clearAllMocks() forgets calls, not implementations:
+        // without this the real loadConfig would stay wired in for every later
+        // test and send their loads to a real fetch.
+        api.loadConfig.mockReset();
+      });
+
+      /**
+       * Run the handler over the REAL api.loadConfig, with only fetch stubbed,
+       * so the test covers the path the bug lived on -- Caddy's bytes, through
+       * the api layer's reading of them, to the tool result. Mocking loadConfig
+       * here would only restate what this test wants to find out.
+       */
+      async function loadThroughRealApi(body: string, status = 200) {
+        const actual = await vi.importActual<typeof import("../api.js")>("../api.js");
+        api.loadConfig.mockImplementation(actual.loadConfig);
+        api.configGet.mockResolvedValue(ok(prior));
+        globalThis.fetch = vi.fn(async () => new Response(body, { status })) as any;
+        return handler({ config: caddyfile, format: "caddyfile", confirm: true });
+      }
+
+      it("returns isError, with Caddy's error and the adapter warnings both shown", async () => {
+        const result = await loadThroughRealApi(`${WARNINGS_JSON}${ERROR_JSON}\n`);
+
+        expect(result.isError).toBe(true);
+        const text = result.content[0].text;
+        // Caddy's own error object, verbatim, leads.
+        expect(text.startsWith(`Error: ${ERROR_JSON}`)).toBe(true);
+        // What happened, stated as it happened -- no invented status.
+        expect(text).toContain("Caddy answered HTTP 200");
+        // The warnings are still there, and readable.
+        expect(text).toContain(`Adapter warnings (1):\n  - Caddyfile:2: ${WARNING_TEXT}`);
+      });
+
+      it("does NOT snapshot: the running config was not replaced", async () => {
+        await loadThroughRealApi(`${WARNINGS_JSON}${ERROR_JSON}\n`);
+
+        const { listSnapshots } = await import("../snapshots.js");
+        expect(listSnapshots()).toHaveLength(0);
+      });
+
+      it("still reports a load that APPLIED with warnings as a success, and snapshots it", async () => {
+        const result = await loadThroughRealApi(WARNINGS_JSON);
+
+        expect(result.isError).toBeFalsy();
+        expect(result.content[0].text).toBe(`OK\n\nAdapter warnings (1):\n  - Caddyfile:2: ${WARNING_TEXT}`);
+        const { listSnapshots } = await import("../snapshots.js");
+        const snaps = listSnapshots();
+        expect(snaps).toHaveLength(1);
+        expect(snaps[0].config).toEqual(prior);
+      });
+
+      // caddyserver/caddy#7267 (open, milestoned v2.11.5; read from its diff,
+      // never run) moves the failure to a real 400 with both parts in one object.
+      it("shows both parts of the post-#7267 failure shape too", async () => {
+        const result = await loadThroughRealApi(
+          `{"error":"loading config: open cert.pem: no such file or directory","warnings":${WARNINGS_JSON}}\n`,
+          400,
+        );
+
+        expect(result.isError).toBe(true);
+        expect(result.content[0].text).toContain("loading config: open cert.pem: no such file or directory");
+        expect(result.content[0].text).toContain(WARNING_TEXT);
+        const { listSnapshots } = await import("../snapshots.js");
+        expect(listSnapshots()).toHaveLength(0);
+      });
+    });
   });
 
   // ─── caddy_revert ─────────────────────────────────────────────────────
@@ -2349,6 +2739,75 @@ describe("tool handler behavior", () => {
       expect(snaps).toHaveLength(1);
       expect(snaps[0].trigger).toBe("caddy_load");
       expect(snaps[0].config).toEqual(target);
+    });
+
+    // The exception to the deferral above: a revert whose deadline fired may
+    // have applied, and the config it replaced is recorded nowhere else. It is
+    // kept, and the shift that causes is stated with the target's new index.
+    describe("a revert whose outcome is unknown", () => {
+      const timedOut: ApiResponse = {
+        ok: false,
+        status: 0,
+        outcomeUnknown: true,
+        error: "Request timed out after 55000ms -- the outcome is unknown: Caddy may still be applying this change.",
+      };
+
+      it("keeps the roll-forward snapshot and gives the target's new index", async () => {
+        const { saveSnapshot, listSnapshots } = await import("../snapshots.js");
+        const target = { apps: { intended: true } };
+        const current = { apps: { current: true } };
+        saveSnapshot(target, "caddy_load");
+
+        api.configGet.mockResolvedValue(ok(current));
+        api.loadConfig.mockResolvedValue(timedOut);
+
+        const result = await handler({ action: "apply", index: 0, confirm: true });
+
+        expect(result.isError).toBe(true);
+        const text = result.content[0].text;
+        expect(text.startsWith(`Error: ${timedOut.error}`)).toBe(true);
+        expect(text).toContain("The pre-revert config was kept anyway, as snapshot [0] (trigger=caddy_revert)");
+        expect(text).toContain("the snapshot you asked to apply is now [1]");
+        expect(text).toContain("re-running apply with index 0 would load a different snapshot");
+        const snaps = listSnapshots();
+        expect(snaps).toHaveLength(2);
+        expect(snaps[0].trigger).toBe("caddy_revert");
+        expect(snaps[0].config).toEqual(current);
+        // The index the message names really does hold the target now.
+        expect(snaps[1].config).toEqual(target);
+      });
+
+      it("says the target dropped out when the ring was full and it was the oldest", async () => {
+        const { saveSnapshot, listSnapshots } = await import("../snapshots.js");
+        const oldest = { apps: { generation: 0 } };
+        saveSnapshot(oldest, "caddy_load");
+        for (let i = 1; i < 10; i++) saveSnapshot({ apps: { generation: i } }, "caddy_load");
+        expect(listSnapshots()[9].config).toEqual(oldest);
+
+        api.configGet.mockResolvedValue(ok({ apps: { current: true } }));
+        api.loadConfig.mockResolvedValue(timedOut);
+
+        const result = await handler({ action: "apply", index: 9, confirm: true });
+
+        expect(api.loadConfig).toHaveBeenCalledWith(oldest, "application/json");
+        expect(result.content[0].text).toContain("the snapshot you asked to apply ([9]) has dropped out of the ring");
+        expect(listSnapshots().map((s) => s.config)).not.toContainEqual(oldest);
+      });
+
+      it("keeps nothing, and claims nothing, when the pre-revert read failed", async () => {
+        const { saveSnapshot, listSnapshots } = await import("../snapshots.js");
+        saveSnapshot({ apps: { intended: true } }, "caddy_load");
+
+        api.configGet.mockResolvedValue(err(0, "fetch failed"));
+        api.loadConfig.mockResolvedValue(timedOut);
+
+        const result = await handler({ action: "apply", index: 0, confirm: true });
+
+        expect(result.isError).toBe(true);
+        expect(result.content[0].text).not.toContain("kept anyway");
+        expect(listSnapshots()).toHaveLength(1);
+        expect(listSnapshots()[0].trigger).toBe("caddy_load");
+      });
     });
 
     it("save refuses to capture a non-object config body", async () => {
@@ -2609,6 +3068,90 @@ describe("tool handler behavior", () => {
       const result = formatResult({ ok: false, status: 503 });
       expect(result.isError).toBe(true);
       expect(result.content[0].text).toBe("Error: HTTP 503");
+    });
+
+    // `warnings` is set only by POST /load (see readLoadBody in api.ts). These pin
+    // how they render: readable for the shape Caddy 2.11.4 sends, verbatim JSON
+    // for anything else, and in the same content item as the result either way.
+    describe("adapter warnings", () => {
+      const NOT_FORMATTED = "Caddyfile input is not formatted; run 'caddy fmt --overwrite' to fix inconsistencies";
+
+      it("appends them to a success, in the form Caddy's own Warning.String() uses", async () => {
+        const { formatResult } = await import("../format.js");
+        const result = formatResult({
+          ok: true,
+          status: 200,
+          warnings: [
+            { file: "Caddyfile", line: 2, message: NOT_FORMATTED },
+            { file: "Caddyfile", line: 9, directive: "header_up", message: "unnecessary header_up X-Forwarded-For" },
+          ],
+        });
+        expect(result.isError).toBeUndefined();
+        expect(result.content).toHaveLength(1);
+        expect(result.content[0].text).toBe(
+          `OK\n\nAdapter warnings (2):\n  - Caddyfile:2: ${NOT_FORMATTED}\n` +
+            "  - Caddyfile:9 (header_up): unnecessary header_up X-Forwarded-For",
+        );
+      });
+
+      it("appends them to an error in the SAME content item, so a client reading content[0] sees both", async () => {
+        const { formatResult } = await import("../format.js");
+        const result = formatResult({
+          ok: false,
+          status: 200,
+          error: '{"error":"loading config: boom"}',
+          warnings: [{ file: "Caddyfile", line: 2, message: NOT_FORMATTED }],
+        });
+        expect(result.isError).toBe(true);
+        expect(result.content).toHaveLength(1);
+        expect(result.content[0].text).toBe(
+          `Error: {"error":"loading config: boom"}\n\nAdapter warnings (1):\n  - Caddyfile:2: ${NOT_FORMATTED}`,
+        );
+      });
+
+      it("prints only the parts a warning carries: Caddy omits every empty field", async () => {
+        const { formatResult } = await import("../format.js");
+        const text = formatResult({
+          ok: true,
+          status: 200,
+          warnings: [
+            { message: "bare" },
+            { line: 4, message: "line only" },
+            { file: "Caddyfile", message: "file only" },
+            { directive: "tls", message: "directive only" },
+          ],
+        }).content[0].text;
+        expect(text).toContain("\n  - bare\n");
+        expect(text).toContain("\n  - line 4: line only\n");
+        expect(text).toContain("\n  - Caddyfile: file only\n");
+        expect(text).toContain("\n  - (tls): directive only");
+      });
+
+      // Lossless: a warning this code does not fully recognize is printed whole,
+      // never trimmed to the fields it knows -- a later Caddy, or a third-party
+      // adapter, can add to the shape.
+      it.each([
+        ["an unknown extra field", { file: "Caddyfile", line: 2, message: "m", severity: "info" }],
+        ["no message", { file: "Caddyfile", line: 2 }],
+        ["an empty message", { file: "Caddyfile", line: 2, message: "" }],
+        ["a line that is not a number", { file: "Caddyfile", line: "2", message: "m" }],
+        ["a file that is not a string", { file: 7, message: "m" }],
+        ["a directive that is not a string", { directive: ["tls"], message: "m" }],
+        ["a plain string", "just a string"],
+        ["a number", 42],
+        ["null", null],
+        ["an array", [1, 2]],
+      ])("prints a warning with %s as its JSON", async (_label, warning) => {
+        const { formatResult } = await import("../format.js");
+        const text = formatResult({ ok: true, status: 200, warnings: [warning] }).content[0].text;
+        expect(text).toBe(`OK\n\nAdapter warnings (1):\n  - ${JSON.stringify(warning)}`);
+      });
+
+      it("adds nothing for an empty warnings array", async () => {
+        const { formatResult } = await import("../format.js");
+        expect(formatResult({ ok: true, status: 200, warnings: [] }).content[0].text).toBe("OK");
+        expect(formatResult({ ok: false, status: 400, error: "bad", warnings: [] }).content[0].text).toBe("Error: bad");
+      });
     });
   });
 

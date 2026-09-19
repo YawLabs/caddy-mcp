@@ -21,7 +21,7 @@ Other Caddy MCP servers wrap half the admin API and silently swallow errors. Thi
 - **Safe-by-default mutations** — `caddy_config_set` defaults to idempotent `overwrite` (PATCH), not `append` (POST). Calling twice doesn't duplicate your route.
 - **Defensive parsing** — `caddy_list_routes` never crashes on malformed config, even if routes are null, handlers are strings, or matchers are non-arrays. Regression-tested.
 - **No leaked credentials in errors** — if `CADDY_ADMIN_URL` contains a token in the path/query, the connect-failed message shows only the origin.
-- **Fallback error surfacing** — when a TLS write PATCH fails and the POST fallback also fails, both error bodies are returned so you know what actually went wrong.
+- **Fallback error surfacing** — when a TLS write PATCH fails and the PUT fallback also fails, both error bodies are returned so you know what actually went wrong.
 - **Tool annotations** — every tool declares `readOnlyHint`, `destructiveHint`, and `idempotentHint`, so MCP clients can skip confirmations for safe ops.
 - **Instant startup** — ships as a single bundle with two runtime deps (the MCP SDK + Zod). No 5-minute `node_modules` install.
 - **Input hardening** — adapter names, `@id` values, server names, and CA ids are all regex-validated with length caps. Blocks CRLF header injection and ReDoS.
@@ -81,9 +81,9 @@ That's it. Now ask your AI assistant:
 | `CADDY_ADMIN_URL` | `http://localhost:2019` | Caddy admin API URL. Set to `http://caddy:2019` inside Docker, or an https URL for remote admin. Also accepts a unix socket, in either `unix:///var/run/caddy-admin.sock` or Caddy's own `unix//var/run/caddy-admin.sock` spelling — see below. |
 | `CADDY_API_TOKEN` | (none) | Optional Bearer token for authenticated admin endpoints. Only needed if you've configured Caddy with auth. |
 | `CADDY_MCP_SNAPSHOT_DIR` | (none) | Directory for persisting `caddy_revert` snapshots. Unset, snapshots live in memory only and are lost when this server restarts. Snapshots are full Caddy configs and can contain secrets, so the location is opt-in rather than defaulted. |
-| `CADDY_MAX_RETRIES` | `2` | Number of retries on transient failures (5xx, network errors). 4xx and 412 never retry. POSTs to `/config/*` and `/id/*` also skip retry (non-idempotent appends/creates -- retrying could duplicate routes or 409 a half-applied create). POSTs to `/load`, `/adapt`, `/stop` still retry. Hard-capped at 5; values above the cap log a one-time stderr notice so the clamp is visible. Set to `0` to disable. |
-| `CADDY_TIMEOUT` | `10000` | Timeout in ms for all admin API requests except `/load` (which uses `CADDY_LOAD_TIMEOUT`). Non-numeric, `<= 0`, or fractional values below 1ms fall back to the default. |
-| `CADDY_LOAD_TIMEOUT` | `60000` | Timeout in ms for the `/load` endpoint; raise for ACME-heavy bring-ups where provisioning many certificates can exceed the default. Non-numeric, `<= 0`, or fractional values below 1ms fall back to the default. |
+| `CADDY_MAX_RETRIES` | `2` | Number of retries on transient failures: network errors, and 502/503/504 (which only a proxy in front of Caddy sends). Caddy's own 500s are deterministic rejections and never retry, nor do 4xx and 412. Requests a replay could change the outcome of also skip retry: POSTs to `/config/*` and `/id/*` (they append, or replace an existing key -- retrying could duplicate routes), and a PUT or DELETE at an array index such as `.../routes/0` (a replay would insert a second route, or remove the one that slid into that index), including a PUT to a bare `/id/<id>`, which Caddy resolves to the identified element's array index. A config change whose timeout fired is never retried (see `CADDY_LOAD_TIMEOUT`). A refused connection retries for every method, since nothing was sent. POSTs to `/load`, `/adapt`, `/stop` still retry. Hard-capped at 5; values above the cap log a one-time stderr notice so the clamp is visible. Set to `0` to disable. |
+| `CADDY_TIMEOUT` | `10000` | Timeout in ms for admin API requests that do not change the config: GETs, `/adapt`, `/stop`, PKI, upstreams and metrics. Config changes use `CADDY_LOAD_TIMEOUT`. Non-numeric, `<= 0`, or fractional values below 1ms fall back to the default. |
+| `CADDY_LOAD_TIMEOUT` | `55000` | Timeout in ms for every request that changes the config: `POST /load`, and every POST/PUT/PATCH/DELETE under `/config/*` and `/id/*`. Each is a full synchronous reload inside Caddy, which can legitimately run long -- Caddy sleeps through `apps.http.shutdown_delay` inside the reload whenever a change closes a listener, and a change can wait behind another reload. A timeout here is never retried: Caddy keeps applying a change after the client gives up, so the error says the outcome is unknown and to re-read the config before retrying (`caddy_load` and `caddy_revert` keep their snapshot in that case). Keep it below your MCP client's request timeout (60 s by default in the MCP SDK), or that error arrives after the client has given up and is never shown; the default sits 5 s under it. Non-numeric, `<= 0`, or fractional values below 1ms fall back to the default. |
 
 **Unix socket admin endpoints:**
 
@@ -118,11 +118,11 @@ Use the same JSON block shown above in any of these.
 ### Config management (6)
 
 - **caddy_config_get** — Read config at any JSON path (or the full config).
-- **caddy_config_set** — Write config at a path. Modes: `overwrite` (PATCH, default, idempotent), `append` (POST), `insert` (PUT, for array positions).
+- **caddy_config_set** — Write config at a path. Modes: `overwrite` (PATCH, default, idempotent; the key must exist), `append` (POST: appends to an array, but replaces an existing non-array key and cannot create missing parents), `insert` (PUT: inserts at an array position, or strictly creates a key along with any missing parents and fails with 409 if it exists — the way to create a server or app, even on an instance with no config).
 - **caddy_config_delete** — Delete config at a path. Requires `confirm=true` (deleting a parent path also removes every descendant).
 - **caddy_config_by_id** — Get/set/delete config by `@id` tag — much easier than navigating deep paths. The `delete` action requires `confirm=true`.
-- **caddy_load** — Replace the entire config atomically. 60-second timeout for cert provisioning. Auto-snapshots the prior config.
-- **caddy_revert** — Manage config snapshots for rollback. Actions: `list`, `save`, `apply` (confirm-gated). In-memory, last 10.
+- **caddy_load** — Replace the entire config atomically. Runs on `CADDY_LOAD_TIMEOUT` (55 seconds by default), like every config change. Auto-snapshots the prior config, and keeps that snapshot when the load times out with its outcome unknown. Lists the Caddyfile adapter's warnings, and reports a load that failed as an error even when Caddy answered HTTP 200 — which Caddy 2.11.4 does for a Caddyfile that adapted with warnings ([caddyserver/caddy#7246](https://github.com/caddyserver/caddy/issues/7246)).
+- **caddy_revert** — Manage config snapshots for rollback. Actions: `list`, `save`, `apply` (confirm-gated). In-memory, last 10. An `apply` that times out with its outcome unknown keeps the pre-revert config as snapshot [0], which shifts every older snapshot down one index; the error says where the target now sits.
 
 ### Route operations (4)
 
@@ -133,7 +133,7 @@ Use the same JSON block shown above in any of these.
 
 ### TLS & config conversion (2)
 
-- **caddy_tls** — Check or set TLS settings: ACME email, ACME CA URL. PATCH first; on a fresh install, POSTs a minimal config. On an existing config it deep-merges into the issuer path and PUTs the result back, preserving siblings (custom certs, `on_demand`, additional policies). Refuses with a shape-specific error if the existing structure is unexpected — never clobbers.
+- **caddy_tls** — Check or set TLS settings. Actions: `status`, `set_email` (ACME email), `set_acme_ca` (ACME CA URL), `set_acme_profile` (ACME profile, Caddy 2.10+), and the read-only `ech_status` (the Encrypted ClientHello config at `apps/tls/encrypted_client_hello`, Caddy 2.10+). The set actions PATCH first; when `apps/tls` is not set they PUT a minimal config, which also creates any missing parents, so they work on an instance with no config at all. On an existing config they deep-merge into the issuer path and PATCH the result back, preserving siblings (custom certs, `on_demand`, additional policies). Refuses with a shape-specific error if the existing structure is unexpected — never clobbers.
 - **caddy_adapt** — Convert a config in any registered adapter format to Caddy JSON without applying it. `caddyfile` (built-in, default) plus any adapter module compiled into your Caddy binary — e.g., `nginx` ([caddy-nginx-adapter](https://github.com/caddyserver/nginx-adapter)), `yaml` ([caddy-yaml](https://github.com/abiosoft/caddy-yaml)). Great for previewing or porting from existing configs.
 
 ### Server operations (6)
@@ -265,7 +265,7 @@ npm install
 npm run lint       # Biome check
 npm run lint:fix   # Auto-fix
 npm run build      # tsup bundle
-npm test           # Vitest (357 unit tests, +9 POSIX-only unix-socket tests; +13 live-Caddy integration tests gated by CADDY_MCP_INTEGRATION=1)
+npm test           # Vitest (636 unit tests, +39 POSIX-only unix-socket and launcher tests; +32 live-Caddy integration tests gated by CADDY_MCP_INTEGRATION=1)
 npm run typecheck  # tsc --noEmit
 ```
 
