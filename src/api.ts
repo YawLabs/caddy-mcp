@@ -18,6 +18,20 @@ const RETRY_HARD_CAP = 5;
  * its own client connections open.
  */
 const ADMIN_RESTART_SETTLE_MS = 250;
+/**
+ * The default deadline for a config change (CADDY_LOAD_TIMEOUT unset). Kept
+ * BELOW 60 s on purpose: the MCP SDK's client gives up on a tool call after
+ * DEFAULT_REQUEST_TIMEOUT_MSEC = 60000 unless the host passes its own timeout,
+ * and its timer starts before this one does (it is already running while the
+ * tool handler is dispatched, and some tools make a GET before their write).
+ * A deadline equal to the client's therefore always loses the race: the
+ * client throws a bare MCP "Request timed out" (-32001), cancels the call, and
+ * the SDK drops the handler's result -- so the outcome-unknown error in
+ * sendOnce, the one message that says to re-read before retrying, was never
+ * delivered at all. 5 s of headroom covers the client's head start, a GET in
+ * front of the write, and the settle wait after it.
+ */
+const LOAD_TIMEOUT = 55000;
 
 export interface ApiResponse<T = any> {
   ok: boolean;
@@ -25,6 +39,26 @@ export interface ApiResponse<T = any> {
   data?: T;
   error?: string;
   etag?: string;
+  /**
+   * Config-adapter warnings Caddy attached to a `POST /load` answer, set on a
+   * load that applied and on one that failed alike (see readLoadBody). Kept
+   * apart from `data` and `error` so neither has to be a rendered string;
+   * formatResult prints them for every consumer, so none can drop them.
+   * Elements are whatever Caddy sent -- `{file, line, directive, message}` on
+   * 2.11.4 -- and are not validated here.
+   */
+  warnings?: unknown[];
+  /**
+   * Set (to true) only on a failure where this client's deadline fired on a
+   * config change (isConfigChange): no answer came, and Caddy may have applied
+   * the change, may still apply it, or may never have received it. `ok` is
+   * false, because nothing confirmed success -- but unlike every other failure
+   * it does NOT mean "nothing changed", and a caller that skips its bookkeeping
+   * on `!ok` needs to know the difference. caddy_load and caddy_revert apply key
+   * on it to keep the snapshot they would otherwise drop. A flag rather than a
+   * match on the error text, so rewording the message cannot change behaviour.
+   */
+  outcomeUnknown?: boolean;
 }
 
 /** Cache of path → ETag from successful config GETs, used for optimistic concurrency */
@@ -243,12 +277,62 @@ function sleep(ms: number): Promise<void> {
   return new Promise((resolve) => setTimeout(resolve, ms));
 }
 
-/** Retry network failures (status 0) and 5xx. Never 4xx, including 412 (concurrency). */
+/**
+ * Whether a failed response could come out differently if the request were sent
+ * again. Necessary, never sufficient: shouldRetry decides whether THIS request
+ * may be replayed.
+ *
+ * Status 0 is a transport failure -- no response arrived at all.
+ *
+ * Of the 5xx range, only the gateway statuses 502 / 503 / 504 count. Caddy's
+ * admin API never emits one: no AdminRoute handler at v2.11.4 (admin.go,
+ * caddyconfig/load.go, and the reverse_proxy / pki / metrics admin routes)
+ * writes a gateway status, so one can only come from a proxy in front of the
+ * admin endpoint -- the case this retry was written for.
+ *
+ * What Caddy itself emits is 500, and its 500s are deterministic rejections,
+ * not outages. handleError turns every error that is not an APIError into 500
+ * (admin.go:894-899), which is how `loading new config: ...` (the new config
+ * failed validation or provisioning), `decoding request body`, `array index out
+ * of bounds` and `invalid traversal path` all arrive. Caddy either refused the
+ * request before touching the config or restored the old one before answering
+ * (changeConfig, caddy.go:247-264), so the change did not land and a replay
+ * gets the same answer. Every replay cost an ERROR line in Caddy's log
+ * (handleError logs each one), fired without the settle wait because that is
+ * gated on success; what else it cost depends on where Caddy refused it:
+ *   - `invalid traversal path`, `array index out of bounds` and `decoding
+ *     request body` come out of unsyncedConfigAccess, which changeConfig runs
+ *     and returns from (caddy.go:205-207) before any load starts, and so does a
+ *     `loading new config` failure in StrictUnmarshalJSON (an unknown field,
+ *     caddy.go:343). Nothing is loaded and nothing restarts: each replay was a
+ *     wasted round trip and one more ERROR line.
+ *   - A load that fails while PROVISIONING the apps (an unknown handler module,
+ *     say) has already restarted Caddy's admin endpoint -- provisionContext
+ *     replaces the admin server (caddy.go:565) ahead of the apps -- so each of
+ *     those replays was another admin restart as well.
+ * Verified against Caddy 2.11.4: a PATCH naming an unknown handler, a DELETE of
+ * `routes/9` past the end of the array, a PATCH with a non-JSON body and a PATCH
+ * carrying an unknown field all answer 500, and of the four only the unknown
+ * handler restarts the admin endpoint (one more "admin endpoint started" log
+ * line). One caddy_config_set with a bad handler cost 3 ERROR lines, 3 admin
+ * restarts and 438 ms at the default CADDY_MAX_RETRIES, against 1, 1 and 35 ms
+ * with retries off. The cheap kind was also the ordinary path, not an error
+ * case: caddy_tls set_email against an instance with no `apps/tls` replayed its
+ * doomed PATCH (500 `invalid traversal path`) twice on every call -- two wasted
+ * round trips and two ERROR lines -- before falling back to the write that
+ * creates the app.
+ *
+ * Status-only on purpose. Sniffing for Caddy's `{"error":...}` body to tell
+ * "Caddy's 500" from "a proxy's 500" would be a heuristic over a shape any
+ * proxy can also produce; a proxy that answers 500 for an outage is not
+ * retried, which costs one un-retried request.
+ *
+ * Never 4xx, including 412 (a concurrency conflict is an answer, not a blip).
+ */
 function isTransientFailure(res: ApiResponse): boolean {
   if (res.ok) return false;
   if (res.status === 0) return true;
-  if (res.status >= 500 && res.status <= 599) return true;
-  return false;
+  return res.status === 502 || res.status === 503 || res.status === 504;
 }
 
 /**
@@ -274,45 +358,182 @@ export function isMissingConfigPath(res: Pick<ApiResponse, "ok" | "error">): boo
   return (res.error ?? "").toLowerCase().includes("invalid traversal path");
 }
 
-/** Matches a trailing array index, e.g. ".../routes/0" -- the shape Caddy PUT inserts at. */
-const ARRAY_INDEX_TAIL_RE = /\/\d+$/;
+/**
+ * Matches a trailing array index, e.g. ".../routes/0" -- the shape Caddy PUT
+ * inserts at and Caddy DELETE re-packs around.
+ *
+ * Trailing slashes are tolerated because Caddy tolerates them: it trims the
+ * config path before walking it (`strings.Trim(path, "/")`, admin.go:1178), so
+ * ".../routes/0/" addresses the same element, while normalizePath and
+ * encodePathSegments here pass a trailing slash through untouched. Anchoring on
+ * a bare `$` let that spelling walk straight past both carve-outs below.
+ * Verified against Caddy 2.11.4: `DELETE .../routes/0/` answers 200 and removes
+ * element 0.
+ */
+const ARRAY_INDEX_TAIL_RE = /\/\d+\/*$/;
+
+/** A bare `/id/<id>` with no subpath -- see the PUT paragraph of isRetryableMethod. */
+const BARE_ID_RE = /^\/id\/[^/]+\/*$/;
 
 /**
- * Whether a (method, path) pair is safe to retry on a transient failure.
+ * Whether Caddy handles a (method, path) by loading a new config: `POST /load`,
+ * and every non-GET under /config or /id.
  *
- * GET / PATCH / DELETE are idempotent on every Caddy admin endpoint --
- * replaying them yields the same end state, so they always retry under the
- * normal transient-failure policy.
+ * All of them run the same code inside Caddy. handleConfig hands the write to
+ * changeConfig (admin.go:1069) and `/load` reaches the same function through
+ * caddy.Load (caddy.go:136); changeConfig takes `rawCfgMu` and holds it while it
+ * provisions and starts the ENTIRE new config and stops the old one
+ * (caddy.go:168 through unsyncedDecodeAndRun at :247), and only then does the
+ * response go out. It takes no request context, so nothing the client does --
+ * a timeout, a closed connection -- cancels a change once Caddy has read it.
  *
- * PUT is idempotent only when the destination is NOT an array position. Caddy's
- * PUT semantics are "insert at a position in an array, strictly create
- * otherwise" -- so a PUT to `.../routes/0` that succeeded server-side but lost
- * its response (status 0), or 5xx'd after committing, would insert a SECOND
- * element on replay. That is the same silent-duplicate hazard the POST carve-out
- * below exists to prevent, so PUT to an array-index path skips the retry loop.
- * A config key that is literally numeric (a server named "0") is a false
- * positive here; the cost is one un-retried request, versus a duplicated route
- * if we guessed the other way.
+ * Three things here key on that one fact, which is why it is one predicate:
+ *   - the deadline (getTimeoutFor): a reload needs the CADDY_LOAD_TIMEOUT budget
+ *     whichever endpoint started it;
+ *   - the retry policy (shouldRetry): a deadline that fires on one of these says
+ *     nothing about whether the change applied, and a replay cannot overtake it;
+ *   - the settle wait (settleAdminRestart): a successful one restarts Caddy's
+ *     admin endpoint.
+ */
+function isConfigChange(method: string, path: string): boolean {
+  if (method === "GET") return false;
+  return path === "/load" || path.startsWith("/config/") || path.startsWith("/id/");
+}
+
+/**
+ * Whether replaying a (method, path) leaves the same end state as sending it
+ * once -- the question that matters when a failure does not say whether Caddy
+ * applied the request (no response arrived, or a proxy in front answered for it).
+ *
+ * GET and PATCH always are: a read changes nothing, and PATCH replaces the value
+ * at a path with the same value.
+ *
+ * DELETE is, EXCEPT at an array index. Deleting a map key twice is harmless --
+ * the replay answers 404 `key does not exist` -- and so is a bare
+ * `DELETE /id/<id>`: Caddy rebuilds its id index after the first delete, so the
+ * replay answers 404 `unknown object ID`. But Caddy removes an array element by
+ * re-packing the array (`append(arr[:idx], arr[idx+1:]...)`, admin.go:1251), so
+ * whatever sat at n+1 is at n by the time a replay arrives, and the replay
+ * removes THAT. It compounds: replays of a change Caddy is still applying queue
+ * on its config lock and then each run against the already re-packed array, so
+ * one `DELETE .../routes/2` could remove up to 1 + CADDY_MAX_RETRIES routes
+ * (3 by default, 6 at the cap) and still report a failure. Verified against
+ * Caddy 2.11.4, with another reload holding the config lock for 4 s and a 1 s
+ * deadline: 2.5.2 sent `DELETE .../routes/0` three times, routes r0, r1 AND r2
+ * were gone afterwards, and the call reported "Request timed out"; under the
+ * current policy (this carve-out, plus shouldRetry's rule 3 for the deadline)
+ * Caddy receives it once and only r0 goes. caddy_remove_route by index is
+ * fully exposed -- it reads `.../routes` and deletes `.../routes/<n>`, so no
+ * cached ETag matches the path and no If-Match guards the replay.
+ *
+ * PUT is, EXCEPT at an array index, for the mirror-image reason. Caddy's PUT
+ * semantics are "insert at a position in an array, strictly create otherwise"
+ * -- so a PUT to `.../routes/0` that was applied but lost its response would
+ * insert a SECOND element on replay. That is the same silent-duplicate hazard
+ * the POST carve-out below exists to prevent.
+ *
+ * A bare `PUT /id/<id>` (no subpath) is the same hazard in disguise, so it is
+ * excluded too. Caddy rewrites the id to the expanded path it indexes
+ * (handleConfigID, admin.go:1108-1122), and for a route that path ENDS in an
+ * array index -- `.../routes/2` -- so the PUT inserts the value just before the
+ * identified element; ARRAY_INDEX_TAIL_RE cannot see that, because the index
+ * is only in the path Caddy expands, never in the one sent. changeConfig then
+ * rebuilds the id index, so a replay resolves the id to the element's NEW
+ * position and inserts a second copy in front of it (a value carrying no @id
+ * passes indexing, so nothing rejects the duplicate). Verified against Caddy
+ * 2.11.4: the same `PUT /id/keep` (keep = a route, value with no @id) sent twice
+ * answered 200 both times and left two copies in front of it. An id that names an
+ * object held under a key (a server) loses nothing by the exclusion: PUT there
+ * answers 409 `key already exists`, so a replay was never useful. The If-Match
+ * guard does not cover it either: the ETag of a bare /id/ path is only cached
+ * after a GET of exactly that path, and any /config write clears every /id/
+ * entry (invalidateRelated).
+ *
+ * For all of these, a config key that is literally numeric (a server named "0")
+ * is a false positive; the cost is one un-retried request, versus a duplicated
+ * or wrongly deleted route if we guessed the other way.
  *
  * POST is split by path:
  *  - `/config/<path>` and `/id/<id>` are non-idempotent: they append to
- *    arrays (e.g. routes) or create new keys. On a network failure (status 0)
- *    the request may already have been processed server-side; retrying
- *    produces a duplicate append. On a 5xx, the server may have completed
- *    the mutation before erroring downstream. Either way, retry risks a
- *    silent duplicate -- skip the loop and surface the failure verbatim.
+ *    arrays (e.g. routes) or create new keys. When no response arrived
+ *    (status 0) the request may already have been applied, and a gateway
+ *    status from a proxy in front says nothing either way; replaying risks a
+ *    silent duplicate append -- skip the loop and surface the failure verbatim.
  *  - `/load` is an atomic full-config replace: same input yields the same
  *    end state, so retry is safe and is genuinely useful against a flaky
- *    server during a large config push.
+ *    proxy during a large config push.
  *  - `/adapt` is a pure transformation (Caddyfile/etc -> JSON) with no
  *    side effects.
  *  - `/stop` is destructive but a second call against an already-stopped
  *    server is a no-op (it just yields ECONNREFUSED), so retry is benign.
  */
 function isRetryableMethod(method: string, path: string): boolean {
-  if (method === "PUT") return !ARRAY_INDEX_TAIL_RE.test(path);
+  // Trailing slashes tolerated for the same reason as ARRAY_INDEX_TAIL_RE.
+  if (method === "PUT" && BARE_ID_RE.test(path)) return false;
+  if (method === "PUT" || method === "DELETE") return !ARRAY_INDEX_TAIL_RE.test(path);
   if (method !== "POST") return true;
   return !path.startsWith("/config/") && !path.startsWith("/id/");
+}
+
+/** One attempt's result, plus the transport facts the retry policy needs. */
+interface Attempt<T> {
+  res: ApiResponse<T>;
+  /** The connection was refused: no byte of the request reached Caddy. */
+  refused: boolean;
+  /** This client's own deadline fired before any response arrived. */
+  timedOut: boolean;
+}
+
+/**
+ * The whole retry decision for one failed attempt. Four rules, in precedence
+ * order, each answering a different question:
+ *
+ *  1. Could a second send come out differently at all? (isTransientFailure)
+ *     No for every 4xx and for Caddy's own 500s -- stop.
+ *
+ *  2. Did the request provably never reach Caddy? A refused connection is
+ *     retried for EVERY method, including the POST, array-index PUT and
+ *     array-index DELETE that rule 4 excludes, and ahead of rule 3: the TCP
+ *     handshake never completed, so not one byte of the request left this
+ *     process and a replay cannot duplicate a write. That proof holds for
+ *     ECONNREFUSED only -- a reset or a timeout can arrive after Caddy read
+ *     and applied the request. A Caddy that is genuinely down still fails in a
+ *     few hundred ms at the default budget, with the unchanged "is Caddy
+ *     running?" message.
+ *
+ *  3. Could the first request still be running? A deadline that fires on a
+ *     config change (isConfigChange) is never replayed, `/load` included. If
+ *     Caddy read the request, it is not gone -- Caddy goes on applying it under
+ *     its config lock and ignores the client having hung up -- so a replay
+ *     does not race it, it QUEUES behind it, and then runs against a config
+ *     the first request already changed. What comes back misreports the first
+ *     request's own result: a 412 when an If-Match was cached (the path's hash
+ *     changed), a 404 for a delete that in fact landed (observed on 2.11.4,
+ *     see getTimeoutFor), a second removal at an array index (rule 4 stops
+ *     that one independently). And when the reload outlasts the deadline,
+ *     every replay times out as well: 1 + CADDY_MAX_RETRIES deadlines back to
+ *     back, 165 s at the defaults, far past the 60 s the MCP SDK's client
+ *     waits for a tool call by default (which is also why a single default
+ *     deadline sits below 60 s -- see LOAD_TIMEOUT). The operator is told the
+ *     outcome is unknown instead (see the timeout message in sendOnce), and the
+ *     response carries `outcomeUnknown` so caddy_load and caddy_revert keep the
+ *     snapshot a load that did apply would need. `/load` is held to the rule
+ *     like the rest, although a replay of an identical `/load` is answered 200
+ *     without reloading once it gets the lock: the replay could as easily land
+ *     behind ANOTHER reloader's load and put this body back over it. A
+ *     deadline on anything else -- a GET, `/adapt`, `/stop` -- may still
+ *     retry: nothing is left half-applied behind it.
+ *
+ *  4. Otherwise: is a replay idempotent for this method and path?
+ *     (isRetryableMethod)
+ *
+ * Same CADDY_MAX_RETRIES budget and backoff whichever rule lets a retry through.
+ */
+function shouldRetry(method: string, path: string, attempt: Attempt<unknown>): boolean {
+  if (!isTransientFailure(attempt.res)) return false;
+  if (attempt.refused) return true;
+  if (attempt.timedOut && isConfigChange(method, path)) return false;
+  return isRetryableMethod(method, path);
 }
 
 /**
@@ -336,7 +557,6 @@ async function caddyRequest<T = any>(
   path: string,
   body?: unknown,
   contentType?: string,
-  timeout?: number,
   rawStringBody = false,
 ): Promise<ApiResponse<T>> {
   // Checked here rather than in attemptRequest so it bypasses the retry loop:
@@ -354,24 +574,17 @@ async function caddyRequest<T = any>(
     };
   }
   const maxRetries = getMaxRetries();
-  let attempt = 0;
-  let { res, refused } = await attemptRequest<T>(method, path, body, contentType, timeout, rawStringBody);
-  // A refused connection is retried for EVERY method, including the POST and
-  // array-index PUT that isRetryableMethod excludes: the TCP handshake never
-  // completed, so not one byte of the request left this process and a replay
-  // cannot duplicate a write. That proof holds for ECONNREFUSED only -- a reset
-  // or a timeout can arrive after Caddy read and applied the request, so those
-  // stay behind isRetryableMethod. Same CADDY_MAX_RETRIES budget and backoff
-  // either way, so a Caddy that is genuinely down still fails in a few hundred
-  // ms at the default of 2, with the unchanged "is Caddy running?" message.
-  while (isTransientFailure(res) && (refused || isRetryableMethod(method, path)) && attempt < maxRetries) {
-    attempt++;
-    const backoff = Math.min(RETRY_BASE_MS * 2 ** (attempt - 1), RETRY_MAX_DELAY_MS);
+  let retries = 0;
+  let attempt = await attemptRequest<T>(method, path, body, contentType, rawStringBody);
+  // Whether a failure may be replayed is decided in one place: see shouldRetry.
+  while (retries < maxRetries && shouldRetry(method, path, attempt)) {
+    retries++;
+    const backoff = Math.min(RETRY_BASE_MS * 2 ** (retries - 1), RETRY_MAX_DELAY_MS);
     const delay = backoff + Math.random() * RETRY_MAX_JITTER_MS;
     await sleep(delay);
-    ({ res, refused } = await attemptRequest<T>(method, path, body, contentType, timeout, rawStringBody));
+    attempt = await attemptRequest<T>(method, path, body, contentType, rawStringBody);
   }
-  return res;
+  return attempt.res;
 }
 
 /**
@@ -401,6 +614,36 @@ function isConnectionRefused(err: unknown): boolean {
   return false;
 }
 
+/**
+ * Whether a transport error is this client's own deadline firing, judged by the
+ * error's NAME anywhere in its cause chain, not by its message.
+ *
+ * The message is runtime-specific text. Node's fetch rejects an
+ * AbortSignal.timeout with DOMException TimeoutError "The operation was aborted
+ * due to timeout"; oam's -- the runtime bin/caddy-mcp.mjs prefers when oam
+ * 0.15.2 or newer is installed -- rejects with DOMException TimeoutError "The
+ * operation timed out", which contains neither "abort" nor "timeout". Matching
+ * on the text alone missed that, so under oam a timed-out config change was
+ * never recognised as one: rule 3 of shouldRetry did not fire, the write was
+ * replayed up to 1 + CADDY_MAX_RETRIES times (into the false 404 / 412 rule 3
+ * exists to prevent), and the caller got the bare runtime message instead of
+ * the outcome-unknown one. The name is what the platform standardises:
+ * `TimeoutError` for an AbortSignal.timeout reason, `AbortError` for an abort
+ * (node:http wraps a signal abort in one, with the TimeoutError as its cause).
+ *
+ * Walks `cause` like isConnectionRefused. The caller still keeps the old
+ * substring test as a fallback for a runtime whose error carries neither name.
+ */
+function isTimeoutError(err: unknown): boolean {
+  let current: unknown = err;
+  for (let depth = 0; depth < 5 && current !== null && typeof current === "object"; depth++) {
+    const e = current as { name?: unknown; cause?: unknown };
+    if (e.name === "TimeoutError" || e.name === "AbortError") return true;
+    current = e.cause;
+  }
+  return false;
+}
+
 /** The transport-agnostic shape both send paths reduce to. */
 interface RawResponse {
   ok: boolean;
@@ -412,9 +655,9 @@ interface RawResponse {
 /**
  * Send one request over a unix socket via node:http.
  *
- * Errors reject rather than resolve, so attemptRequest's existing catch block
- * does the classification for both transports. The timeout rejection carries
- * the literal word "timeout" because that catch matches on it.
+ * Errors reject rather than resolve, so sendOnce's catch block does the
+ * classification for both transports. A fired deadline rejects with an error
+ * NAMED TimeoutError, which that catch recognises by name (isTimeoutError).
  */
 function sendViaUnixSocket(
   socketPath: string,
@@ -425,12 +668,21 @@ function sendViaUnixSocket(
   timeoutMs: number,
 ): Promise<RawResponse> {
   return new Promise((resolve, reject) => {
-    // AbortSignal.timeout, not req.setTimeout: setTimeout is an INACTIVITY
+    // An absolute deadline, not req.setTimeout: setTimeout is an INACTIVITY
     // timer, so a response that trickles bytes steadily would never fire it,
-    // while the fetch path below aborts on an absolute deadline. Using the same
-    // signal here keeps CADDY_TIMEOUT / CADDY_LOAD_TIMEOUT meaning one thing on
-    // both transports. The resulting AbortError message contains "aborted",
-    // which attemptRequest's catch already classifies as a timeout.
+    // while the fetch path below aborts on an absolute deadline. Keeping the two
+    // alike keeps CADDY_TIMEOUT / CADDY_LOAD_TIMEOUT meaning one thing on both
+    // transports.
+    //
+    // An explicit timer that destroys the request, rather than node:http's
+    // `signal` option. On Node the two are the same thing -- a signal abort IS a
+    // req.destroy -- but oam's node:http ignores `signal`: a request under
+    // AbortSignal.timeout(200) had still not aborted after 3 s on oam 0.16.2
+    // (Node: 203 ms), which left this transport with no deadline at all there.
+    // Once the timer has fired, every rejection that follows is reported as the
+    // deadline itself: destroying a request whose response has already started
+    // also fails the response with a generic "aborted", and the catch must see
+    // the timeout either way.
     //
     // agent: false gives every request its own connection. Since Node 19 the
     // global agent keeps sockets alive, and Caddy closes them whenever a config
@@ -442,25 +694,33 @@ function sendViaUnixSocket(
     // shared-listener deadline -- that bug is TCP on Windows only), so a fresh
     // connect during the restart just queues in the backlog. A dedicated agent
     // (keepAlive off) also sends `Connection: close`.
-    const req = httpRequest(
-      { socketPath, path, method, headers, agent: false, signal: AbortSignal.timeout(timeoutMs) },
-      (res) => {
-        const chunks: Buffer[] = [];
-        res.on("data", (chunk: Buffer) => chunks.push(chunk));
-        res.on("error", reject);
-        res.on("end", () => {
-          const status = res.statusCode ?? 0;
-          const etag = res.headers.etag;
-          resolve({
-            ok: status >= 200 && status < 300,
-            status,
-            text: Buffer.concat(chunks).toString("utf8"),
-            etag: typeof etag === "string" ? etag : undefined,
-          });
+    let deadlineHit = false;
+    const deadline = Object.assign(new Error(`timed out after ${timeoutMs}ms`), { name: "TimeoutError" });
+    function fail(err: unknown) {
+      clearTimeout(timer);
+      reject(deadlineHit ? deadline : err);
+    }
+    const req = httpRequest({ socketPath, path, method, headers, agent: false }, (res) => {
+      const chunks: Buffer[] = [];
+      res.on("data", (chunk: Buffer) => chunks.push(chunk));
+      res.on("error", fail);
+      res.on("end", () => {
+        clearTimeout(timer);
+        const status = res.statusCode ?? 0;
+        const etag = res.headers.etag;
+        resolve({
+          ok: status >= 200 && status < 300,
+          status,
+          text: Buffer.concat(chunks).toString("utf8"),
+          etag: typeof etag === "string" ? etag : undefined,
         });
-      },
-    );
-    req.on("error", reject);
+      });
+    });
+    const timer = setTimeout(() => {
+      deadlineHit = true;
+      req.destroy(deadline);
+    }, timeoutMs);
+    req.on("error", fail);
     if (body !== undefined) req.write(body);
     req.end();
   });
@@ -557,11 +817,13 @@ function originOf(origin: unknown): string | undefined {
  * fine. Measured: 157 such failures in 15 runs of the live suite, every one on
  * a reused socket with no response byte, none on a fresh connection.
  *
- * Why not retry the reset: GET/PATCH/DELETE already do, which is why those only
- * ever looked slow. A POST under /config appends, and a reset does not prove
- * Caddy never read the request -- only that no response arrived -- so replaying
- * it risks a duplicate route. Waiting for the close means the POST is never
- * written to a doomed socket in the first place, so there is nothing to replay.
+ * Why not retry the reset: GET, PATCH and DELETE of a key already do, which is
+ * why those only ever looked slow. A POST under /config appends, a PUT at an
+ * array index inserts and a DELETE at one re-packs the array, and a reset does
+ * not prove Caddy never read the request -- only that no response arrived -- so
+ * replaying one risks a duplicate route, or the wrong route removed (see
+ * isRetryableMethod). Waiting for the close means none of them is ever written
+ * to a doomed socket in the first place, so there is nothing to replay.
  *
  * Why not `Connection: close` on every request: it also keeps requests off
  * doomed sockets, but it makes the request after a config change open a fresh
@@ -597,17 +859,122 @@ function settleAdminRestart(origin: string | undefined): Promise<void> {
   });
 }
 
-/** Whether a successful (method, path) makes Caddy load a new config and restart its admin endpoint. */
-function isConfigChange(method: string, path: string): boolean {
-  if (method === "GET") return false;
-  return path === "/load" || path.startsWith("/config/") || path.startsWith("/id/");
+/** What the body of a 2xx answer to `POST /load` says, beyond its status line. */
+interface LoadBody {
+  /** Config-adapter warnings, in the order Caddy reported them. */
+  warnings: unknown[];
+  /** Caddy's trailing `{"error":...}` object exactly as it appeared, when the body carries one. */
+  errorText?: string;
 }
 
-/** One attempt's result, plus the transport fact the retry policy needs. */
-interface Attempt<T> {
-  res: ApiResponse<T>;
-  /** The connection was refused: no byte of the request reached Caddy. */
-  refused: boolean;
+/**
+ * The index just past the first complete JSON array or object in `text`, or -1
+ * if it never closes.
+ *
+ * This finds a BOUNDARY and nothing else: it tracks string state (and escapes
+ * inside strings) so a bracket or brace inside a warning's message cannot end
+ * the value early, and it counts `[`/`{` against `]`/`}` without caring which
+ * closes which. Whether the slice is valid JSON is JSON.parse's job, run on the
+ * result by the caller. A regex over the text -- splitting on `]{`, say -- gets
+ * this wrong the moment a message contains those characters, and a warning's
+ * message is free text quoted from the operator's own config.
+ */
+function endOfFirstJsonValue(text: string): number {
+  let depth = 0;
+  let inString = false;
+  let escaped = false;
+  for (let i = 0; i < text.length; i++) {
+    const ch = text[i];
+    if (inString) {
+      if (escaped) escaped = false;
+      else if (ch === "\\") escaped = true;
+      else if (ch === '"') inString = false;
+      continue;
+    }
+    if (ch === '"') inString = true;
+    else if (ch === "[" || ch === "{") depth++;
+    else if (ch === "]" || ch === "}") {
+      depth--;
+      if (depth <= 0) return depth === 0 ? i + 1 : -1;
+    }
+  }
+  return -1;
+}
+
+function parseJsonOrUndefined(text: string): unknown {
+  try {
+    return JSON.parse(text);
+  } catch {
+    return undefined;
+  }
+}
+
+/**
+ * Read the body of a 2xx answer to `POST /load` -- the one place Caddy's status
+ * line cannot be taken at its word.
+ *
+ * handleLoad writes the config adapter's warnings to the response BEFORE it
+ * runs the load (caddyconfig/load.go:104-110 at v2.11.4). That first write
+ * commits the status at 200, so when caddy.Load then fails, the 400 handleError
+ * sets arrives too late to change it and the error object is appended to what
+ * was already sent. Verified against Caddy 2.11.4, loading a space-indented
+ * Caddyfile (the adapter's "input is not formatted" warning fires on any file
+ * `caddy fmt` would change, so this is the common case, not a corner) whose
+ * `tls` directive names a certificate file that does not exist:
+ *
+ *   HTTP/1.1 200 OK
+ *   Content-Type: text/plain; charset=utf-8
+ *
+ *   [{"file":"Caddyfile","line":2,"message":"Caddyfile input is not formatted; run 'caddy fmt --overwrite' to fix inconsistencies"}]{"error":"loading config: loading new config: loading http app module: provision http: getting tls app: loading tls app module: provision tls: loading certificates: open C:/nonexistent-caddy-mcp/cert.pem: The system cannot find the path specified."}
+ *
+ * and `GET /config/` afterwards still returned the previous config. The same
+ * Caddyfile indented with tabs -- no warning, so nothing written early -- is
+ * answered 400 with that error object alone. Read as ONE document the 200 body
+ * is not JSON, so this client fell through to "a 2xx with a text body" and
+ * reported the failed load as a success: caddy_load printed it with no isError,
+ * pushed a "pre-load" snapshot of a config that had not been replaced, and the
+ * ETag cache was cleared.
+ *
+ * Shapes recognized:
+ *   [..warnings..]                   2.11.4, the load applied (observed live)
+ *   [..warnings..]{"error":"..."}    2.11.4, the load FAILED behind a 200 (observed live)
+ *   {"warnings":[..]}                the load applied, as caddyserver/caddy#7267 writes it
+ *
+ * #7267 is the upstream fix: open and milestoned v2.11.5 at the time of
+ * writing, read from its diff, never run. It moves the failure to a real 400
+ * carrying `{"error":"...","warnings":[..]}`, which needs nothing here -- a
+ * non-2xx never reaches this function, and sendOnce already returns such a body
+ * verbatim, so both parts stay visible. Only its success shape is handled, and
+ * only when `warnings` is the object's sole key, so a body that grew another
+ * field is shown whole by the fallback rather than trimmed to the part this
+ * function knows about.
+ *
+ * Anything else returns undefined and the caller does what it always did. That
+ * is deliberate: the one thing worth overriding a 200 for is an error object
+ * Caddy itself appended, identified by structure (a JSON array, then a JSON
+ * object with a string `error`), not by sniffing the text for the word "error".
+ */
+function readLoadBody(text: string): LoadBody | undefined {
+  const body = text.trim();
+  if (body.startsWith("[")) {
+    const end = endOfFirstJsonValue(body);
+    if (end === -1) return undefined;
+    const warnings = parseJsonOrUndefined(body.slice(0, end));
+    if (!Array.isArray(warnings)) return undefined;
+    const tail = body.slice(end).trim();
+    if (!tail) return { warnings };
+    const trailing = parseJsonOrUndefined(tail);
+    if (trailing === null || typeof trailing !== "object" || Array.isArray(trailing)) return undefined;
+    if (typeof (trailing as { error?: unknown }).error !== "string") return undefined;
+    return { warnings, errorText: tail };
+  }
+  if (body.startsWith("{")) {
+    const parsed = parseJsonOrUndefined(body);
+    if (parsed === null || typeof parsed !== "object" || Array.isArray(parsed)) return undefined;
+    const warnings = (parsed as { warnings?: unknown }).warnings;
+    if (Array.isArray(warnings) && Object.keys(parsed).length === 1) return { warnings };
+  }
+  return undefined;
 }
 
 async function attemptRequest<T = any>(
@@ -615,26 +982,24 @@ async function attemptRequest<T = any>(
   path: string,
   body?: unknown,
   contentType?: string,
-  timeout?: number,
   rawStringBody = false,
 ): Promise<Attempt<T>> {
-  const transport = { refused: false };
-  const res = await sendOnce<T>(transport, method, path, body, contentType, timeout, rawStringBody);
-  return { res, refused: transport.refused };
+  const transport = { refused: false, timedOut: false };
+  const res = await sendOnce<T>(transport, method, path, body, contentType, rawStringBody);
+  return { res, refused: transport.refused, timedOut: transport.timedOut };
 }
 
 async function sendOnce<T = any>(
-  transport: { refused: boolean },
+  transport: { refused: boolean; timedOut: boolean },
   method: string,
   path: string,
   body?: unknown,
   contentType?: string,
-  timeout?: number,
   rawStringBody = false,
 ): Promise<ApiResponse<T>> {
   const socketPath = getUnixSocketPath();
   const url = `${getBaseUrl()}${path}`;
-  const effectiveTimeout = timeout ?? getRequestTimeout();
+  const effectiveTimeout = getTimeoutFor(method, path);
   try {
     const hasBody = body !== undefined;
     const headers = getHeaders(hasBody ? contentType || "application/json" : undefined, socketPath !== undefined);
@@ -663,6 +1028,33 @@ async function sendOnce<T = any>(
     const res = socketPath
       ? await sendViaUnixSocket(socketPath, path, method, headers, serializedBody, effectiveTimeout)
       : await sendViaFetch(url, method, headers, serializedBody, effectiveTimeout);
+    // `/load` can answer 200 for a load that FAILED: see readLoadBody. Decided
+    // here, ahead of everything below that keys on `res.ok`, so this failure is
+    // handled exactly as the 400 Caddy sends for the same failure when no
+    // warnings got in the way: returned as-is with no settle wait, and -- since
+    // loadConfig and caddy_load key on the `ok` returned here -- no ETag cache
+    // clear and no pre-load snapshot. Never retried either: isTransientFailure
+    // wants status 0 or a gateway status, and this is neither.
+    //
+    // The status stays the 200 Caddy sent. Reporting the 400 it "meant" would be
+    // inventing a response; what happened is a 200 whose body carries a load
+    // error, and the message says that. The error object is Caddy's own bytes;
+    // the hint explains the 200, which has one mechanism, and names no cause for
+    // the load failure itself -- that is whatever Caddy's text says.
+    const loadBody = path === "/load" && res.ok ? readLoadBody(res.text) : undefined;
+    if (loadBody?.errorText !== undefined) {
+      return {
+        ok: false,
+        status: res.status,
+        error:
+          `${loadBody.errorText} -- Caddy answered HTTP ${res.status}, but the response body carries this load ` +
+          `error after its config-adapter warnings, so caddy-mcp reports the load as failed. Caddy writes the ` +
+          `warnings before it runs the load, which fixes the status at 200 whatever the load then does ` +
+          `(caddyserver/caddy#7246); without warnings it answers the same failure with 400. Re-read the ` +
+          `config to confirm what is running.`,
+        warnings: loadBody.warnings,
+      };
+    }
     // Caddy is now restarting its admin endpoint; hold the result until the
     // pooled sockets it will close are gone, so the caller's next request
     // cannot be written to one of them. Over a unix socket every request has
@@ -733,6 +1125,10 @@ async function sendOnce<T = any>(
       return { ok: false, status: res.status, error: text };
     }
     if (!text) return { ok: true, status: res.status, etag };
+    // A load that applied, with adapter warnings. They go out as `warnings`, not
+    // `data`: a Caddyfile load has no result to return, and leaving the raw array
+    // in `data` as well would print every warning twice.
+    if (loadBody) return { ok: true, status: res.status, warnings: loadBody.warnings, etag };
     try {
       return { ok: true, status: res.status, data: JSON.parse(text) as T, etag };
     } catch {
@@ -766,8 +1162,39 @@ async function sendOnce<T = any>(
         error: `Cannot connect to Caddy admin API at ${target} — is Caddy running?`,
       };
     }
-    if (msg.includes("abort") || msg.includes("timeout")) {
-      return { ok: false, status: 0, error: `Request timed out after ${effectiveTimeout}ms` };
+    // By name first (isTimeoutError explains why the text is not enough); the
+    // substring test stays as a fallback for a runtime whose error carries no
+    // standard name, with "timed out" added for oam's wording.
+    if (isTimeoutError(err) || msg.includes("abort") || msg.includes("timeout") || msg.includes("timed out")) {
+      transport.timedOut = true;
+      const timedOutMsg = `Request timed out after ${effectiveTimeout}ms`;
+      if (!isConfigChange(method, path)) return { ok: false, status: 0, error: timedOutMsg };
+      // A deadline on a config change is not "it failed". Caddy applies the
+      // change synchronously inside the request and does not notice the client
+      // giving up (see isConfigChange), so all this client knows is that no
+      // answer came in time -- a reload still running, a change waiting on
+      // Caddy's config lock behind someone else's reload, a response that was
+      // lost, a request that never arrived. The hint therefore names no cause
+      // and no outcome; it says the one thing that is true in every case (look
+      // before doing it again), because an operator who reads a bare "timed
+      // out" and re-issues `DELETE .../routes/2` by hand recreates the replay
+      // hazard shouldRetry just declined to create.
+      //
+      // The CADDY_LOAD_TIMEOUT advice carries its ceiling: raised to or past the
+      // MCP client's own request timeout, this message is never delivered (see
+      // LOAD_TIMEOUT), which is worse than the timeout it was raised to avoid.
+      return {
+        ok: false,
+        status: 0,
+        outcomeUnknown: true,
+        error:
+          `${timedOutMsg} -- the outcome is unknown: Caddy may still be applying this change. A config change ` +
+          `blocks until Caddy finishes reloading, and a client timeout does not cancel it, so it may have ` +
+          `applied, may yet apply, or may not apply at all; caddy-mcp never replays a timed-out config change. ` +
+          `Re-read the config before retrying. If reloads on this instance legitimately take this long, raise ` +
+          `CADDY_LOAD_TIMEOUT, keeping it below your MCP client's request timeout (60 s by default in the MCP ` +
+          `SDK), or this error never reaches the client.`,
+      };
     }
     return { ok: false, status: 0, error: msg };
   }
@@ -822,24 +1249,60 @@ function getRequestTimeout(): number {
 
 function getLoadTimeout(): number {
   const raw = process.env.CADDY_LOAD_TIMEOUT;
-  if (raw === undefined) return 60000;
+  if (raw === undefined) return LOAD_TIMEOUT;
   const n = Number(raw);
   // Reject anything that floors below 1ms -- "0.5" passes n>0 but Math.floor(0.5)=0
   // would produce an immediate-abort timeout. Floor first, then bounds-check.
-  if (!Number.isFinite(n)) return 60000;
+  if (!Number.isFinite(n)) return LOAD_TIMEOUT;
   const floored = Math.floor(n);
-  if (floored < 1) return 60000;
+  if (floored < 1) return LOAD_TIMEOUT;
   return floored;
 }
 
+/**
+ * The deadline for one attempt, chosen by what the request makes Caddy do
+ * rather than by which endpoint it names: CADDY_LOAD_TIMEOUT for every config
+ * change, CADDY_TIMEOUT for everything else (GETs, `/adapt`, `/stop`, PKI,
+ * metrics).
+ *
+ * `/load` used to be the only request on the larger budget, on the reasoning
+ * that a full reload can be slow. But a PATCH / PUT / POST / DELETE under
+ * /config or /id IS a full reload -- the same changeConfig, the same lock, the
+ * same provision-everything-then-stop-the-old-config sequence (see
+ * isConfigChange) -- and it sat on the 10 s budget, so the same reload that
+ * `/load` would have waited out was reported as a timeout while Caddy carried
+ * on applying it. The documented way to get there is
+ * `apps.http.shutdown_delay`: stopping the old HTTP app sleeps for that long
+ * INSIDE the reload whenever the change closes a listener (deleting a server,
+ * editing `listen`; modules/caddyhttp/app.go:660-685 at v2.11.4). Verified
+ * against Caddy 2.11.4 with `shutdown_delay: 4s` and a 2 s deadline: deleting a
+ * server took 4.0 s and applied; 2.5.2 timed out, replayed, and -- the replay
+ * having queued behind the original -- reported `404 key does not exist` for
+ * its own successful delete. On the reload budget the same call answers 200.
+ * A change that has to wait on Caddy's config lock behind another reloader
+ * (`caddy reload`, caddy-docker-proxy) gets there too. ACME issuance does not:
+ * certificates are managed asynchronously and do not hold up a reload.
+ *
+ * The reload budget defaults to 55 s, not the 60 s `/load` alone had in 2.5.2.
+ * A config change now gets ONE attempt (shouldRetry rule 3), and the MCP SDK's
+ * client abandons a tool call at 60 s by default, so a 60 s deadline meant the
+ * outcome-unknown error was never delivered: the client had already given up
+ * and the SDK dropped the result (see LOAD_TIMEOUT).
+ *
+ * Read per attempt, not cached: both values come from the environment.
+ */
+function getTimeoutFor(method: string, path: string): number {
+  return isConfigChange(method, path) ? getLoadTimeout() : getRequestTimeout();
+}
+
 export async function loadConfig(config: unknown, contentType?: string): Promise<ApiResponse> {
-  const res = await caddyRequest("POST", "/load", config, contentType, getLoadTimeout(), true);
+  const res = await caddyRequest("POST", "/load", config, contentType, true);
   if (res.ok) etagCache.clear();
   return res;
 }
 
 export function adapt<T = any>(config: string, adapter = "caddyfile"): Promise<ApiResponse<T>> {
-  return caddyRequest<T>("POST", "/adapt", config, `text/${adapter}`, undefined, true);
+  return caddyRequest<T>("POST", "/adapt", config, `text/${adapter}`, true);
 }
 
 export function stop(): Promise<ApiResponse> {

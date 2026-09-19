@@ -308,7 +308,24 @@ function isRouteShape(obj: unknown): boolean {
   return Array.isArray((obj as { handle?: unknown }).handle);
 }
 
-/** Build an error result for when a server doesn't exist. `op` names the calling tool so the caller can tell which operation hit the missing server. */
+/**
+ * Build an error result for when a server doesn't exist. `op` names the calling tool so the caller can tell which operation hit the missing server.
+ *
+ * The recipe names mode "insert" (PUT), not "append" (POST). This text used to
+ * recommend "append" and to say that on an instance with no config "caddy_config_set
+ * cannot create the apps/http tree it would write into". Both were wrong, and the
+ * second sent operators to caddy_load -- a confirm-gated replace of the WHOLE config --
+ * for a job one scoped write does. Verified against Caddy 2.11.4, on a config-less
+ * instance (GET /config/ -> null):
+ *   POST apps/http/servers/srv0 -> 500 "invalid traversal path at: config/apps"
+ *   PUT  apps/http/servers/srv0 -> 200, config becomes {"apps":{"http":{"servers":{...}}}}
+ *   the same PUT again          -> 409 "key already exists: srv0"
+ *   POST over an existing srv0  -> 200, and the server is REPLACED (its routes are gone)
+ * So PUT is the more capable verb (it creates missing parents as it walks the path)
+ * and the safer one (strictly-create: a name that is already taken is a 409, where
+ * POST silently swaps the server out). This is reached on a traversal failure, which
+ * means the parents may be missing too -- the case only PUT handles.
+ */
 function serverNotFoundError(srv: string, op = "operation") {
   return {
     isError: true,
@@ -317,12 +334,13 @@ function serverNotFoundError(srv: string, op = "operation") {
         type: "text" as const,
         text:
           `Error: Server "${srv}" does not exist (${op}). Use caddy_list_servers to see what is configured. ` +
-          `To create it: caddy_config_set { path: "apps/http/servers/${srv}", mode: "append", ` +
-          `value: { "listen": [":443"], "routes": [] } }. Both arguments are load-bearing: mode "append" ` +
-          `creates the key, while the default "overwrite" fails with "key does not exist"; and "routes": [] ` +
-          `must be present, or adding the first route fails, because a POST creates a missing routes key as ` +
-          `an object rather than an array. On an instance with no config at all, use caddy_load instead -- ` +
-          `caddy_config_set cannot create the apps/http tree it would write into.`,
+          `To create it: caddy_config_set { path: "apps/http/servers/${srv}", mode: "insert", ` +
+          `value: { "listen": [":443"], "routes": [] } }. Both arguments are load-bearing: mode "insert" (PUT) ` +
+          `creates the key along with any missing apps/http/servers parents, so it works even on an instance ` +
+          `with no config at all, and fails with 409 if the server already exists -- whereas "append" (POST) ` +
+          `would replace an existing server and cannot create missing parents, and the default "overwrite" ` +
+          `fails with "key does not exist"; and "routes": [] must be present, or adding the first route fails, ` +
+          `because a POST creates a missing routes key as an object rather than an array.`,
       },
     ],
   };
@@ -344,6 +362,28 @@ function serverNotFoundError(srv: string, op = "operation") {
  *
  * An empty OBJECT is a different answer and must not land here -- `{}` is a real,
  * routeless server, which the summary path renders as "no routes configured".
+ *
+ * The recipe names mode "insert" because a strictly-create PUT is the one write that
+ * cannot damage either case. Verified against Caddy 2.11.4:
+ *   PUT   apps/http/servers/typo    -> 200  (no such key: created)
+ *   PUT   apps/http/servers/nulled  -> 409 "key already exists: nulled"
+ *   PATCH apps/http/servers/nulled  -> 200  (the null is replaced)
+ * It used to name no mode at all, which left the caller on the default "overwrite" --
+ * a PATCH, which 404s on the likelier cause (an unknown server).
+ *
+ * A 409 from that PUT does NOT settle which case this was, and the text must not say
+ * it does. Caddy answers 409 whenever the key is present at WRITE time, whatever it
+ * holds (admin.go, the PUT branch of unsyncedConfigAccess), so it proves only that the
+ * key exists now. It may have held null all along; or it may have been created after
+ * this read -- by another writer (a second agent, `caddy reload`, caddy-docker-proxy),
+ * or by an earlier attempt of this same PUT whose response was lost, which api.ts
+ * replays on a reset or a gateway status because a PUT to a key is retryable. In the
+ * last two cases the server is real, and the "overwrite" (PATCH) this text once
+ * recommended on a 409 would replace it wholesale, routes included, and report
+ * success. So the text sends the caller to re-read the key first. Verified against
+ * Caddy 2.11.4: GET apps/http/servers/typo -> 200 null; another client PUTs "typo"
+ * with a route; the recipe's PUT -> 409 "key already exists: typo"; and the re-read
+ * shows that real server, not null.
  */
 function serverNullError(srv: string) {
   return {
@@ -354,8 +394,14 @@ function serverNullError(srv: string) {
         text:
           `Error: Server "${srv}" is not configured, or its config is null -- Caddy returns the same ` +
           `response (HTTP 200 with a body of null) for both, so they cannot be told apart from here. ` +
-          `Use caddy_list_servers to see which servers exist, or create this one with caddy_load or ` +
-          `caddy_config_set at path 'apps/http/servers/${srv}' with at minimum: { "listen": [":443"] }`,
+          `Use caddy_list_servers to see which servers exist. To create this one: caddy_config_set ` +
+          `{ path: "apps/http/servers/${srv}", mode: "insert", value: { "listen": [":443"], "routes": [] } }. ` +
+          `Mode "insert" (PUT) strictly creates the key, so it never overwrites anything. If it fails with ` +
+          `409 "key already exists", the key is there now: it may hold a null config, or it may have been ` +
+          `created after this read (by another writer, or by an earlier attempt of this same write whose ` +
+          `response was lost). Re-read it with caddy_config_get { path: "apps/http/servers/${srv}" }, and use ` +
+          `mode "overwrite" only if that read still shows null -- overwrite (PATCH) replaces the whole server, ` +
+          `routes included.`,
       },
     ],
   };
