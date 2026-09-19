@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [2.5.3] — 2026-09-19
+
 ### Fixed
 - **`caddy_remove_route` by index can no longer remove more than one route.** A
   `DELETE` at an array index was retried like any other `DELETE` when no response
