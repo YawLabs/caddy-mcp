@@ -24,7 +24,10 @@ function formatWarning(w: unknown): string {
 export function registerAdaptTools(server: McpServer) {
   server.tool(
     "caddy_adapt",
-    "Convert a config in any registered adapter format to Caddy JSON without loading it. Useful for previewing what a Caddyfile produces, or for porting from nginx/yaml configs when Caddy is built with the matching adapter module ('caddyfile' is built-in; 'nginx', 'yaml', etc. require their adapter modules to be compiled into the Caddy binary). Returns the adapted JSON and any warnings separately.",
+    "Convert a config in any registered adapter format to Caddy JSON without loading it. Useful for previewing what a Caddyfile produces, or for porting from nginx/yaml configs when Caddy is built with the matching adapter module ('caddyfile' is built-in; 'nginx', 'yaml', etc. require their adapter modules to be compiled into the Caddy binary). Returns the adapted JSON and any warnings separately. " +
+      "One exception to 'without loading it': on Caddy <= 2.11.4 a Caddyfile 'order' global option is not preview-only. It mutates that Caddy process's directive order, so it carries into every later Caddyfile adapt or load there, " +
+      "and an 'order' line that FAILS (unknown target, bad positional, extra arg) still removes the directive it names -- later Caddyfiles using that directive then fail with \"directive 'X' is not an ordered HTTP handler\" until another " +
+      "'order' line re-places it or Caddy restarts. Fixed upstream in caddyserver/caddy#7995, unreleased as of v2.11.4.",
     {
       config: z.string().describe("The raw config text (e.g., Caddyfile contents, nginx.conf, yaml)"),
       adapter: z

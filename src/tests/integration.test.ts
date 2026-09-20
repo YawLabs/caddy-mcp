@@ -997,5 +997,78 @@ describe.skipIf(!RUN)("integration: live Caddy admin API", () => {
       // No "pre-load" snapshot for a load that replaced nothing.
       expect(listSnapshots()).toHaveLength(ringBefore);
     });
+
+    // A root caddy_config_delete is a different operation wearing the same tool:
+    // Caddy deletes the "config" key itself, marshals the result to null and runs
+    // it, so the whole configuration is unloaded. Nothing else in this server
+    // records what was there, and the mocked tests can only prove that
+    // saveSnapshot was called -- not that what it stored is re-loadable, which is
+    // the entire point of the safety net. So the round trip is pinned live.
+    //
+    // Safe to run against the suite's shared instance because the configs here
+    // carry no `admin` block: Caddy re-binds the admin endpoint to the same
+    // default address it was already on (localhost:2019, or $CADDY_ADMIN), so the
+    // endpoint this suite talks to does not move. An instance whose CONFIG sets
+    // admin.listen is the dangerous case, and that is the one this test avoids
+    // creating -- see the tool description.
+    it("caddy_config_delete snapshots the whole config before unloading it, and caddy_revert brings it back", async () => {
+      const known = {
+        apps: {
+          http: {
+            servers: {
+              srv0: {
+                listen: [":18899"],
+                routes: [{ handle: [{ handler: "static_response", body: "before the unload" }] }],
+              },
+            },
+          },
+        },
+      };
+      assertOk(await loadAndSettle(known), "loadConfig known config");
+      const before = await api.configGet();
+      assertOk(before, "configGet before the unload");
+
+      const { listSnapshots } = await import("../snapshots.js");
+      const ringBefore = listSnapshots().length;
+
+      const del = getHandler(registerConfigTools, "caddy_config_delete");
+      const result = await del({ path: "", confirm: true });
+
+      expect(result.isError, result.content?.[0]?.text).toBeFalsy();
+      expect(result.content[0].text).toContain("snapshot [0]");
+      // No admin.listen was unloaded, so the endpoint did NOT move -- claiming
+      // it did would send an operator after a listener that never changed.
+      expect(result.content[0].text).not.toContain("set admin.listen to");
+
+      // Unloading restarts the admin endpoint exactly as a load does.
+      await waitForAdmin();
+      const emptied = await api.configGet();
+      assertOk(emptied, "configGet after the unload");
+      expect(emptied.data).toBeNull();
+
+      const snaps = listSnapshots();
+      expect(snaps).toHaveLength(ringBefore + 1);
+      expect(snaps[0].trigger).toBe("caddy_config_delete");
+      // Exactly what was unloaded: the handler's own GET refreshes the "/config/"
+      // ETag, so the DELETE carries If-Match and Caddy either removes that config
+      // or answers 412.
+      expect(snaps[0].config).toEqual(before.data);
+
+      // The half a mock cannot reach: POST /load re-creates the "config" key that
+      // the DELETE removed, so the snapshot is genuinely restorable afterwards.
+      const revert = getHandler(registerConfigTools, "caddy_revert");
+      const restored = await revert({ action: "apply", index: 0, confirm: true });
+      expect(restored.isError, restored.content?.[0]?.text).toBeFalsy();
+      expect(restored.content[0].text).toContain("Reverted to snapshot [0]");
+      // And it says why no roll-forward snapshot was taken, in the words that fit
+      // a 200 carrying `null` -- an unloaded instance is not a failed read.
+      expect(restored.content[0].text).toContain("empty or not a JSON object");
+      expect(restored.content[0].text).not.toContain("could not be read");
+
+      await waitForAdmin();
+      const after = await api.configGet();
+      assertOk(after, "configGet after the revert");
+      expect(after.data).toEqual(before.data);
+    });
   });
 });

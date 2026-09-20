@@ -987,6 +987,8 @@ describe("tool handler behavior", () => {
     let handler: (...args: any[]) => Promise<any>;
 
     beforeEach(async () => {
+      const { clearSnapshots } = await import("../snapshots.js");
+      clearSnapshots();
       const mockServer = { tool: vi.fn(), resource: vi.fn() };
       const { registerConfigTools } = await import("../tools/config.js");
       registerConfigTools(mockServer as any);
@@ -1005,6 +1007,178 @@ describe("tool handler behavior", () => {
       const result = await handler({ path: "apps/http/servers/srv0/routes/0", confirm: true });
       expect(api.configDelete).toHaveBeenCalledWith("apps/http/servers/srv0/routes/0");
       expect(result.isError).toBeFalsy();
+    });
+
+    // A root path is DELETE /config/ -- Caddy's documented "unload the entire
+    // current configuration". It takes the admin block with it, so Caddy re-binds
+    // the admin endpoint to its default address and a CADDY_ADMIN_URL pointing
+    // anywhere else stops working. The refusal used to read `Refusing to delete
+    // ""`, which named neither consequence.
+    describe("a path that addresses the whole config", () => {
+      // Every spelling isRootConfigPath accepts. If this list and the predicate
+      // ever disagree, a path would take Caddy's unloads-everything branch with
+      // this tool's leaf branch: no warning, no snapshot. The slash-only tails
+      // are in the list deliberately -- they normalize to `/config//` in api.ts,
+      // which is why the handler sends the canonical "" instead (below).
+      const rootPaths = ["", "/", "config", "config/", "/config", "/config/", "//", "///", "config//", "/config//"];
+
+      it.each(rootPaths)("refuses path %o without confirm=true, naming the whole config", async (path) => {
+        const result = await handler({ path });
+
+        expect(result.isError).toBe(true);
+        const text = result.content[0].text;
+        expect(text).toContain("ENTIRE config");
+        expect(text).toContain("confirm=true");
+        // The consequence the old text never mentioned: the admin endpoint moves.
+        expect(text).toContain("admin");
+        expect(text).toContain("localhost:2019");
+        expect(text).toContain("CADDY_ADMIN_URL");
+        // And the non-destructive alternative for "I meant to change the config".
+        expect(text).toContain("caddy_load");
+        expect(api.configDelete).not.toHaveBeenCalled();
+        expect(api.configGet).not.toHaveBeenCalled();
+      });
+
+      it("snapshots the config BEFORE deleting it, and says so", async () => {
+        const prior = { apps: { http: { servers: { srv0: { listen: [":80"] } } } } };
+        api.configGet.mockResolvedValue(ok(prior));
+        api.configDelete.mockResolvedValue(ok({}));
+
+        const result = await handler({ path: "", confirm: true });
+
+        expect(result.isError).toBeFalsy();
+        // Read first: the GET is also what refreshes the cached ETag, so the
+        // DELETE carries If-Match and the snapshot is exactly what was unloaded.
+        expect(api.configGet.mock.invocationCallOrder[0]).toBeLessThan(api.configDelete.mock.invocationCallOrder[0]);
+        const { listSnapshots } = await import("../snapshots.js");
+        const snaps = listSnapshots();
+        expect(snaps).toHaveLength(1);
+        expect(snaps[0].trigger).toBe("caddy_config_delete");
+        expect(snaps[0].config).toEqual(prior);
+        // A snapshot the caller is never told about is a safety net nobody reaches for.
+        expect(result.content[0].text).toContain("snapshot [0]");
+        expect(result.content[0].text).toContain("caddy_revert");
+      });
+
+      it("sends the CANONICAL root path, whatever spelling the caller used", async () => {
+        // The handler's own GET caches the ETag under "/config/". api.ts encodes
+        // "//" to `/config//` -- a different cache key, so the DELETE would go
+        // out with no If-Match and the optimistic-concurrency guarantee this
+        // branch documents would silently not hold. (Caddy's admin mux has the
+        // config route registered at "/config/", so it answers `/config//` with
+        // a redirect rather than dispatching; fetch follows it and the config
+        // really is unloaded, unguarded, while node:http over a unix socket does
+        // not follow redirects at all.)
+        api.configGet.mockResolvedValue(ok({ apps: {} }));
+        api.configDelete.mockResolvedValue(ok({}));
+
+        await handler({ path: "//", confirm: true });
+
+        expect(api.configDelete).toHaveBeenCalledWith("");
+        expect(api.configDelete).not.toHaveBeenCalledWith("//");
+      });
+
+      it("warns that the admin endpoint moved only when the unloaded config set admin.listen", async () => {
+        // Caddy substitutes DefaultAdminListen for an absent or empty Listen on
+        // BOTH sides of the delete (admin.go:411 + :1391-1398 before, :398-402
+        // after), so only a block that supplied a `listen` can have moved
+        // anything. The mere presence of an 'admin' key cannot: an instance
+        // already running on the default address does not MOVE, and saying it
+        // did would send the operator after an endpoint that never changed.
+        const { clearSnapshots } = await import("../snapshots.js");
+        api.configDelete.mockResolvedValue(ok({}));
+
+        api.configGet.mockResolvedValue(ok({ admin: { listen: "127.0.0.1:2020" }, apps: {} }));
+        const moved = await handler({ path: "", confirm: true });
+        expect(moved.content[0].text).toContain('set admin.listen to "127.0.0.1:2020"');
+
+        // The shapes that carry an 'admin' key but no `listen`. The first is the
+        // standard no-autosave config -- and the exact shape this repo's own
+        // live-Caddy procedure runs -- so a note here is a false alarm on the
+        // most common config there is.
+        for (const config of [
+          { admin: { config: { persist: false } }, apps: {} },
+          { admin: { origins: ["http://localhost:2019"] }, apps: {} },
+          { admin: { listen: "" }, apps: {} },
+          { apps: {} },
+        ]) {
+          clearSnapshots();
+          api.configGet.mockResolvedValue(ok(config));
+          const notMoved = await handler({ path: "", confirm: true });
+          expect(notMoved.content[0].text, JSON.stringify(config)).not.toContain("set admin.listen to");
+        }
+      });
+
+      it("does NOT snapshot when the delete fails", async () => {
+        // A failed delete changed nothing server-side; a snapshot for it would
+        // burn a slot in the 10-deep ring and push older rollback targets down.
+        api.configGet.mockResolvedValue(ok({ apps: {} }));
+        api.configDelete.mockResolvedValue(err(412, "If-Match header did not match current config hash"));
+
+        const result = await handler({ path: "", confirm: true });
+
+        expect(result.isError).toBe(true);
+        // Caddy's body, verbatim.
+        expect(result.content[0].text).toContain("If-Match header did not match current config hash");
+        const { listSnapshots } = await import("../snapshots.js");
+        expect(listSnapshots()).toHaveLength(0);
+      });
+
+      it("keeps the snapshot when the delete's deadline fired, and says it was kept", async () => {
+        // Same exception caddy_load makes: Caddy goes on applying a config change
+        // it has read after the client hangs up, and a timed-out change is never
+        // replayed -- so the config this delete may have unloaded is recorded
+        // nowhere else.
+        const prior = { apps: { http: {} } };
+        api.configGet.mockResolvedValue(ok(prior));
+        api.configDelete.mockResolvedValue({
+          ok: false,
+          status: 0,
+          outcomeUnknown: true,
+          error: "Request timed out after 10000ms -- the outcome is unknown: Caddy may still be applying this change.",
+        } as ApiResponse);
+
+        const result = await handler({ path: "", confirm: true });
+
+        expect(result.isError).toBe(true);
+        expect(result.content[0].text).toContain("the outcome is unknown");
+        expect(result.content[0].text).toContain("kept anyway, as snapshot [0] (trigger=caddy_config_delete)");
+        const { listSnapshots } = await import("../snapshots.js");
+        expect(listSnapshots()[0]?.config).toEqual(prior);
+      });
+
+      it("reports an unsnapshotable prior config without calling it a read failure", async () => {
+        // Caddy answers a config-less instance with a literal `null` at HTTP 200.
+        // That is not a read FAILURE, and naming one would send the operator after
+        // a connectivity problem that does not exist.
+        api.configGet.mockResolvedValue(ok(null));
+        api.configDelete.mockResolvedValue(ok({}));
+
+        const result = await handler({ path: "", confirm: true });
+
+        expect(result.content[0].text).toContain("empty or not a JSON object");
+        expect(result.content[0].text).not.toContain("could not be read");
+        const { listSnapshots } = await import("../snapshots.js");
+        expect(listSnapshots()).toHaveLength(0);
+      });
+
+      it("leaves a non-root delete exactly as it was: no pre-read, no snapshot", async () => {
+        // The snapshot is for the whole-config case only. One snapshot per route
+        // removal would evict the caddy_load rollback targets the ring exists for.
+        api.configDelete.mockResolvedValue(ok({}));
+
+        const result = await handler({ path: "apps/http/servers/srv0/routes/0", confirm: true });
+
+        expect(result.isError).toBeFalsy();
+        expect(api.configGet).not.toHaveBeenCalled();
+        expect(api.configDelete).toHaveBeenCalledWith("apps/http/servers/srv0/routes/0");
+        const { listSnapshots } = await import("../snapshots.js");
+        expect(listSnapshots()).toHaveLength(0);
+        // ...and its refusal still reads as a leaf delete, not a whole-config one.
+        const refusal = await handler({ path: "apps/http/servers/srv0" });
+        expect(refusal.content[0].text).toContain('Refusing to delete "apps/http/servers/srv0"');
+        expect(refusal.content[0].text).not.toContain("ENTIRE config");
+      });
     });
   });
 
@@ -1777,10 +1951,13 @@ describe("tool handler behavior", () => {
       expect(result.content[0].text).toContain("off (HTTP only)");
     });
 
-    it("does not misclassify port 4430 as HTTPS (boundary-aware port match)", async () => {
-      // A naive substring `.includes(":443")` matches ":4430" as well -- a
-      // server on port 4430 must NOT report "auto (HTTPS)" since Caddy only
-      // auto-provisions for port 443.
+    it("does not misclassify port 4430 as HTTPS", async () => {
+      // Port 4430 is not https_port, so Caddy adds no policy for the port alone
+      // (autohttps.go:138-145). With routes: [] there is no host matcher either,
+      // so autohttps.go:185-187 bails and the server really does serve plain
+      // HTTP -- it is "off (no host matchers)", NOT "off (HTTP only)": nothing
+      // here listens on http_port. The pre-2.5.4 label got the right verdict for
+      // the wrong reason, by testing the listen string for ":443".
       api.configGet.mockResolvedValue(
         ok({
           apps: {
@@ -1792,13 +1969,19 @@ describe("tool handler behavior", () => {
       );
 
       const result = await handler({});
-      expect(result.content[0].text).toContain("off (HTTP only)");
+      expect(result.content[0].text).toContain("TLS: off (no host matchers)");
       expect(result.content[0].text).not.toContain("auto (HTTPS)");
     });
 
-    it("recognizes port 443 with a protocol suffix (e.g. `:443/h3` for QUIC)", async () => {
-      // Caddy listen strings may carry protocol annotations after the port;
-      // those must still classify as HTTPS-auto.
+    it("reads `:443/h3` as Caddy does -- network ':443', no port -- not as port 443", async () => {
+      // There is no protocol suffix on a Caddy listen address; protocols live in
+      // the server's separate `listen_protocols` array. SplitNetworkAddress cuts
+      // at the FIRST '/' (listeners.go:378-386), so ":443/h3" parses as network
+      // ":443" with host "h3" and no port, i.e. port 0 -- a config Caddy could
+      // never actually bind. Verified against Caddy 2.11.4: loading it answers
+      // HTTP 400 {"error":"... listening on :443/h3:0: listen :443: unknown
+      // network :443"}. Through 2.5.3 this file asserted "auto (HTTPS)" here on
+      // the strength of a ":443" substring that Caddy never reads as a port.
       api.configGet.mockResolvedValue(
         ok({
           apps: {
@@ -1810,7 +1993,24 @@ describe("tool handler behavior", () => {
       );
 
       const result = await handler({});
-      expect(result.content[0].text).toContain("auto (HTTPS)");
+      expect(result.content[0].text).toContain("TLS: off (no host matchers)");
+      expect(result.content[0].text).not.toContain("auto (HTTPS)");
+    });
+
+    it("recognizes a network prefix on the HTTPS port (`tcp/:443`)", async () => {
+      // The real prefix form: network before the first '/', address after it.
+      api.configGet.mockResolvedValue(
+        ok({
+          apps: {
+            http: {
+              servers: { srv0: { listen: ["tcp/:443"], routes: [] } },
+            },
+          },
+        }),
+      );
+
+      const result = await handler({});
+      expect(result.content[0].text).toContain("TLS: auto (HTTPS)");
     });
 
     it("recognizes port 443 on a bound address (e.g. `127.0.0.1:443`)", async () => {
@@ -1844,25 +2044,37 @@ describe("tool handler behavior", () => {
     });
 
     it.each([
-      [":443", "auto (HTTPS)"],
-      [":80", "off (HTTP only)"],
-    ])("an EMPTY tls_connection_policies falls through to the listen heuristic (%s -> %s)", async (port, expected) => {
-      // `tls_connection_policies: []` configures nothing, so it has to read the
-      // same as an absent key. Reporting "enabled" off the key's mere presence
-      // told the caller TLS was explicitly configured when the array was empty.
+      [":443"],
+      [":80"],
+      [":8443"],
+    ])("an EMPTY tls_connection_policies turns TLS OFF, whatever the port (%s)", async (port) => {
+      // Not the same as an absent key, which is what 2.5.2-2.5.3 assumed.
+      // Caddy compares the slice against nil (autohttps.go:138 and :230) and
+      // JSON `[]` unmarshals to a non-nil EMPTY slice, so an empty array blocks
+      // the policy Caddy would otherwise add and leaves `len(TLSConnPolicies) > 0`
+      // false at app.go:535. Verified against Caddy 2.11.4: a server with `[]`,
+      // a host matcher and a non-443 port served plain HTTP 200, failed the TLS
+      // handshake, and logged "HTTP/2 skipped because it requires TLS".
       api.configGet.mockResolvedValue(
         ok({
           apps: {
             http: {
-              servers: { srv0: { listen: [port], routes: [], tls_connection_policies: [] } },
+              servers: {
+                srv0: {
+                  listen: [port],
+                  routes: [{ match: [{ host: ["example.com"] }] }],
+                  tls_connection_policies: [],
+                },
+              },
             },
           },
         }),
       );
 
       const result = await handler({});
-      expect(result.content[0].text).toContain(`TLS: ${expected}`);
+      expect(result.content[0].text).toContain("TLS: off (empty tls_connection_policies)");
       expect(result.content[0].text).not.toContain("TLS: enabled");
+      expect(result.content[0].text).not.toContain("auto (HTTPS)");
     });
 
     it("keeps the 'enabled' reading for a present-but-non-array tls_connection_policies", async () => {
@@ -1870,6 +2082,10 @@ describe("tool handler behavior", () => {
       // a malformed config we cannot interpret, and "something is configured
       // here" is the safer summary than silently calling it off. Pinned so a
       // future tightening of the empty-array fix is a deliberate change.
+      //
+      // The listener here is :80 only, so the qualifier below is the whole
+      // label: asserting the bare "TLS: enabled" would pass on the qualified
+      // string too and pin nothing.
       api.configGet.mockResolvedValue(
         ok({
           apps: {
@@ -1881,7 +2097,255 @@ describe("tool handler behavior", () => {
       );
 
       const result = await handler({});
-      expect(result.content[0].text).toContain("TLS: enabled");
+      expect(result.content[0].text).toContain("TLS: enabled (no listener gets TLS: all are on the HTTP port)");
+    });
+
+    it("says policies on an http_port-only server reach no listener", async () => {
+      // The realistic shape the malformed-value case above cannot cover: a
+      // non-empty ARRAY of policies on a server that only binds http_port.
+      // app.go:535 is `len(TLSConnPolicies) > 0 && port != app.httpPort()`, so
+      // useTLS is false on every socket and Caddy serves plain HTTP -- the
+      // policy is provisioned and never wrapped around a listener. A flat
+      // "enabled" tells the operator a certificate is in effect when no TLS
+      // handshake is ever offered.
+      api.configGet.mockResolvedValue(
+        ok({
+          apps: {
+            http: {
+              servers: {
+                srv0: {
+                  listen: [":80"],
+                  routes: [{ match: [{ host: ["example.com"] }] }],
+                  tls_connection_policies: [{}],
+                },
+              },
+            },
+          },
+        }),
+      );
+
+      const result = await handler({});
+      expect(result.content[0].text).toContain("TLS: enabled (no listener gets TLS: all are on the HTTP port)");
+    });
+
+    it("applies the same reading to a custom http_port", async () => {
+      // http_port 8080 moves the exclusion with it (app.go:813-817), so :8080
+      // is the socket app.go:535 denies TLS to and :80 is now just another port.
+      api.configGet.mockResolvedValue(
+        ok({
+          apps: {
+            http: {
+              http_port: 8080,
+              servers: { srv0: { listen: [":8080"], routes: [], tls_connection_policies: [{}] } },
+            },
+          },
+        }),
+      );
+
+      const result = await handler({});
+      expect(result.content[0].text).toContain("TLS: enabled (no listener gets TLS: all are on the HTTP port)");
+    });
+
+    // ─── TLS label == Caddy's own automatic-HTTPS rule ────────────────────
+    //
+    // Caddy decides TLS in autohttps.go:119-231 and app.go:535, and adds the
+    // resulting connection policies IN MEMORY during provisioning -- GET /config
+    // never shows them. So the only honest label is a replay of that rule over
+    // the stored config. Through 2.5.3 this was a ":443" substring test, which
+    // reported "TLS: off (HTTP only)" for servers that were serving TLS 1.3 and
+    // refusing plain HTTP (verified live against Caddy 2.11.4).
+    describe("TLS label mirrors Caddy's automatic-HTTPS rule", () => {
+      const statusFor = async (config: unknown) => {
+        api.configGet.mockResolvedValue(ok(config));
+        return (await handler({})).content[0].text as string;
+      };
+      const withServers = (servers: unknown, appExtras: Record<string, unknown> = {}) => ({
+        apps: { http: { ...appExtras, servers } },
+      });
+      const hostRoutes = [{ match: [{ host: ["example.com"] }], handle: [] }];
+
+      it.each([
+        ["fd/3"],
+        ["fdgram/3"],
+        ["unix//tmp/caddy.sock"],
+      ])("labels a socket-activated / unix listener with a host matcher as auto (%s)", async (addr) => {
+        // fd* and unix* networks carry no port at all (listeners.go:322-343),
+        // so they are neither http_port nor https_port and land on the host-matcher
+        // branch. Verified against Caddy 2.11.4: an "fd/3" server with a host
+        // matcher and no tls_connection_policies served TLS 1.3 over HTTP/2 and
+        // answered plain HTTP with 400 "Client sent an HTTP request to an HTTPS
+        // server", while 2.5.3 labelled it "off (HTTP only)".
+        const text = await statusFor(withServers({ srv0: { listen: [addr], routes: hostRoutes } }));
+        expect(text).toContain("TLS: auto (HTTPS: host matchers on a non-HTTP port)");
+      });
+
+      it("labels an ordinary example.com:8443 site as auto, not HTTP-only", async () => {
+        // The common victim, not the exotic one: `example.com:8443 { ... }` adapts
+        // to listen [":8443"] plus a host matcher and NO tls_connection_policies
+        // (httptype.go:838-839, 978-985 skip the explicit policy), and Caddy serves
+        // it over TLS.
+        const text = await statusFor(withServers({ srv0: { listen: [":8443"], routes: hostRoutes } }));
+        expect(text).toContain("TLS: auto (HTTPS: host matchers on a non-HTTP port)");
+        expect(text).not.toContain("off (HTTP only)");
+      });
+
+      it("labels the same port with no host matcher as off", async () => {
+        // autohttps.go:185-187: no qualifying domains and no policies -> continue.
+        const text = await statusFor(withServers({ srv0: { listen: [":8443"], routes: [] } }));
+        expect(text).toContain("TLS: off (no host matchers)");
+      });
+
+      it("ignores host matchers nested below a top-level route", async () => {
+        // autohttps.go:150-152 walks srv.Routes and their own MatcherSets only;
+        // a host matcher inside a subroute handler never reaches the domain set.
+        const nested = [{ handle: [{ handler: "subroute", routes: hostRoutes }] }];
+        const text = await statusFor(withServers({ srv0: { listen: [":8443"], routes: nested } }));
+        expect(text).toContain("TLS: off (no host matchers)");
+      });
+
+      it("ignores a host matcher listed in automatic_https.skip", async () => {
+        // autohttps.go:163-165 drops skipped names from the domain set, which can
+        // empty it out and take the server back down the no-TLS path.
+        const text = await statusFor(
+          withServers({
+            srv0: { listen: [":8443"], routes: hostRoutes, automatic_https: { skip: ["example.com"] } },
+          }),
+        );
+        expect(text).toContain("TLS: off (no host matchers)");
+      });
+
+      it("reports automatic_https.disable as off even on :443", async () => {
+        // autohttps.go:119-121 skips the server outright, so the policy that would
+        // otherwise be added for an https_port listener never appears and the
+        // server serves plain HTTP. The old heuristic said "auto (HTTPS)".
+        const text = await statusFor(
+          withServers({ srv0: { listen: [":443"], routes: hostRoutes, automatic_https: { disable: true } } }),
+        );
+        expect(text).toContain("TLS: off (automatic HTTPS disabled)");
+        expect(text).not.toContain("auto (HTTPS)");
+      });
+
+      it("treats a port RANGE spanning http_port as HTTP-only", async () => {
+        // listenersUseAnyPortOtherThan tests the whole inclusive range
+        // (server.go:548-556), so [":80-443"] does NOT use any port other than 80
+        // and autohttps.go:125-132 disables automatic HTTPS for the server. A naive
+        // per-port loop would call this one HTTPS.
+        const text = await statusFor(withServers({ srv0: { listen: [":80-443"], routes: hostRoutes } }));
+        expect(text).toContain("TLS: off (HTTP only)");
+        expect(text).not.toContain("auto (HTTPS)");
+      });
+
+      it("calls a server that binds BOTH http_port and another port mixed", async () => {
+        // app.go:535 decides useTLS per socket: `len(TLSConnPolicies) > 0 && port
+        // != app.httpPort()`. So listen [":80", ":8443"] with a host matcher is
+        // plain HTTP on 80 and TLS on 8443 at the same time -- one flat verdict
+        // would be wrong in one direction or the other.
+        const text = await statusFor(withServers({ srv0: { listen: [":80", ":8443"], routes: hostRoutes } }));
+        expect(text).toContain("TLS: mixed (TLS on non-HTTP listeners only)");
+      });
+
+      it("calls explicit policies on http_port PLUS another port mixed, not enabled", async () => {
+        // A hand-written `listen: [":80", ":443"]` carrying its own
+        // tls_connection_policies is the common shape with no host matcher to
+        // fall back on -- and it reaches the label by the policies branch, not
+        // the host-matcher one the test above covers. app.go:535 still decides
+        // per socket, so :80 serves plain HTTP however many policies exist.
+        const text = await statusFor(
+          withServers({ srv0: { listen: [":80", ":443"], routes: [], tls_connection_policies: [{}] } }),
+        );
+        expect(text).toContain("TLS: mixed (TLS on non-HTTP listeners only)");
+        expect(text).not.toContain("TLS: enabled");
+      });
+
+      it("calls an auto-HTTPS server that also binds http_port mixed", async () => {
+        // The third perListener call site, the auto-HTTPS branch. Deliberately
+        // synthetic: to reach that branch AND bind http_port, every range has to
+        // contain https_port while one also spans http_port. A range spanning
+        // :80 on its own takes the earlier "off (HTTP only)" branch, because
+        // listenersUseAnyPortOtherThan tests the whole inclusive range
+        // (server.go:547-556) -- so [":80-443"] alone cannot get here, and the
+        // second [":443"] listener is what makes usesAnyPortOtherThan(80) true.
+        const text = await statusFor(withServers({ srv0: { listen: [":80-443", ":443"], routes: [] } }));
+        expect(text).toContain("TLS: mixed (TLS on non-HTTP listeners only)");
+        expect(text).not.toContain("TLS: auto (HTTPS)");
+      });
+
+      it("calls a range STRADDLING http_port mixed, not enabled", async () => {
+        // The trap in reading Caddy's helper as "all listeners are on the HTTP
+        // port": listenersUseAnyPortOtherThan asks whether http_port falls
+        // OUTSIDE each range, so [":80-443"] answers false -- yet app.go:535's
+        // portOffset loop gives useTLS=false for :80 alone and true for the
+        // other 363 sockets. TLS really is served here, just not on :80.
+        const text = await statusFor(
+          withServers({ srv0: { listen: [":80-443"], routes: [], tls_connection_policies: [{}] } }),
+        );
+        expect(text).toContain("TLS: mixed (TLS on non-HTTP listeners only)");
+        expect(text).not.toContain("all are on the HTTP port");
+      });
+
+      it("reads a bracketed IPv6 listen address", async () => {
+        // Caddy's own adapter emits this: `https://example.com { bind [::1] }`
+        // adapts to listen ["[::1]:443"]. splitPort mirrors net.SplitHostPort --
+        // the FIRST ']' must sit immediately before the LAST ':' -- and getting
+        // that wrong drops the address to port 0, which reads as
+        // "off (no host matchers)" for a plainly HTTPS server.
+        const text = await statusFor(withServers({ srv0: { listen: ["[::1]:443"], routes: [] } }));
+        expect(text).toContain("TLS: auto (HTTPS)");
+        expect(text).not.toContain("off (no host matchers)");
+      });
+
+      it("reads a bracketed IPv6 address on a non-HTTP port", async () => {
+        // `example.com:8443 { bind [::1] }` adapts to exactly this shape.
+        const text = await statusFor(withServers({ srv0: { listen: ["[::1]:8443"], routes: hostRoutes } }));
+        expect(text).toContain("TLS: auto (HTTPS: host matchers on a non-HTTP port)");
+      });
+
+      it.each([
+        [":70000"],
+        [":443-80"],
+        ["[::1]:70000"],
+      ])("treats an unparseable listener as no listener at all (%s)", async (addr) => {
+        // Caddy rejects each of these in ParseNetworkAddress -- the port bound
+        // is strconv.ParseUint(s, 10, 16) and a range must not run backwards
+        // (listeners.go:344-367) -- and listenersUseAnyPortOtherThan `continue`s
+        // past the error (server.go:548-551) rather than counting it as port 0.
+        // With nothing left it returns false for the empty set (server.go:557),
+        // which autohttps.go:125-132 reads as "no port other than http_port" and
+        // disables automatic HTTPS. So the honest label is HTTP-only, NOT the
+        // "off (no host matchers)" a port-0 fallback would produce.
+        const text = await statusFor(withServers({ srv0: { listen: [addr], routes: [] } }));
+        expect(text).toContain("TLS: off (HTTP only)");
+        expect(text).not.toContain("off (no host matchers)");
+      });
+
+      it("honours a non-default http_port / https_port from the app config", async () => {
+        // app.httpPort()/httpsPort() (app.go:813-825) are what autohttps.go compares
+        // against, so with http_port 8080 / https_port 8443 the roles of :80 and
+        // :443 are gone: :8080 is the plain-HTTP port and :8443 is the auto-TLS one.
+        const text = await statusFor(
+          withServers(
+            {
+              plain: { listen: [":8080"], routes: hostRoutes },
+              secure: { listen: [":8443"], routes: [] },
+              eighty: { listen: [":80"], routes: [] },
+            },
+            { http_port: 8080, https_port: 8443 },
+          ),
+        );
+        expect(text).toContain('Server "plain": 1 route(s), listen: :8080, TLS: off (HTTP only)');
+        expect(text).toContain('Server "secure": 0 route(s), listen: :8443, TLS: auto (HTTPS)');
+        // :80 is now just another port: no host matcher, so nothing enables TLS.
+        expect(text).toContain('Server "eighty": 0 route(s), listen: :80, TLS: off (no host matchers)');
+      });
+
+      it("falls back to 80/443 when http_port / https_port are 0 or absent", async () => {
+        // app.httpPort() substitutes the default for a configured 0, so a literal
+        // 0 must not be read as "port 0".
+        const text = await statusFor(
+          withServers({ srv0: { listen: [":443"], routes: [] } }, { http_port: 0, https_port: 0 }),
+        );
+        expect(text).toContain("TLS: auto (HTTPS)");
+      });
     });
 
     it("shows ACME email when present at policies[0].issuers[0].email", async () => {
@@ -1982,9 +2446,11 @@ describe("tool handler behavior", () => {
       expect(text).toContain("api: 1 route(s), listen: :8080");
     });
 
-    it("reads an empty tls_connection_policies off the listen port here too", async () => {
-      // caddy_status and caddy_list_servers share describeServer, so the empty-
-      // array fix has to show up on both surfaces -- this is the second one.
+    it("reads an empty tls_connection_policies as TLS off here too", async () => {
+      // caddy_status and caddy_list_servers share describeServer, so the
+      // empty-array rule has to show up on both surfaces -- this is the second
+      // one. `[]` blocks the policy Caddy would add (autohttps.go:138, :230
+      // compare against nil), so even a :443 server serves plain HTTP.
       api.configGet.mockResolvedValue(
         ok({
           srv0: { listen: [":443"], routes: [], tls_connection_policies: [] },
@@ -1994,8 +2460,27 @@ describe("tool handler behavior", () => {
 
       const text = (await handler({})).content[0].text;
 
-      expect(text).toContain("srv0: 0 route(s), listen: :443, TLS: auto (HTTPS)");
-      expect(text).toContain("plain: 0 route(s), listen: :80, TLS: off (HTTP only)");
+      expect(text).toContain("srv0: 0 route(s), listen: :443, TLS: off (empty tls_connection_policies)");
+      expect(text).toContain("plain: 0 route(s), listen: :80, TLS: off (empty tls_connection_policies)");
+    });
+
+    it("applies Caddy's host-matcher rule on this surface too (fd/ and :8443)", async () => {
+      // The defect that started this: 2.5.3 reported "TLS: off (HTTP only)" for
+      // both of these, and the fd/3 one was verified live against Caddy 2.11.4
+      // serving TLS 1.3 and answering plain HTTP with 400.
+      api.configGet.mockResolvedValue(
+        ok({
+          fdsrv: { listen: ["fd/3"], routes: [{ match: [{ host: ["localhost"] }] }] },
+          tcpsrv: { listen: [":8443"], routes: [{ match: [{ host: ["example.com"] }] }] },
+          plainsrv: { listen: [":8081"], routes: [] },
+        }),
+      );
+
+      const text = (await handler({})).content[0].text;
+
+      expect(text).toContain("fdsrv: 1 route(s), listen: fd/3, TLS: auto (HTTPS: host matchers on a non-HTTP port)");
+      expect(text).toContain("tcpsrv: 1 route(s), listen: :8443, TLS: auto (HTTPS: host matchers on a non-HTTP port)");
+      expect(text).toContain("plainsrv: 0 route(s), listen: :8081, TLS: off (no host matchers)");
     });
 
     it("shows message when no servers configured", async () => {

@@ -4,6 +4,35 @@ import * as api from "../api.js";
 import { formatResult } from "../format.js";
 import { getSnapshot, isSnapshotableConfig, listSnapshots, saveSnapshot } from "../snapshots.js";
 
+/**
+ * Does this path address the config ROOT -- i.e. the whole configuration?
+ *
+ * "", "/", "config" and "/config/" all normalize to the same request,
+ * `DELETE /config/`, which is Caddy's documented "unload the entire current
+ * configuration". The first replace is a copy of api.ts's normalizePath (it is
+ * module-private there, so it cannot be imported); the test then accepts an
+ * all-slashes remainder because "//", "config//" and "/config//" are still the
+ * user asking for the root.
+ *
+ * That tolerance is why the root branch below sends the CANONICAL empty path
+ * instead of the caller's spelling. api.ts would encode "//" to `/config//`,
+ * and Caddy's admin endpoint is a plain `http.ServeMux` with the config route
+ * registered at "/config/" (admin.go:222 and :263 at v2.11.4), so Go answers
+ * that spelling with a redirect to /config/ rather than dispatching to
+ * handleConfig. On the default transport `fetch` follows the redirect and the
+ * unload still happens -- but the ETag this tool cached under "/config/" is
+ * never found for "/config//", so the DELETE would go out with no `If-Match`
+ * and silently lose the guarantee documented at the read below; over a unix
+ * socket node:http does not follow redirects at all, so it would just fail.
+ *
+ * The two regexes MUST stay in step with api.ts: a path this predicate calls a
+ * leaf but api.ts sends to the root would take the unloads-everything branch of
+ * Caddy with the leaf branch of this tool -- no warning, no snapshot.
+ */
+function isRootConfigPath(path: string): boolean {
+  return /^\/*$/.test(path.replace(/^\/?(config(\/|$))?/, ""));
+}
+
 export function registerConfigTools(server: McpServer) {
   server.tool(
     "caddy_config_get",
@@ -41,7 +70,10 @@ export function registerConfigTools(server: McpServer) {
 
   server.tool(
     "caddy_config_delete",
-    "Delete config at a JSON path. Removes the config node at the specified path. Deleting a parent node also deletes every descendant -- e.g. deleting 'apps/http/servers/srv0' removes that server and all of its routes. Requires confirm=true.",
+    "Delete config at a JSON path. Removes the config node at the specified path. Deleting a parent node also deletes every descendant -- e.g. deleting 'apps/http/servers/srv0' removes that server and all of its routes. Requires confirm=true. " +
+      "Any path that addresses the config ROOT ('', '/', 'config', '/config/', and slash-only variants of those) addresses the ENTIRE config and unloads it: every app and server goes, and so does the 'admin' block, after which Caddy re-binds its admin endpoint to its default address " +
+      "(localhost:2019, or $CADDY_ADMIN in Caddy's environment). If CADDY_ADMIN_URL points anywhere else, neither this server nor caddy_revert can reach Caddy afterwards. A root delete is snapshotted first, so caddy_revert can " +
+      "restore it while Caddy is still reachable; no other path is snapshotted. To REPLACE the config rather than unload it, use caddy_load.",
     {
       path: z.string().describe("Config path to delete (e.g., 'apps/http/servers/srv0/routes/0')"),
       confirm: z
@@ -56,22 +88,123 @@ export function registerConfigTools(server: McpServer) {
     // array after a delete, so repeating that call removes a DIFFERENT route each
     // time. caddy_remove_route carries the same correction for the byte-identical
     // underlying request; the two must agree. Nothing here is auto-recoverable
-    // either: only caddy_load captures a snapshot, so a spurious repeat cannot be
-    // undone with caddy_revert.
+    // either: apart from a root delete (below), only caddy_load captures a
+    // snapshot, so a spurious repeat cannot be undone with caddy_revert.
     { readOnlyHint: false, destructiveHint: true, idempotentHint: false, openWorldHint: false },
     async ({ path, confirm }) => {
+      // A root path is a different operation wearing the same tool: Caddy deletes
+      // the "config" key itself, marshals the result to null and runs it, which
+      // unloads every app AND drops the admin block -- the admin endpoint then
+      // falls back to DefaultAdminListen (localhost:2019, or $CADDY_ADMIN in
+      // Caddy's environment). Verified against Caddy 2.11.4: after DELETE /config/
+      // on an instance whose config set admin.listen, the configured port closed
+      // and the admin API answered on the default address instead. So this branch
+      // has to (a) say that before the fact and (b) leave something to revert to.
+      const root = isRootConfigPath(path);
       if (!confirm) {
         return {
           isError: true,
           content: [
             {
               type: "text" as const,
-              text: `Refusing to delete "${path}" without confirm=true. Deleting a parent path also removes all descendants. Re-run with confirm:true to proceed.`,
+              text: root
+                ? `Refusing to delete the ENTIRE config without confirm=true. The path "${path}" addresses the config root, so this ` +
+                  `unloads every app and server, and the 'admin' block with them: Caddy then re-binds its admin endpoint to its default ` +
+                  `address (localhost:2019, or $CADDY_ADMIN in Caddy's environment), and if CADDY_ADMIN_URL points anywhere else neither ` +
+                  `this server nor caddy_revert can reach Caddy afterwards. The current config is snapshotted first, so caddy_revert can ` +
+                  `restore it while Caddy is still reachable. To REPLACE the config rather than unload it, use caddy_load. Re-run with ` +
+                  `confirm:true to proceed.`
+                : `Refusing to delete "${path}" without confirm=true. Deleting a parent path also removes all descendants. Re-run with confirm:true to proceed.`,
             },
           ],
         };
       }
-      return formatResult(await api.configDelete(path));
+      if (!root) return formatResult(await api.configDelete(path));
+
+      // Snapshot ONLY the root delete, and mirror caddy_load's pattern exactly:
+      // read first, then defer the push until the delete has come back, because a
+      // delete that failed changed nothing server-side and a snapshot for it would
+      // just consume a slot in the 10-deep ring and shift the user's older rollback
+      // targets one position deeper. Routine leaf deletes stay unsnapshotted for
+      // the same reason -- one route removal per snapshot would evict the
+      // caddy_load rollback targets that the ring exists for.
+      //
+      // The read is also what makes the snapshot trustworthy: it refreshes the
+      // cached ETag for "/config/", so the DELETE carries If-Match and Caddy either
+      // deletes exactly the config that was just read or answers 412 (passed
+      // through verbatim). Verified against Caddy 2.11.4.
+      //
+      // The DELETE therefore has to go out under the SAME cache key the GET just
+      // filled, which is why it is handed "" rather than the caller's `path`:
+      // isRootConfigPath tolerates an all-slashes remainder, and api.ts would
+      // encode "//" into `/config//` -- a different key, so the If-Match would
+      // be dropped and the guarantee above would quietly not hold. See the
+      // predicate's own comment for what Caddy does with that spelling.
+      const current = await api.configGet();
+      const res = await api.configDelete("");
+      // Same exception as caddy_load: a deadline that fired (`res.outcomeUnknown`)
+      // is not "nothing happened" -- Caddy goes on applying a config change it has
+      // read after the client hangs up, and a timed-out change is never replayed,
+      // so the config this delete may have unloaded is recorded nowhere else.
+      const kept = (res.ok || res.outcomeUnknown === true) && current.ok && isSnapshotableConfig(current.data);
+      if (kept) saveSnapshot(current.data, "caddy_config_delete");
+      if (!res.ok) {
+        if (res.outcomeUnknown && kept) {
+          return formatResult({
+            ...res,
+            error:
+              `${res.error}\nThe pre-delete config was kept anyway, as snapshot [0] (trigger=caddy_config_delete): if this delete ` +
+              `did apply, caddy_revert { action: "apply", index: 0, confirm: true } restores what it unloaded -- as long as this ` +
+              `server can still reach Caddy's admin endpoint, which moves back to Caddy's default address when the deleted ` +
+              `config set an admin.listen of its own. If the delete did not apply, that snapshot is simply the config read ` +
+              `just before it was sent.`,
+          });
+        }
+        return formatResult(res);
+      }
+      // Say what was saved, or why nothing was -- and keep the two reasons apart
+      // the way caddy_revert does. A 200 carrying a body that is not a JSON object
+      // (Caddy answers a config-less instance with a literal `null`) is not a read
+      // FAILURE, and calling it one would send the operator after a connectivity
+      // problem that does not exist.
+      const note = kept
+        ? ` The prior config was saved as snapshot [0] (trigger=caddy_config_delete): caddy_revert { action: "apply", index: 0, confirm: true } restores it.`
+        : current.ok
+          ? " Warning: the prior config was empty or not a JSON object, so no snapshot was captured -- there was nothing to restore."
+          : " Warning: the prior config could not be read, so no snapshot was captured and this unload cannot be reverted.";
+      // The admin endpoint only MOVES when the unloaded block supplied a `listen`
+      // that differs from DefaultAdminListen -- NOT on the mere presence of an
+      // 'admin' key. Caddy substitutes DefaultAdminListen for an empty Listen on
+      // both sides of the delete (admin.go:411 + :1391-1398 before it, :398-402
+      // after), so the very common `{"admin":{"config":{"persist":false}}}`, and
+      // an admin block carrying only origins / enforce_origin / identity /
+      // remote, re-bind to the address they were already on: nothing moves, and
+      // saying it did would send the operator looking for an endpoint that never
+      // changed. `kept` is what makes current.data readable as a config object.
+      //
+      // The message stays hedged because this client cannot resolve the two
+      // things that decide it: $CADDY_ADMIN lives in Caddy's environment, not
+      // ours, and Caddy runs `listen` through the Replacer before the empty test
+      // (admin.go:1392-1398), so "{env.X}" can expand to empty and mean the
+      // default too. A literal "localhost:2019" is the default and does not move
+      // either. One sentence has to cover all of them.
+      const adm = kept ? (current.data as Record<string, unknown>).admin : undefined;
+      const listen =
+        adm !== null && typeof adm === "object" && !Array.isArray(adm)
+          ? (adm as { listen?: unknown }).listen
+          : undefined;
+      const adminNote =
+        typeof listen === "string" && listen !== ""
+          ? ` The unloaded config set admin.listen to "${listen}". If that was not already Caddy's default admin address, the endpoint has moved back to the default (localhost:2019, unless $CADDY_ADMIN is set in Caddy's environment) and CADDY_ADMIN_URL (${process.env.CADDY_ADMIN_URL || "http://localhost:2019"}) may no longer reach it.`
+          : "";
+      return {
+        content: [
+          {
+            type: "text" as const,
+            text: `Unloaded the entire config (every app and server, and the 'admin' block).${note}${adminNote}`,
+          },
+        ],
+      };
     },
   );
 
@@ -151,7 +284,8 @@ export function registerConfigTools(server: McpServer) {
 
   server.tool(
     "caddy_revert",
-    "Manage config snapshots for rollback. Snapshots are auto-captured before caddy_load (last 10). " +
+    "Manage config snapshots for rollback. Snapshots are auto-captured before caddy_load, and before a caddy_config_delete " +
+      "that unloads the whole config (an empty path); no other delete is snapshotted. Last 10. " +
       "By default they live in memory only and are LOST when this server restarts -- set CADDY_MCP_SNAPSHOT_DIR " +
       "to a writable directory to persist them across restarts (they contain full Caddy configs, so pick the location deliberately). " +
       "Actions: 'list' shows snapshots with timestamps, 'save' manually captures the current config, 'apply' restores a snapshot (requires confirm=true).",

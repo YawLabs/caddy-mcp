@@ -152,6 +152,115 @@ describe("caddy-mcp tools", () => {
     }
   });
 
+  it("warns on both upstream surfaces that /reverse_proxy/upstreams is not the configured list", async () => {
+    // Caddy 2.11.2+ answers GET /reverse_proxy/upstreams with more than the
+    // configured pool: admin.go:124-133 appends every dynamic upstream (kept
+    // ~1 h by hosts.go:321-322), and admin.go:109-118 appends every in-flight
+    // dial address that is not spelled the same as a static pool key. So one
+    // backend can be listed twice, the extra copy showing fails 0 and repeating
+    // num_requests. caddy-mcp passes the array through verbatim on purpose --
+    // the entries have different address strings and independent fail counters,
+    // so de-duplicating would invent data. The caveat therefore has to live in
+    // the descriptions, on BOTH surfaces, or an agent sums num_requests and
+    // double-counts, or reads a lingering address as a config that failed to load.
+    const toolDescriptions = new Map<string, string>();
+    const resourceDescriptions = new Map<string, string>();
+    const mockServer = {
+      tool: vi.fn((...args: any[]) => toolDescriptions.set(args[0], args[1])),
+      resource: vi.fn((...args: any[]) => resourceDescriptions.set(args[1], args[2]?.description)),
+    };
+
+    const { registerOperationalTools } = await import("../tools/operational.js");
+    const { registerResources } = await import("../resources.js");
+    registerOperationalTools(mockServer as any);
+    registerResources(mockServer as any);
+
+    for (const desc of [toolDescriptions.get("caddy_upstreams"), resourceDescriptions.get("caddy://upstreams")]) {
+      expect(desc).toBeTruthy();
+      expect(desc).toContain("2.11.2+");
+      expect(desc).toContain("do not sum num_requests");
+      expect(desc).toMatch(/dynamic/i);
+      expect(desc).toMatch(/verbatim/i);
+    }
+  });
+
+  // Caveats an agent has to read BEFORE it acts live only in the tool-facing
+  // text. A refusal message is not enough for any of these: the tools below say
+  // "requires confirm=true", so a well-behaved caller sends confirm on the first
+  // call and never sees one.
+  describe("tool-facing caveats", () => {
+    async function getRegistrations() {
+      const calls: any[][] = [];
+      const mockServer = {
+        tool: vi.fn((...args: any[]) => calls.push(args)),
+        resource: vi.fn(),
+      };
+      const { registerConfigTools } = await import("../tools/config.js");
+      const { registerAdaptTools } = await import("../tools/adapt.js");
+      const { registerTlsTools } = await import("../tools/tls.js");
+      registerConfigTools(mockServer as any);
+      registerAdaptTools(mockServer as any);
+      registerTlsTools(mockServer as any);
+      return calls;
+    }
+
+    it("caddy_config_delete warns about the empty path before the fact", async () => {
+      // An empty path is DELETE /config/, which unloads every app AND the admin
+      // block; Caddy then re-binds the admin endpoint to its default address, so
+      // a CADDY_ADMIN_URL pointing at a config-supplied listener stops working --
+      // and with it caddy_revert. Verified against Caddy 2.11.4.
+      const desc = (await getRegistrations()).find((c) => c[0] === "caddy_config_delete")?.[1] as string;
+      expect(desc).toBeTruthy();
+      expect(desc).toContain("ENTIRE config");
+      expect(desc).toContain("localhost:2019");
+      expect(desc).toContain("$CADDY_ADMIN");
+      expect(desc).toContain("CADDY_ADMIN_URL");
+      expect(desc).toContain("caddy_load");
+    });
+
+    it("caddy_revert names both sources of an auto-captured snapshot", async () => {
+      // It used to say "auto-captured before caddy_load" only. A root
+      // caddy_config_delete now captures one too, and a caller told otherwise
+      // would not think to look for it.
+      const desc = (await getRegistrations()).find((c) => c[0] === "caddy_revert")?.[1] as string;
+      expect(desc).toContain("caddy_load");
+      expect(desc).toContain("caddy_config_delete");
+    });
+
+    it("caddy_adapt warns that a Caddyfile 'order' option is not preview-only on Caddy <= 2.11.4", async () => {
+      // directiveOrder is process-wide and shares its backing array with the
+      // defaults, so one `order` line leaks into later adaptations -- and a
+      // FAILING one removes the directive it names before validation. Reproduced
+      // live on v2.11.4 through this server's own api.adapt: after a 400 from
+      // `order header before not_a_directive`, a plain Caddyfile using `header`
+      // failed to adapt. Fixed upstream in caddyserver/caddy#7995, unreleased.
+      const desc = (await getRegistrations()).find((c) => c[0] === "caddy_adapt")?.[1] as string;
+      expect(desc).toContain("2.11.4");
+      expect(desc).toContain("order");
+      expect(desc).toContain("is not an ordered HTTP handler");
+      expect(desc).toContain("caddyserver/caddy#7995");
+    });
+
+    it("caddy_tls marks the ACME profile experimental and names both failure outcomes", async () => {
+      // Caddy accepts any profile name on load (acmeissuer.go passes it straight
+      // to certmagic), so "ACME profile set to: shortlived" is not evidence the
+      // CA offers it. Verified live on 2.11.4: the load returned 200 and the
+      // order failed later with "ACME server does not advertise support for
+      // profiles". Both outcomes have to be named -- fall-through to the next
+      // issuer, or no certificate at all when there is no next issuer, which is
+      // the single-issuer shape this tool itself creates.
+      const schema = (await getRegistrations()).find((c) => c[0] === "caddy_tls")?.[2] as Record<string, any>;
+      const desc = schema.profile.description as string;
+      expect(desc).toMatch(/EXPERIMENTAL/i);
+      expect(desc).toContain("issues no certificate");
+      expect(desc).toContain("WITHOUT the profile");
+      // The Caddyfile-only "all configured CAs must support it" rule must NOT be
+      // copied here: this tool writes ONE JSON issuer, and only that issuer needs
+      // a CA that offers the profile.
+      expect(desc).not.toMatch(/all (configured )?CAs/i);
+    });
+  });
+
   describe("parseFrom", () => {
     it("parses bare hostname", async () => {
       const { parseFrom } = await import("../tools/routes.js");
