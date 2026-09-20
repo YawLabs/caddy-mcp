@@ -74,6 +74,97 @@ function setEtag(path: string, etag: string): void {
 }
 
 /**
+ * The code points Go's unicode.IsSpace counts as whitespace -- which is the set
+ * strings.Fields splits on, and therefore the set that decides whether Caddy can
+ * read its own ETag back (see isEchoableEtag). Its Latin-1 fast path
+ * (\t \n \v \f \r, space, U+0085, U+00A0) plus the unicode.White_Space table.
+ *
+ * Written out as code points rather than matched with a JS class because this
+ * mirrors one specific Go table, and `\s` is NOT that table: `\s` omits U+0085
+ * (NEL) and includes U+FEFF. Both differences decide the wrong way here -- a
+ * NEL in a key really does break Caddy's parse (400 observed on 2.11.4), and a
+ * BOM really does not.
+ */
+const GO_WHITESPACE = new Set([
+  0x09, 0x0a, 0x0b, 0x0c, 0x0d, 0x20, 0x85, 0xa0, 0x1680, 0x2000, 0x2001, 0x2002, 0x2003, 0x2004, 0x2005, 0x2006,
+  0x2007, 0x2008, 0x2009, 0x200a, 0x2028, 0x2029, 0x202f, 0x205f, 0x3000,
+]);
+
+/** strings.Fields: split on runs of Go whitespace, dropping empty fields. */
+function goFields(text: string): string[] {
+  const fields: string[] = [];
+  let current = "";
+  // for..of iterates code points, so an astral character is one unit here and
+  // its surrogate halves are never tested against the set on their own.
+  for (const ch of text) {
+    if (GO_WHITESPACE.has(ch.codePointAt(0) as number)) {
+      if (current) fields.push(current);
+      current = "";
+    } else {
+      current += ch;
+    }
+  }
+  if (current) fields.push(current);
+  return fields;
+}
+
+/**
+ * Whether Caddy can parse this ETag back when we echo it as If-Match -- the
+ * only question worth asking before caching one, because an ETag we cannot echo
+ * is an ETag that must not be cached.
+ *
+ * Caddy builds the header from the DECODED request path,
+ * `"<path> <hash>"` (makeEtag, admin.go:994-996 at v2.11.4), and reads an
+ * If-Match back by requiring surrounding quotes and then splitting the inner
+ * text with strings.Fields into EXACTLY 2 parts (caddy.go:172-187). So a config
+ * key containing whitespace -- a hand-written server name like "a b", a map key
+ * with a tab -- yields an ETag Caddy itself refuses, in one of two shapes:
+ *   - whitespace anywhere other than the separator gives 3+ fields, and Caddy
+ *     answers 400 `malformed If-Match header; expect format "<path> <hash>"`;
+ *   - a key whose LAST segment ENDS in whitespace still gives 2 fields, but
+ *     parts[0] is then a SHORTER path naming a different key, so Caddy hashes
+ *     that one instead and answers 412.
+ * Both are terminal for the path: the next GET caches the identical ETag, so
+ * "re-read the config and retry" -- what the 412 message says, and what an
+ * operator does with a 400 anyway -- loops forever. Verified against Caddy
+ * 2.11.4: `"/config/apps/http/servers/a b/routes <hash>"` echoed back gives the
+ * 400, and `"/config/logging/logs/foo  <hash>"` (key "foo ", two spaces) gives
+ * the 412 on every read-then-write pair. It takes out caddy_reverse_proxy's
+ * `id` upsert too, which GETs and then PATCHes /id/<id>: the ETag of an /id/
+ * read carries the EXPANDED config path (handleConfigID rewrites r.URL.Path,
+ * admin.go:1121-1124), so a route living under a whitespace-named server fails
+ * on every call however clean the id is.
+ *
+ * The check is on the ETag's CONTENT, never on the request path, for that same
+ * reason: the path we sent does not always contain the path Caddy hashed.
+ *
+ * The latin1 decode is load-bearing. fetch hands header values back
+ * latin1-decoded -- one character per byte -- and so does node:http, so a
+ * multi-byte UTF-8 space arrives as its bytes: U+3000 as U+00E3 U+0080 U+0080,
+ * none of which is whitespace. Testing the undecoded string would therefore
+ * MISS those spaces and, worse, wrongly flag ordinary letters: U+00E0 (a-grave)
+ * is bytes C3 A0, whose second byte reads as U+00A0, a Go space, so an
+ * undecoded test would drop If-Match for a key no Caddy objects to. Verified
+ * against Caddy 2.11.4 through this client: a key holding U+00E9 round-trips
+ * 200, while tab, U+00A0, U+0085 and U+3000 all 400. A runtime that
+ * handed back already-decoded headers would be misread by the decode, and the
+ * result is exactly today's behaviour for that one case (the ETag is cached and
+ * Caddy rejects the write), never worse.
+ */
+function isEchoableEtag(etag: string): boolean {
+  const decoded = Buffer.from(etag, "latin1").toString("utf8");
+  // caddy.go:173 rejects anything not wrapped in quotes before it splits.
+  if (decoded.length < 2 || !decoded.startsWith('"') || !decoded.endsWith('"')) return false;
+  const inner = decoded.slice(1, -1);
+  const fields = goFields(inner);
+  // Two fields AND a byte-for-byte round trip. The count alone is what Caddy
+  // checks, but it passes the trailing-whitespace key above -- rejoining the
+  // fields with the single space Caddy writes is what catches a separator that
+  // is not one space, i.e. the parse that succeeds against the WRONG key.
+  return fields.length === 2 && fields.join(" ") === inner;
+}
+
+/**
  * Invalidate cached ETags whose paths can no longer be trusted after a
  * successful write to `path`. Without prefix-awareness, a sequence like
  * "GET parent / POST child / write parent" would send a stale If-Match on the
@@ -369,11 +460,30 @@ export function isMissingConfigPath(res: Pick<ApiResponse, "ok" | "error">): boo
  * a bare `$` let that spelling walk straight past both carve-outs below.
  * Verified against Caddy 2.11.4: `DELETE .../routes/0/` answers 200 and removes
  * element 0.
+ *
+ * A trailing `...` segment is tolerated for the same reason, and both patterns
+ * below carry it. `...` is the bulk-append spelling (`POST .../routes/...` with
+ * an array body spreads it into the array), but Caddy strips that segment
+ * BEFORE it switches on the method (admin.go:1196-1199), so it is stripped for
+ * EVERY method: `.../routes/0/...` is the same array position as
+ * `.../routes/0`, and `PUT /id/<id>/...` is the same insert-before-the-element
+ * as the bare id. Verified against Caddy 2.11.4: `DELETE .../policies/0/...`
+ * removed element 0 and, sent twice, removed two policies; `PUT /id/p1/...`
+ * inserted before p1. Without the `...` here, both walked past these carve-outs
+ * and were replayed. A path that merely ends in `...` without an index before
+ * it (`.../routes/...`) is NOT matched and keeps its retry: with the segment
+ * stripped, PUT there is an ordinary strictly-create write that answers 409
+ * `key already exists` on a replay (admin.go:1281-1287), and POST under /config
+ * is already excluded whatever its path.
+ *
+ * A false positive -- a config key literally named "0", a key literally named
+ * "..." -- costs one un-retried request, the trade the policy already takes for
+ * numeric keys (see isRetryableMethod).
  */
-const ARRAY_INDEX_TAIL_RE = /\/\d+\/*$/;
+const ARRAY_INDEX_TAIL_RE = /\/\d+(\/+\.\.\.)?\/*$/;
 
 /** A bare `/id/<id>` with no subpath -- see the PUT paragraph of isRetryableMethod. */
-const BARE_ID_RE = /^\/id\/[^/]+\/*$/;
+const BARE_ID_RE = /^\/id\/[^/]+(\/+\.\.\.)?\/*$/;
 
 /**
  * Whether Caddy handles a (method, path) by loading a new config: `POST /load`,
@@ -468,7 +578,9 @@ function isConfigChange(method: string, path: string): boolean {
  *    server is a no-op (it just yields ECONNREFUSED), so retry is benign.
  */
 function isRetryableMethod(method: string, path: string): boolean {
-  // Trailing slashes tolerated for the same reason as ARRAY_INDEX_TAIL_RE.
+  // Trailing slashes and a trailing `...` are tolerated in both patterns for the
+  // same reason: Caddy strips them before it decides what the path means (see
+  // ARRAY_INDEX_TAIL_RE).
   if (method === "PUT" && BARE_ID_RE.test(path)) return false;
   if (method === "PUT" || method === "DELETE") return !ARRAY_INDEX_TAIL_RE.test(path);
   if (method !== "POST") return true;
@@ -1062,10 +1174,23 @@ async function sendOnce<T = any>(
     if (!socketPath && res.ok && isConfigChange(method, path)) await settleAdminRestart(getAdminOrigin());
     const text = res.text;
 
-    // Capture ETag from config GET responses
+    // Capture ETag from config GET responses -- but only one Caddy can read
+    // back (isEchoableEtag). An ETag built from a path containing whitespace is
+    // one Caddy answers 400 (or, for a key ending in whitespace, 412) to on
+    // every write, and re-reading caches the same unusable value, so caching it
+    // takes the path out of service permanently. Writes there instead go out
+    // with NO If-Match, which is the only thing Caddy's `"<path> <hash>"`
+    // format leaves available: the ETag cannot be spelled in a way Caddy parses.
+    // That trades optimistic concurrency for a working write, on the paths where
+    // the alternative is no write at all.
+    //
+    // DELETE rather than skip: any entry already sitting here is at best from an
+    // older read of the same unusable shape, and leaving it would echo it on the
+    // next write.
     const etag = res.etag;
     if (method === "GET" && etag && isConfigPath) {
-      setEtag(path, etag);
+      if (isEchoableEtag(etag)) setEtag(path, etag);
+      else etagCache.delete(path);
     }
 
     // Method-aware ETag cache policy on successful config writes:

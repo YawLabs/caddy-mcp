@@ -366,7 +366,12 @@ export function registerTlsTools(server: McpServer) {
         .optional()
         .describe(
           "ACME profile name (for 'set_acme_profile'). Requires Caddy 2.10+ and a CA that offers profiles; " +
-            "Let's Encrypt uses 'shortlived' for 6-day certificates. Valid names are defined by the CA, not by Caddy.",
+            "Let's Encrypt uses 'shortlived' for 6-day certificates. Valid names are defined by the CA, not by Caddy. " +
+            "EXPERIMENTAL upstream (the ACME profiles spec is still a draft; Caddy marks the field 'subject to change' and may rename or drop it). " +
+            "Caddy accepts any name on load, so a success here does not mean the CA offers it: if this issuer's CA does not advertise the name, " +
+            "every order from this issuer fails at issuance time, reported only in Caddy's own logs. Caddy then either falls through to the next " +
+            "issuer in the policy, which issues WITHOUT the profile, or -- when this is the policy's only issuer, which is the shape this tool " +
+            "creates -- keeps retrying and issues no certificate at all.",
         ),
     },
     { readOnlyHint: false, destructiveHint: false, idempotentHint: true, openWorldHint: false },

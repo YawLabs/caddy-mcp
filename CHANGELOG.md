@@ -7,6 +7,166 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+- **`caddy_config_delete` no longer unloads the entire config without a word or a
+  snapshot.** An empty path — `''`, `'/'`, `'config'`, `'/config/'` or a slash-only
+  variant of those — normalizes to `DELETE /config/`, Caddy's documented "unload the
+  entire current configuration": every app and server goes, and so does the `admin`
+  block, after which Caddy re-binds its admin endpoint to `DefaultAdminListen`
+  (`localhost:2019`, or `$CADDY_ADMIN` in Caddy's environment) — a move only for an
+  instance that was not already there. The refusal read `Refusing to delete ""` and named neither
+  consequence, nothing was snapshotted, and the success was a bare `OK`. Verified
+  against Caddy 2.11.4: on an instance whose config set `admin.listen`, the configured
+  port closed and the admin API answered on the default address instead, leaving
+  caddy-mcp — and `caddy_revert` with it — unable to reach Caddy at all. The warning
+  now lives in the tool description, so every caller sees it and not only one that
+  forgot `confirm`, and the refusal says the same. A root delete now auto-snapshots the
+  prior config first (trigger `caddy_config_delete`), on `caddy_load`'s pattern: the
+  read also refreshes the `/config/` ETag, so the `DELETE` carries `If-Match` and the
+  snapshot is exactly what was unloaded, or Caddy answers 412 and nothing is captured.
+  A delete whose deadline fired keeps the snapshot, as `caddy_load` does, since Caddy
+  goes on applying a config change after the client hangs up. No other path is
+  snapshotted — one snapshot per route removal would evict the `caddy_load` rollback
+  targets the 10-deep ring exists for — and `caddy_revert`'s description now names both
+  sources of an auto-captured snapshot. Two details of that branch: the success message
+  warns about the admin endpoint only when the unloaded config supplied an
+  `admin.listen`, not on the mere presence of an `admin` key, because Caddy substitutes
+  `DefaultAdminListen` for an absent or empty `Listen` on both sides of the delete
+  (`admin.go:411` and `:1391-1398` before it, `:398-402` after) — so the near-universal
+  `{"admin":{"config":{"persist":false}}}`, and a block carrying only `origins` /
+  `enforce_origin` / `identity` / `remote`, re-bind to the address they were already on
+  and nothing moves; and the wording is hedged rather than asserting a move, since
+  `$CADDY_ADMIN` lives in Caddy's environment and a `listen` of `{env.X}` can expand to
+  empty (the Replacer runs before the empty test), so this client cannot tell a
+  non-default address from the default one. The `DELETE` is also always sent as the
+  canonical `/config/`, whatever spelling the caller used: `'//'` would otherwise be
+  encoded to `/config//`, which is not the key the preceding read cached its `ETag`
+  under, so the unload would go out with no `If-Match` and no 412 to protect it.
+- **A config key containing whitespace no longer poisons the ETag cache, so writes to
+  it work again.** Caddy builds its `ETag` from the *decoded* config path
+  (`"<path> <hash>"`) but parses an `If-Match` back by splitting on whitespace and
+  demanding exactly two fields, so a key such as a server named `a b` produced an ETag
+  Caddy itself rejects: HTTP 400 `malformed If-Match header` on every write to that
+  path, or — when the key's last segment *ends* in whitespace — HTTP 412 measured
+  against a different, shorter key. Re-reading cached the same unusable value, so
+  "re-read the config and retry" never recovered. Concretely: `caddy_reverse_proxy`
+  with an `id` failed on every call for a route living under a whitespace-named server,
+  and `caddy_config_set` failed after any `caddy_config_get` on such a path. caddy-mcp
+  now declines to cache an ETag it could not echo back, and writes to such a path go
+  out with no `If-Match` — the only spelling Caddy's format allows. Verified against
+  Caddy 2.11.4: `GET /config/apps/http/servers/a%20b/routes` answers
+  `Etag: "/config/apps/http/servers/a b/routes 3dcae0d8b3ae53c0"`; 2.5.3 failed every
+  write to that path with 400, and a `logging/logs/foo ` key with 412, both of them
+  again after a re-read, and the same sequences now answer 200. Optimistic concurrency
+  is unchanged everywhere else — a stale ETag on an ordinary key still produces the
+  412, checked live in the same run.
+- **The no-replay guards now cover the trailing `/...` spelling too.** Caddy strips a
+  trailing `...` segment for *every* method, not just the `POST` bulk-append it is
+  documented for, so `.../routes/0/...` addresses the same array position as
+  `.../routes/0`, and `PUT /id/<id>/...` is the same insert as the bare id. Both
+  spellings walked past the array-index and bare-`/id` carve-outs 2.5.3 added, so a
+  lost response or a proxy 502/503/504 could remove or insert more than once. Verified
+  against Caddy 2.11.4: `DELETE .../policies/0/...` sent twice answered 200 both times
+  and removed two policies. A path ending in `/...` with no array index in front of it
+  is a different request — a `PUT` there addresses no index and answered 409 `key
+  already exists` in the same run — and is still retried.
+- **`caddy_status` and `caddy_list_servers` report the TLS state Caddy will actually
+  use.** The label came from testing each listen string for `:443`, which mislabeled
+  every server whose TLS comes from a host matcher on some other port: an ordinary
+  `example.com:8443` site, or a socket-activated `fd/N` / `fdgram/N` listener (Caddy
+  2.9.0+, which parses to port 0), read `TLS: off (HTTP only)` while it was serving
+  TLS 1.3 and answering plain HTTP with 400. The label now replays Caddy's own
+  automatic-HTTPS rule (`autohttps.go`, plus `app.go:535` for the per-socket decision)
+  over the stored config, which is the only way to see it from outside: Caddy adds
+  those connection policies in memory while provisioning, so they never appear in
+  `GET /config`. `caddy_status` feeds it the app's real `apps.http.http_port` /
+  `https_port`; `caddy_list_servers` still assumes 80/443, because it reads only
+  `apps/http/servers`, so prefer `caddy_status` on an instance with custom ports. A
+  listen address like `:443/h3` is no longer read as port 443 either: Caddy parses the
+  text before the first `/` as the network, so that string is network `:443` with no
+  port — a config Caddy refuses to bind (verified against 2.11.4: HTTP 400 `listening
+  on :443/h3:0: listen :443: unknown network :443`). Protocols live in the server's
+  `listen_protocols` array, never as a suffix on the address.
+
+### Changed
+- **Behavior change: the `TLS:` line in `caddy_status` and `caddy_list_servers` can
+  read differently for a server you did not touch.** That is the visible half of the
+  fix above: a server that used to read `TLS: off (HTTP only)` may now read `auto
+  (HTTPS: host matchers on a non-HTTP port)`, `mixed (TLS on non-HTTP listeners only)`
+  or `off (no host matchers)`. The full vocabulary is `enabled`, `enabled (no listener
+  gets TLS: all are on the HTTP port)`, `auto (HTTPS)`, `auto (HTTPS: host matchers on
+  a non-HTTP port)`, `mixed (TLS on non-HTTP listeners only)`, `off (HTTP only)`,
+  `off (no host matchers)`, `off (automatic HTTPS disabled)` and
+  `off (empty tls_connection_policies)`. A second reading also changes: a server whose
+  every listener is the HTTP port now reads `enabled (no listener gets TLS: all are on
+  the HTTP port)` rather than a flat `enabled`, because `app.go:535` decides TLS per
+  socket — `len(TLSConnPolicies) > 0 && port != app.httpPort()` — so `listen: [":80"]`
+  with connection policies written out is served as plain HTTP on every socket, and a
+  range that straddles the HTTP port (`:80-443`) is `mixed` rather than `enabled` for
+  the same reason. One reading is reversed outright:
+  `"tls_connection_policies": []` now reads as TLS **off**, not as an absent key — 2.5.2
+  and 2.5.3 had it backwards. Caddy compares that slice against `nil`, and JSON `[]`
+  unmarshals to a non-nil empty slice, so an empty array *blocks* the policy Caddy
+  would otherwise add. Verified against Caddy 2.11.4: such a server, with a host
+  matcher and a non-443 port, served plain HTTP 200, failed the TLS handshake, and
+  logged "HTTP/2 skipped because it requires TLS".
+- **`caddy_upstreams` and the `caddy://upstreams` resource now describe what Caddy
+  2.11.2+ actually returns.** It is not the configured upstream list: dynamic upstreams
+  stay listed about 1 h (up to ~65 min) after the dynamic source last returned them, so
+  an address can outlive the config that referenced it — even an empty config still
+  reports one — and a backend with requests in flight can appear twice when its
+  resolved address differs from the entry's dial text (`tcp/`, `unix//`, placeholder
+  and dynamic dials). The extra copy always shows `fails 0` and repeats `num_requests`,
+  so `num_requests` must not be summed across entries. The data is unchanged: still
+  Caddy's array verbatim, deliberately not de-duplicated, because the duplicate pair
+  carries two different address strings and two independent fail counters.
+- **`caddy_tls` now says the ACME profile is experimental, and what an unknown name
+  actually does.** `profile` is marked "EXPERIMENTAL: Subject to change" on Caddy's
+  ACME issuer at 2.10.0, 2.11.4 and master alike, and the tool never said so. Caddy
+  also passes the name to certmagic without checking it, so the load returns 200 and
+  the tool reported "ACME profile set to: shortlived" whether or not the CA offers that
+  profile; the failure shows up only later, in Caddy's logs, as acmez refuses the order
+  client-side. Verified live on 2.11.4 against a CA advertising no profiles: HTTP 200,
+  then `could not get certificate from issuer … ACME server does not advertise support
+  for profiles` at issuance. The parameter text now names both outcomes — Caddy falls
+  through to the policy's next issuer, which issues *without* the profile, or, when it
+  is the policy's only issuer (the shape this tool creates), keeps retrying and issues
+  nothing. No validation was added: checking a name means fetching the CA directory,
+  which is outbound I/O this tool does not do.
+- **`caddy_adapt` now warns that a Caddyfile `order` global option is not preview-only
+  on Caddy 2.11.4 and earlier.** `directiveOrder` is process-wide and shares its backing
+  array with the defaults, and `parseOptOrder` removes the named directive in place
+  *before* it validates the target — so a valid `order` line leaks into every later
+  Caddyfile adaptation in that Caddy process, and a failing one drops that directive
+  from the order until another `order` line re-places it or Caddy restarts. Reproduced
+  on 2.11.4 through caddy-mcp's own `/adapt` call: one HTTP 400 from `order header
+  before not_a_directive` was enough to make a plain Caddyfile using `header` fail with
+  "directive 'header' is not an ordered HTTP handler", and `POST /load` with
+  `text/caddyfile` then failed identically. Concurrency is sufficient but not necessary
+  (32 overlapping adapts corrupted the order; 8 did not). Fixed upstream in
+  [caddyserver/caddy#7995](https://github.com/caddyserver/caddy/pull/7995), milestoned
+  2.11.5 and unreleased; the caveat can be dropped once 2.11.5 is the supported floor.
+  `/adapt` is deliberately not serialized — that would address only the rarest of the
+  three failure modes, and only for this client's own calls.
+- README: the Requirements section now names a recommended Caddy floor of 2.11.3
+  (latest 2.11.x preferred; still verified against 2.11.4) and why — Caddy 2.11.2 and
+  earlier log every admin request's headers at INFO, so an `Authorization` header that
+  reaches the admin listener is written to Caddy's log in clear, and Caddy 2.11.1 and
+  earlier accept a duplicate `@id` silently. The `CADDY_API_TOKEN` row says what the
+  token is actually for: Caddy's admin API has no token auth of its own and ignores the
+  header, so it matters only to an authenticating proxy in front of the endpoint. The
+  `CADDY_ADMIN_URL` row no longer offers "an https URL for remote admin": Caddy's
+  native `admin.remote` listener (default `:2021`) requires a TLS client certificate,
+  which caddy-mcp does not present. Troubleshooting gains the Host/Origin requirements
+  for an SSH tunnel or a proxy, a 401/403 entry that lists every cause instead of
+  blaming a missing bearer token, and an entry for "directive 'X' is not an ordered
+  HTTP handler". The coverage claim reads "every endpoint in Caddy's admin API
+  reference", with Caddy's Go debug endpoints (`/debug/pprof/*`, `/debug/vars`) named
+  as the deliberate exclusion and `caddy_metrics` pointed at for the leak-trend case
+  they are usually wanted for. `caddy_config_set` documents the `/...` bulk-append
+  path spelling, `caddy_config_delete` and `caddy_revert` document the root-delete
+  snapshot, and `caddy_load`'s `format` is spelled out as `json` or `caddyfile` only.
+
 ## [2.5.3] — 2026-09-19
 
 ### Fixed

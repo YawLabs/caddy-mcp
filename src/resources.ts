@@ -31,7 +31,15 @@ export function registerResources(server: McpServer) {
   server.resource(
     "caddy-upstreams",
     "caddy://upstreams",
-    { description: "Reverse proxy upstream health status" },
+    {
+      description:
+        "Reverse proxy upstream health: Caddy's /reverse_proxy/upstreams array, returned verbatim. " +
+        "On Caddy 2.11.2+ it is not the configured upstream list -- dynamic upstreams stay listed about 1 h after " +
+        "the dynamic source last returned them (so an address can outlive the config that referenced it), and a " +
+        "backend with requests in flight can appear twice when its resolved address differs from the entry's text. " +
+        "The extra copy always shows fails 0 and repeats num_requests, so do not sum num_requests. " +
+        "See the caddy_upstreams tool for the full caveat.",
+    },
     async () => {
       const res = await api.getUpstreams();
       return {

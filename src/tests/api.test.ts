@@ -509,10 +509,22 @@ describe("api", () => {
           cause: Object.assign(new Error("connect ECONNREFUSED 127.0.0.1:2019"), { code: "ECONNREFUSED" }),
         });
 
+      // The "..." spellings are the same insert. Caddy strips a trailing "..."
+      // segment BEFORE it switches on the method (admin.go:1196-1199 at
+      // v2.11.4), so `PUT /id/<id>/...` expands to the identified element's own
+      // path and inserts in front of it exactly as the bare id does. Verified
+      // against Caddy 2.11.4: `PUT /id/p1/...` answered 200 and put a new
+      // policy before p1, and sending it twice left two.
       it.each([
-        ["a gateway 503", () => new Response("upstream down", { status: 503 })],
-        ["a gateway 504", () => new Response("gateway timeout", { status: 504 })],
-      ])("is sent exactly once on %s", async (_label, respond) => {
+        ["a gateway 503", "", "/id/r2", () => new Response("upstream down", { status: 503 })],
+        ["a gateway 504", "", "/id/r2", () => new Response("gateway timeout", { status: 504 })],
+        [
+          "a gateway 503, at the '...' spelling",
+          "...",
+          "/id/r2/...",
+          () => new Response("upstream down", { status: 503 }),
+        ],
+      ])("is sent exactly once on %s", async (_label, subpath, path, respond) => {
         process.env.CADDY_MAX_RETRIES = "3";
         const api = await import("../api.js");
         const sent: string[] = [];
@@ -521,15 +533,17 @@ describe("api", () => {
           return respond();
         }) as any;
 
-        const res = await api.configByIdSet("r2", { handle: [] }, "PUT");
+        const res = await api.configByIdSet("r2", { handle: [] }, "PUT", subpath);
         expect(res.ok).toBe(false);
-        expect(sent).toEqual(["PUT /id/r2"]);
+        expect(sent).toEqual([`PUT ${path}`]);
       });
 
       it.each([
-        ["r2", "/id/r2"],
-        ["r2/", "/id/r2/"],
-      ])("is sent exactly once when the response is lost to a reset (id %p)", async (id, path) => {
+        ["/id/r2", "r2", "", "/id/r2"],
+        ["/id/r2/ (trailing slash)", "r2/", "", "/id/r2/"],
+        ["/id/r2/...", "r2", "...", "/id/r2/..."],
+        ["/id/r2/.../ (both)", "r2", ".../", "/id/r2/.../"],
+      ])("is sent exactly once when the response is lost to a reset: %s", async (_label, id, subpath, path) => {
         process.env.CADDY_MAX_RETRIES = "3";
         const api = await import("../api.js");
         const sent: string[] = [];
@@ -538,10 +552,26 @@ describe("api", () => {
           throw reset();
         }) as any;
 
-        const res = await api.configByIdSet(id, { handle: [] }, "PUT");
+        const res = await api.configByIdSet(id, { handle: [] }, "PUT", subpath);
         expect(res.ok).toBe(false);
         expect(res.status).toBe(0);
         expect(sent).toEqual([`PUT ${path}`]);
+      });
+
+      // Rule 2 still wins over the carve-out at the "..." spelling too.
+      it("IS replayed at the '...' spelling when the connection was refused", async () => {
+        process.env.CADDY_MAX_RETRIES = "2";
+        const api = await import("../api.js");
+        const sent: string[] = [];
+        globalThis.fetch = vi.fn(async (url: any, opts: any) => {
+          sent.push(`${opts.method} ${new URL(String(url)).pathname}`);
+          if (sent.length === 1) throw refusal();
+          return new Response("", { status: 200 });
+        }) as any;
+
+        const res = await api.configByIdSet("r2", { handle: [] }, "PUT", "...");
+        expect(res.ok).toBe(true);
+        expect(sent).toEqual(["PUT /id/r2/...", "PUT /id/r2/..."]);
       });
 
       // Rule 2 of shouldRetry runs ahead of isRetryableMethod: a refused connect
@@ -582,10 +612,18 @@ describe("api", () => {
     // Caddy trims slashes off a config path before walking it (admin.go:1178),
     // so ".../routes/0/" is the same array position as ".../routes/0". The
     // carve-out used to anchor on a bare `$` and let that spelling through.
+    //
+    // A trailing "..." is the same story: Caddy strips that segment before it
+    // switches on the method (admin.go:1196-1199), so ".../routes/0/..." is
+    // array position 0 for a PUT, not the bulk-append POST the spelling
+    // suggests. Verified against Caddy 2.11.4: `PUT .../policies/0/...`
+    // answered 200 and inserted at 0.
     it.each([
       "apps/http/servers/srv0/routes/0/",
       "apps/http/servers/srv0/routes/0//",
-    ])("does NOT retry PUT at an array-index path spelled with a trailing slash (%s)", async (path) => {
+      "apps/http/servers/srv0/routes/0/...",
+      "apps/http/servers/srv0/routes/0/.../",
+    ])("does NOT retry PUT at an array-index path spelled with a trailing slash or '...' (%s)", async (path) => {
       process.env.CADDY_MAX_RETRIES = "3";
       const api = await import("../api.js");
       let calls = 0;
@@ -597,6 +635,25 @@ describe("api", () => {
       const res = await api.configPut(path, {});
       expect(res.ok).toBe(false);
       expect(calls).toBe(1);
+    });
+
+    // The boundary: "..." WITHOUT an index in front of it is not an array
+    // position. With the segment stripped, a PUT there is an ordinary
+    // strictly-create write, which answers 409 `key already exists` on a replay
+    // (admin.go:1281-1287), so it keeps its retry.
+    it("still retries PUT at a '...' path with no array index in front of it", async () => {
+      process.env.CADDY_MAX_RETRIES = "2";
+      const api = await import("../api.js");
+      let calls = 0;
+      globalThis.fetch = vi.fn(async () => {
+        calls++;
+        if (calls < 3) return new Response("upstream down", { status: 503 });
+        return new Response("", { status: 200 });
+      }) as any;
+
+      const res = await api.configPut("apps/http/servers/srv0/routes/...", [{}]);
+      expect(res.ok).toBe(true);
+      expect(calls).toBe(3);
     });
 
     // Caddy removes an array element by RE-PACKING the array (admin.go:1251), so
@@ -615,7 +672,22 @@ describe("api", () => {
           (api) => api.configDelete("apps/http/servers/srv0/routes/0/"),
           "/config/apps/http/servers/srv0/routes/0/",
         ],
+        // Caddy strips a trailing "..." for every method (admin.go:1196-1199),
+        // so this deletes element 0 and re-packs the array just as the bare
+        // spelling does. Verified against Caddy 2.11.4: `DELETE
+        // .../policies/0/...` answered 200 and removed element 0; sent twice, it
+        // removed two policies.
+        [
+          "a /config array index spelled with '...'",
+          (api) => api.configDelete("apps/http/servers/srv0/routes/0/..."),
+          "/config/apps/http/servers/srv0/routes/0/...",
+        ],
         ["an /id subpath array index", (api) => api.configByIdDelete("my-route", "handle/0"), "/id/my-route/handle/0"],
+        [
+          "an /id subpath array index spelled with '...'",
+          (api) => api.configByIdDelete("my-route", "handle/0/..."),
+          "/id/my-route/handle/0/...",
+        ],
       ];
 
       /** A transport failure that is NOT a refusal: Caddy may have read the request. */
@@ -931,6 +1003,13 @@ describe("api", () => {
     });
   });
 
+  // Every mock ETag below is spelled the way Caddy spells one -- a quoted
+  // `"<config path> <hex hash>"` (makeEtag, admin.go:994-996 at v2.11.4) --
+  // because the client now refuses to cache anything it could not echo back as
+  // an If-Match (isEchoableEtag). A synthetic unquoted token is not merely
+  // unrealistic: it is a value Caddy answers 400 to, so caching it would take
+  // the path out of service, and these tests would then pass vacuously against
+  // an empty cache instead of exercising it.
   describe("ETag cache refresh on writes", () => {
     it("refreshes cached ETag from a successful write response and uses it on the next chained write", async () => {
       const api = await import("../api.js");
@@ -942,11 +1021,14 @@ describe("api", () => {
         const ifMatch = opts?.headers?.["If-Match"] ?? null;
         calls.push({ method, ifMatch });
         if (method === "GET") {
-          return new Response("{}", { status: 200, headers: { ETag: "etag-1" } });
+          return new Response("{}", {
+            status: 200,
+            headers: { ETag: '"/config/etag-refresh-target 1f2e3d4c5b6a7988"' },
+          });
         }
         if (calls.length === 2) {
           // First PATCH -- return new ETag for refresh.
-          return new Response("", { status: 200, headers: { ETag: "etag-2" } });
+          return new Response("", { status: 200, headers: { ETag: '"/config/etag-refresh-target 2a3b4c5d6e7f8091"' } });
         }
         // Subsequent writes -- echo back so we can inspect headers.
         return new Response("", { status: 200 });
@@ -967,9 +1049,9 @@ describe("api", () => {
       expect(calls).toHaveLength(3);
       expect(calls[0]?.method).toBe("GET");
       expect(calls[1]?.method).toBe("PATCH");
-      expect(calls[1]?.ifMatch).toBe("etag-1");
+      expect(calls[1]?.ifMatch).toBe('"/config/etag-refresh-target 1f2e3d4c5b6a7988"');
       expect(calls[2]?.method).toBe("PATCH");
-      expect(calls[2]?.ifMatch).toBe("etag-2");
+      expect(calls[2]?.ifMatch).toBe('"/config/etag-refresh-target 2a3b4c5d6e7f8091"');
     });
 
     it("refreshes cached ETag from a successful PUT and uses it on the next chained write", async () => {
@@ -981,10 +1063,16 @@ describe("api", () => {
         const ifMatch = opts?.headers?.["If-Match"] ?? null;
         calls.push({ method, ifMatch });
         if (method === "GET") {
-          return new Response("{}", { status: 200, headers: { ETag: "put-etag-1" } });
+          return new Response("{}", {
+            status: 200,
+            headers: { ETag: '"/config/etag-put-refresh-target 3c4d5e6f70819a2b"' },
+          });
         }
         if (method === "PUT") {
-          return new Response("", { status: 200, headers: { ETag: "put-etag-2" } });
+          return new Response("", {
+            status: 200,
+            headers: { ETag: '"/config/etag-put-refresh-target 4d5e6f708192a3b4"' },
+          });
         }
         // Follow-up PATCH -- echo back so we can inspect headers.
         return new Response("", { status: 200 });
@@ -1004,9 +1092,9 @@ describe("api", () => {
       expect(calls).toHaveLength(3);
       expect(calls[0]?.method).toBe("GET");
       expect(calls[1]?.method).toBe("PUT");
-      expect(calls[1]?.ifMatch).toBe("put-etag-1");
+      expect(calls[1]?.ifMatch).toBe('"/config/etag-put-refresh-target 3c4d5e6f70819a2b"');
       expect(calls[2]?.method).toBe("PATCH");
-      expect(calls[2]?.ifMatch).toBe("put-etag-2");
+      expect(calls[2]?.ifMatch).toBe('"/config/etag-put-refresh-target 4d5e6f708192a3b4"');
     });
 
     it("invalidates cache after a successful POST, even if response carries an ETag", async () => {
@@ -1018,12 +1106,15 @@ describe("api", () => {
         const ifMatch = opts?.headers?.["If-Match"] ?? null;
         calls.push({ method, ifMatch });
         if (method === "GET") {
-          return new Response("{}", { status: 200, headers: { ETag: "post-etag-1" } });
+          return new Response("{}", {
+            status: 200,
+            headers: { ETag: '"/config/etag-post-invalidate-target 5e6f708192a3b4c5"' },
+          });
         }
         if (method === "POST") {
           // POST returns an ETag, but it may describe the parent/root config --
           // policy says invalidate, don't trust it for the path-resource.
-          return new Response("", { status: 200, headers: { ETag: "post-etag-bogus" } });
+          return new Response("", { status: 200, headers: { ETag: '"/config/ 6f708192a3b4c5d6"' } });
         }
         return new Response("", { status: 200 });
       }) as any;
@@ -1043,7 +1134,7 @@ describe("api", () => {
       expect(calls).toHaveLength(3);
       expect(calls[0]?.method).toBe("GET");
       expect(calls[1]?.method).toBe("POST");
-      expect(calls[1]?.ifMatch).toBe("post-etag-1");
+      expect(calls[1]?.ifMatch).toBe('"/config/etag-post-invalidate-target 5e6f708192a3b4c5"');
       expect(calls[2]?.method).toBe("PATCH");
       expect(calls[2]?.ifMatch).toBe(null);
     });
@@ -1057,11 +1148,14 @@ describe("api", () => {
         const ifMatch = opts?.headers?.["If-Match"] ?? null;
         calls.push({ method, ifMatch });
         if (method === "GET") {
-          return new Response("{}", { status: 200, headers: { ETag: "delete-etag-1" } });
+          return new Response("{}", {
+            status: 200,
+            headers: { ETag: '"/config/etag-delete-invalidate-target 708192a3b4c5d6e7"' },
+          });
         }
         if (method === "DELETE") {
           // Even if DELETE returns an ETag, the resource is gone -- invalidate.
-          return new Response("", { status: 200, headers: { ETag: "delete-etag-bogus" } });
+          return new Response("", { status: 200, headers: { ETag: '"/config/ 8192a3b4c5d6e7f8"' } });
         }
         return new Response("", { status: 200 });
       }) as any;
@@ -1080,9 +1174,43 @@ describe("api", () => {
       expect(calls).toHaveLength(3);
       expect(calls[0]?.method).toBe("GET");
       expect(calls[1]?.method).toBe("DELETE");
-      expect(calls[1]?.ifMatch).toBe("delete-etag-1");
+      expect(calls[1]?.ifMatch).toBe('"/config/etag-delete-invalidate-target 708192a3b4c5d6e7"');
       expect(calls[2]?.method).toBe("PATCH");
       expect(calls[2]?.ifMatch).toBe(null);
+    });
+
+    it("keys the root ETag on the canonical /config/, so a slashy spelling loses If-Match", async () => {
+      // Why caddy_config_delete's root branch hands api.configDelete the
+      // canonical "" instead of the caller's spelling: the cache key is the
+      // encoded request path, and "//" encodes to `/config//`. The GET caches
+      // under "/config/", the DELETE looks up "/config//", and the root unload
+      // goes out unguarded -- no If-Match, so no 412 if another writer changed
+      // the config in between. (Caddy's admin mux registers the config route at
+      // "/config/" and answers the doubled spelling with a redirect, which the
+      // default fetch transport follows, so the unload still happens.)
+      const api = await import("../api.js");
+      const calls: Array<{ method: string; path: string; ifMatch: string | null }> = [];
+      globalThis.fetch = vi.fn(async (url: any, opts: any) => {
+        const method = opts?.method ?? "GET";
+        calls.push({
+          method,
+          path: new URL(String(url)).pathname,
+          ifMatch: opts?.headers?.["If-Match"] ?? null,
+        });
+        if (method === "GET") {
+          return new Response("{}", { status: 200, headers: { ETag: '"/config/ a1b2c3d4e5f60718"' } });
+        }
+        return new Response("", { status: 200 });
+      }) as any;
+
+      await api.configGet();
+      expect((await api.configDelete("")).ok).toBe(true);
+
+      await api.configGet();
+      expect((await api.configDelete("//")).ok).toBe(true);
+
+      expect(calls[1]).toEqual({ method: "DELETE", path: "/config/", ifMatch: '"/config/ a1b2c3d4e5f60718"' });
+      expect(calls[3]).toEqual({ method: "DELETE", path: "/config//", ifMatch: null });
     });
 
     it("invalidates ancestor entries on a successful child write", async () => {
@@ -1099,7 +1227,7 @@ describe("api", () => {
         const ifMatch = opts?.headers?.["If-Match"] ?? null;
         calls.push({ method, path, ifMatch });
         if (method === "GET") {
-          return new Response("{}", { status: 200, headers: { ETag: "parent-etag-1" } });
+          return new Response("{}", { status: 200, headers: { ETag: '"/config/ancestor-parent 92a3b4c5d6e7f809"' } });
         }
         return new Response("", { status: 200 });
       }) as any;
@@ -1128,7 +1256,10 @@ describe("api", () => {
         const ifMatch = opts?.headers?.["If-Match"] ?? null;
         calls.push({ method, path, ifMatch });
         if (method === "GET") {
-          return new Response("{}", { status: 200, headers: { ETag: "child-etag-1" } });
+          return new Response("{}", {
+            status: 200,
+            headers: { ETag: '"/config/descendant-parent/child a3b4c5d6e7f8091a"' },
+          });
         }
         return new Response("", { status: 200 });
       }) as any;
@@ -1155,7 +1286,10 @@ describe("api", () => {
         const ifMatch = opts?.headers?.["If-Match"] ?? null;
         calls.push({ method, path, ifMatch });
         if (method === "GET") {
-          return new Response("{}", { status: 200, headers: { ETag: "config-etag-1" } });
+          return new Response("{}", {
+            status: 200,
+            headers: { ETag: '"/config/cross-ns-config-path b4c5d6e7f8091a2b"' },
+          });
         }
         return new Response("", { status: 200 });
       }) as any;
@@ -1181,7 +1315,10 @@ describe("api", () => {
         const ifMatch = opts?.headers?.["If-Match"] ?? null;
         calls.push({ method, path, ifMatch });
         if (method === "GET") {
-          return new Response("{}", { status: 200, headers: { ETag: "id-etag-1" } });
+          return new Response("{}", {
+            status: 200,
+            headers: { ETag: '"/config/apps/http/servers/srv0/routes/0 c5d6e7f8091a2b3c"' },
+          });
         }
         return new Response("", { status: 200 });
       }) as any;
@@ -1209,7 +1346,7 @@ describe("api", () => {
         const ifMatch = opts?.headers?.["If-Match"] ?? null;
         calls.push({ method, path, ifMatch });
         if (method === "GET") {
-          return new Response("{}", { status: 200, headers: { ETag: "root-etag-1" } });
+          return new Response("{}", { status: 200, headers: { ETag: '"/config/ d6e7f8091a2b3c4d"' } });
         }
         return new Response("", { status: 200 });
       }) as any;
@@ -1238,7 +1375,10 @@ describe("api", () => {
         const ifMatch = opts?.headers?.["If-Match"] ?? null;
         calls.push({ method, path, ifMatch });
         if (method === "GET") {
-          return new Response("{}", { status: 200, headers: { ETag: "sibling-etag-1" } });
+          return new Response("{}", {
+            status: 200,
+            headers: { ETag: '"/config/prefix-siblings/srv0 e7f8091a2b3c4d5e"' },
+          });
         }
         return new Response("", { status: 200 });
       }) as any;
@@ -1247,7 +1387,7 @@ describe("api", () => {
       await api.configPatch("prefix-siblings/srv01", { listen: [":80"] });
       await api.configPatch("prefix-siblings/srv0", { listen: [":443"] });
 
-      expect(calls[2]?.ifMatch).toBe("sibling-etag-1");
+      expect(calls[2]?.ifMatch).toBe('"/config/prefix-siblings/srv0 e7f8091a2b3c4d5e"');
     });
 
     it("invalidates cache when a successful write returns no ETag", async () => {
@@ -1259,7 +1399,10 @@ describe("api", () => {
         const ifMatch = opts?.headers?.["If-Match"] ?? null;
         calls.push({ method, ifMatch });
         if (method === "GET") {
-          return new Response("{}", { status: 200, headers: { ETag: "etag-only-on-get" } });
+          return new Response("{}", {
+            status: 200,
+            headers: { ETag: '"/config/etag-no-header-target f8091a2b3c4d5e6f"' },
+          });
         }
         // Writes return 200 OK with no ETag header.
         return new Response("", { status: 200 });
@@ -1277,9 +1420,98 @@ describe("api", () => {
       expect(calls).toHaveLength(3);
       expect(calls[0]?.method).toBe("GET");
       expect(calls[1]?.method).toBe("PATCH");
-      expect(calls[1]?.ifMatch).toBe("etag-only-on-get");
+      expect(calls[1]?.ifMatch).toBe('"/config/etag-no-header-target f8091a2b3c4d5e6f"');
       expect(calls[2]?.method).toBe("PATCH");
       expect(calls[2]?.ifMatch).toBe(null);
+    });
+  });
+
+  // Caddy builds an ETag from the DECODED config path -- `"<path> <hash>"` --
+  // and then parses an If-Match back by splitting the quoted text with
+  // strings.Fields and demanding exactly 2 parts. A config key holding
+  // whitespace therefore produces an ETag Caddy itself cannot read: it answers
+  // 400 `malformed If-Match header` to every write that echoes one, or 412 when
+  // the key's last segment ENDS in whitespace (2 fields, but parts[0] names a
+  // shorter, different key). Caching such a value is terminal for the path --
+  // the next GET caches the identical ETag, so "re-read and retry" never
+  // recovers -- which is why the client now declines to cache it at all.
+  // Verified against Caddy 2.11.4 through this client: a route under a server
+  // named "a b" fails every caddy_reverse_proxy `id` upsert with the 400.
+  describe("ETags Caddy could not read back", () => {
+    /** GET `target`, answering with `etag`, then PATCH it; returns the PATCH's If-Match. */
+    async function ifMatchAfterGet(target: string, etag: string): Promise<string | null> {
+      const api = await import("../api.js");
+      const sent: Array<string | null> = [];
+      globalThis.fetch = vi.fn(async (_url: any, opts: any) => {
+        const method = opts?.method ?? "GET";
+        sent.push(opts?.headers?.["If-Match"] ?? null);
+        if (method === "GET") return new Response("{}", { status: 200, headers: { ETag: etag } });
+        return new Response("", { status: 200 });
+      }) as any;
+
+      await api.configGet(target);
+      await api.configPatch(target, { foo: 1 });
+      return sent[1] ?? null;
+    }
+
+    // The non-ASCII cases are spelled as the BYTES a header carries, because
+    // that is what both transports hand back: fetch and node:http decode header
+    // values latin1, so a UTF-8 space arrives as two or three latin1
+    // characters. "ã" is U+3000, "Â" is U+0085
+    // (NEL) and "Â " is U+00A0 (NBSP) -- none of which a JS \s test
+    // over the undecoded string would catch.
+    it.each([
+      ["a space in a key", "unusable-etag-space", '"/config/apps/http/servers/a b/routes bb405bd5f39dead0"'],
+      ["a tab in a key", "unusable-etag-tab", '"/config/apps/http/servers/a\tb/routes bb405bd5f39dead0"'],
+      [
+        "a key ending in a space (2 fields, wrong key)",
+        "unusable-etag-trailing",
+        '"/config/logging/logs/foo  5908b3541995c03c"',
+      ],
+      ["U+3000 in a key", "unusable-etag-u3000", '"/config/apps/http/servers/aãb 5908b3541995c03c"'],
+      ["U+0085 in a key", "unusable-etag-nel", '"/config/apps/http/servers/aÂb 5908b3541995c03c"'],
+      ["U+00A0 in a key", "unusable-etag-nbsp", '"/config/apps/http/servers/aÂ b 5908b3541995c03c"'],
+      ["an unquoted value", "unusable-etag-unquoted", "/config/unusable-etag-unquoted 5908b3541995c03c"],
+    ])("caches nothing for %s, so the next write carries no If-Match", async (_label, target, etag) => {
+      expect(await ifMatchAfterGet(target, etag)).toBe(null);
+    });
+
+    // The other direction: a decoded non-ASCII key is NOT whitespace and must
+    // keep its If-Match. "Ã " is U+00E0 (a-grave) as header bytes --
+    // its second byte reads as U+00A0 undecoded, so a check that skipped the
+    // UTF-8 decode would drop optimistic concurrency for ordinary keys.
+    it.each([
+      ["U+00E9 (e-acute)", "usable-etag-eacute", '"/config/apps/http/servers/cafÃ© 2eba8f8053559545"'],
+      ["U+00E0 (a-grave)", "usable-etag-agrave", '"/config/apps/http/servers/Ã -key 2eba8f8053559545"'],
+    ])("still echoes an ETag whose key holds %s", async (_label, target, etag) => {
+      expect(await ifMatchAfterGet(target, etag)).toBe(etag);
+    });
+
+    it("drops an ETag already cached for the path when a later GET returns an unusable one", async () => {
+      // The entry is DELETED rather than left alone: a key can be renamed under
+      // the path, and echoing the value from before the rename would fail the
+      // write for a second, unrelated reason.
+      const api = await import("../api.js");
+      const target = "etag-poison-replaces-good";
+      const usable = '"/config/etag-poison-replaces-good 2eba8f8053559545"';
+      const unusable = '"/config/etag-poison replaces-good 2eba8f8053559545"';
+      let gets = 0;
+      const sent: Array<string | null> = [];
+      globalThis.fetch = vi.fn(async (_url: any, opts: any) => {
+        const method = opts?.method ?? "GET";
+        sent.push(opts?.headers?.["If-Match"] ?? null);
+        if (method === "GET") {
+          gets++;
+          return new Response("{}", { status: 200, headers: { ETag: gets === 1 ? usable : unusable } });
+        }
+        return new Response("", { status: 200 });
+      }) as any;
+
+      await api.configGet(target);
+      await api.configGet(target);
+      await api.configPatch(target, { foo: 1 });
+
+      expect(sent[2]).toBe(null);
     });
   });
 
@@ -1297,7 +1529,7 @@ describe("api", () => {
         const ifMatch = opts?.headers?.["If-Match"] ?? null;
         calls.push({ method, ifMatch });
         if (method === "GET") {
-          return new Response("{}", { status: 200, headers: { ETag: "stale-etag" } });
+          return new Response("{}", { status: 200, headers: { ETag: '"/config/412-target-path 091a2b3c4d5e6f70"' } });
         }
         patchCount++;
         if (patchCount === 1) return new Response("precondition failed", { status: 412 });
@@ -1335,7 +1567,10 @@ describe("api", () => {
         const ifMatch = opts?.headers?.["If-Match"] ?? null;
         calls.push({ method, path, ifMatch });
         if (method === "GET") {
-          return new Response("{}", { status: 200, headers: { ETag: "pre-load-etag" } });
+          return new Response("{}", {
+            status: 200,
+            headers: { ETag: '"/config/loadconfig-clears-cache-target 1a2b3c4d5e6f7081"' },
+          });
         }
         return new Response("", { status: 200 });
       }) as any;
@@ -1997,7 +2232,7 @@ describe("api", () => {
         const path = new URL(String(url)).pathname;
         calls.push({ path, ifMatch: opts?.headers?.["If-Match"] ?? null });
         if (method === "GET") {
-          return new Response("{}", { status: 200, headers: { ETag: `etag${path}` } });
+          return new Response("{}", { status: 200, headers: { ETag: `"${path} 0badc0de0badc0de"` } });
         }
         return new Response("", { status: 200 });
       }) as any;
@@ -2014,7 +2249,7 @@ describe("api", () => {
 
       // Oldest was dropped; newest survived.
       expect(calls[0]?.ifMatch).toBe(null);
-      expect(calls[1]?.ifMatch).toBe("etag/config/evict-probe/p256");
+      expect(calls[1]?.ifMatch).toBe('"/config/evict-probe/p256 0badc0de0badc0de"');
     });
   });
 
@@ -2031,7 +2266,10 @@ describe("api", () => {
         const method = opts?.method ?? "GET";
         calls.push({ method, ifMatch: opts?.headers?.["If-Match"] ?? null });
         if (method === "GET") {
-          return new Response("{}", { status: 200, headers: { ETag: "survives-failed-load" } });
+          return new Response("{}", {
+            status: 200,
+            headers: { ETag: '"/config/load-failure-keeps-cache 2b3c4d5e6f708192"' },
+          });
         }
         if (String(url).endsWith("/load")) {
           return new Response("config invalid", { status: 400 });
@@ -2045,7 +2283,7 @@ describe("api", () => {
 
       await api.configPatch(target, { foo: 1 });
       expect(calls[2]?.method).toBe("PATCH");
-      expect(calls[2]?.ifMatch).toBe("survives-failed-load");
+      expect(calls[2]?.ifMatch).toBe('"/config/load-failure-keeps-cache 2b3c4d5e6f708192"');
     });
   });
 
@@ -2125,7 +2363,11 @@ describe("api", () => {
       globalThis.fetch = vi.fn(async (url: any, opts: any) => {
         const method = opts?.method ?? "GET";
         calls.push({ method, ifMatch: opts?.headers?.["If-Match"] ?? null });
-        if (method === "GET") return new Response("{}", { status: 200, headers: { ETag: "survives-false-200" } });
+        if (method === "GET")
+          return new Response("{}", {
+            status: 200,
+            headers: { ETag: '"/config/load-failed-behind-200-keeps-cache 3c4d5e6f708192a3"' },
+          });
         if (String(url).endsWith("/load")) return new Response(FAILED_BEHIND_A_200, { status: 200 });
         return new Response("", { status: 200 });
       }) as any;
@@ -2135,7 +2377,7 @@ describe("api", () => {
       await api.configPatch(target, { foo: 1 });
 
       expect(calls[2]?.method).toBe("PATCH");
-      expect(calls[2]?.ifMatch).toBe("survives-false-200");
+      expect(calls[2]?.ifMatch).toBe('"/config/load-failed-behind-200-keeps-cache 3c4d5e6f708192a3"');
     });
 
     it("keeps a load that applied with warnings a success, and surfaces the warnings", async () => {
@@ -2160,7 +2402,11 @@ describe("api", () => {
       globalThis.fetch = vi.fn(async (url: any, opts: any) => {
         const method = opts?.method ?? "GET";
         calls.push({ method, ifMatch: opts?.headers?.["If-Match"] ?? null });
-        if (method === "GET") return new Response("{}", { status: 200, headers: { ETag: "pre-load" } });
+        if (method === "GET")
+          return new Response("{}", {
+            status: 200,
+            headers: { ETag: '"/config/load-with-warnings-clears-cache 4d5e6f708192a3b4"' },
+          });
         if (String(url).endsWith("/load")) return new Response(WARNINGS_JSON, { status: 200 });
         return new Response("", { status: 200 });
       }) as any;
@@ -2482,6 +2728,26 @@ describe("api", () => {
       expect(url.pathname).toBe("/config/");
     });
 
+    // Caddy's bulk-append spelling: `POST .../routes/...` with an ARRAY body
+    // spreads the elements into the array in one request, all or nothing
+    // (admin.go:1196-1199 and 1232-1237 at v2.11.4). It has to survive this
+    // client untouched -- rejectTraversal matches only a whole ".." segment and
+    // encodeURIComponent("...") is "..." -- and it must never be replayed,
+    // because a POST under /config appends.
+    it("passes a trailing '...' through verbatim, with the array body, and never replays it", async () => {
+      process.env.CADDY_MAX_RETRIES = "3";
+      const api = await import("../api.js");
+      const sent: Array<{ method: string; pathname: string; body: unknown }> = [];
+      globalThis.fetch = vi.fn(async (url: any, opts: any) => {
+        sent.push({ method: opts.method, pathname: new URL(String(url)).pathname, body: opts.body });
+        return new Response("upstream down", { status: 503 });
+      }) as any;
+
+      const res = await api.configPost("apps/http/servers/srv0/routes/...", [{}]);
+      expect(res.ok).toBe(false);
+      expect(sent).toEqual([{ method: "POST", pathname: "/config/apps/http/servers/srv0/routes/...", body: "[{}]" }]);
+    });
+
     it("leaves unreserved characters alone, including '..' inside a segment", async () => {
       const url = await captureUrl((a) => a.configGet("apps/http/servers/my..name"));
       expect(url.pathname).toBe("/config/apps/http/servers/my..name");
@@ -2536,7 +2802,10 @@ describe("api", () => {
         const method = opts?.method ?? "GET";
         calls.push({ method, ifMatch: opts?.headers?.["If-Match"] ?? null });
         if (method === "GET") {
-          return new Response("{}", { status: 200, headers: { ETag: "encoded-key-etag" } });
+          return new Response("{}", {
+            status: 200,
+            headers: { ETag: '"/config/encode-probe/prod#1 5e6f708192a3b4c5"' },
+          });
         }
         return new Response("", { status: 200 });
       }) as any;
@@ -2545,7 +2814,7 @@ describe("api", () => {
       await api.configPatch("encode-probe/prod#1", { listen: [":443"] });
 
       expect(calls[1]?.method).toBe("PATCH");
-      expect(calls[1]?.ifMatch).toBe("encoded-key-etag");
+      expect(calls[1]?.ifMatch).toBe('"/config/encode-probe/prod#1 5e6f708192a3b4c5"');
     });
   });
 
