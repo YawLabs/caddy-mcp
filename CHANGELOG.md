@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [2.5.4] — 2026-09-19
+
 ### Fixed
 - **`caddy_config_delete` no longer unloads the entire config without a word or a
   snapshot.** An empty path — `''`, `'/'`, `'config'`, `'/config/'` or a slash-only
