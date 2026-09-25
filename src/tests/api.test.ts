@@ -991,6 +991,37 @@ describe("api", () => {
     });
   });
 
+  describe("idObjectPath", () => {
+    // The ETag of `GET /id/<id>/@id` is `"<resolved path>/@id <hash>"`, and the
+    // path is where Caddy actually sends `/id/<id>` (issue #60). Shapes below
+    // are the ones Caddy 2.11.4 answered live.
+    it("reads the resolved object path out of Caddy's ETag", async () => {
+      const api = await import("../api.js");
+      expect(api.idObjectPath('"/config/@id 1f231e1f8ace40d5"')).toBe("/config");
+      expect(api.idObjectPath('"/config/apps/http/servers/srv0/routes/0/@id f81fa6aca187b238"')).toBe(
+        "/config/apps/http/servers/srv0/routes/0",
+      );
+      // A key with whitespace: the hash never contains a space, so the LAST
+      // space is the separator.
+      expect(api.idObjectPath('"/config/apps/http/servers/a b/@id 9f873a6030d3fbf1"')).toBe(
+        "/config/apps/http/servers/a b",
+      );
+    });
+
+    it("decodes a UTF-8 key that arrives as latin1 header bytes", async () => {
+      const api = await import("../api.js");
+      const raw = Buffer.from('"/config/apps/http/servers/café/@id abc123"', "utf8").toString("latin1");
+      expect(api.idObjectPath(raw)).toBe("/config/apps/http/servers/café");
+    });
+
+    it("returns undefined for anything that is not that shape", async () => {
+      const api = await import("../api.js");
+      for (const etag of [undefined, "", '"', "/config/@id abc", '"/config/@id"', '"/config/apps abc"', '"nospace"']) {
+        expect(api.idObjectPath(etag), String(etag)).toBeUndefined();
+      }
+    });
+  });
+
   describe("isRootConfigPath", () => {
     // Every spelling that lands on Caddy's whole-config branch. The "..." family
     // is there because Caddy strips a trailing "..." segment BEFORE it switches

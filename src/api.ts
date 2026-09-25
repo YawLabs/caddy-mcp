@@ -1509,6 +1509,39 @@ function idPath(id: string, subpath: string): string {
   return subpath ? `/id/${encodedId}/${encodePathSegments(subpath)}` : `/id/${encodedId}`;
 }
 
+/**
+ * The config path an @id resolves to, read from the ETag of `GET /id/<id>/@id`.
+ *
+ * Caddy decides where `/id/<id>` goes from its own index, not from anything a
+ * client can reconstruct: it builds each indexed path with `path.Join`, which
+ * collapses ".." INSIDE key names (caddy.go:311 at v2.11.4), and keys a numeric
+ * "@id" by its Go `%v` string. So a nested object under a key like "../../.."
+ * resolves to the config ROOT, and `{"@id": 7}` makes `/id/7` the root while a
+ * read of the top-level "@id" answers the number 7. The one reliable answer is
+ * where Caddy actually sends the request: handleConfigID rewrites the path and
+ * re-dispatches it internally, and the GET that lands in handleConfig writes an
+ * ETag of `"<that path> <hash>"` (makeEtag). Appending "@id" keeps the read to a
+ * few bytes. Verified against Caddy 2.11.4: a string or numeric top-level @id
+ * and a "../../.."-nested one all answer `"/config/@id <hash>"`; a route answers
+ * its own path; an id that collapses OUTSIDE the config tree (to `/load` or `/`)
+ * answers 404 with no ETag, because no config handler serves it.
+ *
+ * Returns the resolved object's path ("/config" for the root), or undefined when
+ * the ETag is absent or not of that shape. Header bytes arrive as latin1, like
+ * isEchoableEtag's input; the hash never contains a space, so the LAST space is
+ * the separator even when a key in the path contains whitespace.
+ */
+export function idObjectPath(etag: string | undefined): string | undefined {
+  if (!etag) return undefined;
+  const decoded = Buffer.from(etag, "latin1").toString("utf8");
+  if (decoded.length < 2 || !decoded.startsWith('"') || !decoded.endsWith('"')) return undefined;
+  const inner = decoded.slice(1, -1);
+  const cut = inner.lastIndexOf(" ");
+  if (cut <= 0) return undefined;
+  const path = inner.slice(0, cut);
+  return path.endsWith("/@id") ? path.slice(0, -"/@id".length) : undefined;
+}
+
 export function configByIdGet<T = any>(id: string, subpath = ""): Promise<ApiResponse<T>> {
   const badId = rejectTraversal(id);
   if (badId) return Promise.resolve(badId);

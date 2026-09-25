@@ -1261,6 +1261,78 @@ describe.skipIf(!RUN)("integration: live Caddy admin API", () => {
       expect(listSnapshots()[0].config).toEqual(edited.data);
     });
 
+    // The three shapes that got past the first #60 fix, which compared `id`
+    // with the top-level "@id": a NUMERIC top-level @id (the read answers the
+    // number 7, never the string "7"), a nested @id under a key whose ".."
+    // Caddy's path.Join collapses to the root (the top-level @id reads null),
+    // and an @id that collapses OUTSIDE the config tree to /load -- where
+    // 'append' is a POST to /load, a whole-config load. Resolution through
+    // Caddy must gate the first two and refuse the third without writing.
+    it("caddy_config_by_id resolves ids through Caddy: numeric and nested root ids are gated, /load is refused", async () => {
+      const byId = getHandler(registerConfigTools, "caddy_config_by_id");
+      const replacement = { apps: { http: { servers: { srv9: { listen: [":18886"], routes: [] } } } } };
+      const cases: Array<[string, Record<string, unknown>, string]> = [
+        [
+          "numeric top-level @id",
+          { "@id": 7, apps: { http: { servers: { srv0: { listen: [":18887"], routes: [] } } } } },
+          "7",
+        ],
+        [
+          "nested @id collapsing to the root",
+          { apps: { http: { servers: { "../../..": { "@id": "deep", listen: [":18887"], routes: [] } } } } },
+          "deep",
+        ],
+      ];
+      for (const [label, config, id] of cases) {
+        assertOk(await loadAndSettle(config), `load ${label}`);
+        const before = await api.configGet();
+        assertOk(before, `configGet before (${label})`);
+        const refused = await byId({
+          id,
+          action: "set",
+          value: replacement,
+          subpath: "",
+          mode: "overwrite",
+          confirm: false,
+        });
+        expect(refused.isError, label).toBe(true);
+        expect(refused.content[0].text, label).toContain("ENTIRE config");
+        const after = await api.configGet();
+        assertOk(after, `configGet after (${label})`);
+        expect(after.data, label).toEqual(before.data);
+      }
+
+      const toLoad = {
+        apps: {
+          http: {
+            servers: {
+              srv0: {
+                listen: [":18887"],
+                routes: [{ handle: [{ handler: "vars", "../../../../../../../../../load": { "@id": "toload" } }] }],
+              },
+            },
+          },
+        },
+      };
+      assertOk(await loadAndSettle(toLoad), "load config with an @id collapsing to /load");
+      const before = await api.configGet();
+      assertOk(before, "configGet before the /load case");
+      const refused = await byId({
+        id: "toload",
+        action: "set",
+        value: replacement,
+        subpath: "",
+        mode: "append",
+        confirm: true,
+      });
+      expect(refused.isError).toBe(true);
+      expect(refused.content[0].text).toContain('Could not check where Caddy resolves @id "toload"');
+      const after = await api.configGet();
+      assertOk(after, "configGet after the /load case");
+      // Even with confirm=true, nothing was loaded.
+      expect(after.data).toEqual(before.data);
+    });
+
     // The two sequences the description and refusal spell out. A root DELETE
     // removes Caddy's "config" key itself (admin.go:1304), which flips both
     // verbs: 'insert' (PUT) answers 409 while the key exists -- including on an

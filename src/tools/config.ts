@@ -523,7 +523,7 @@ export function registerConfigTools(server: McpServer) {
   server.tool(
     "caddy_revert",
     "Manage config snapshots for rollback. Snapshots are auto-captured before caddy_load, and before a caddy_config_delete " +
-      "or caddy_config_set at the config root (any path that addresses the whole config), and before a caddy_config_by_id set or delete whose @id names the root; no other delete or set is snapshotted. Last 10. " +
+      "or caddy_config_set at the config root (any path that addresses the whole config), and before a caddy_config_by_id set or delete whose @id resolves to the root; no other delete or set is snapshotted. Last 10. " +
       "By default they live in memory only and are LOST when this server restarts -- set CADDY_MCP_SNAPSHOT_DIR " +
       "to a writable directory to persist them across restarts (they contain full Caddy configs, so pick the location deliberately). " +
       "Actions: 'list' shows snapshots with timestamps, 'save' manually captures the current config, 'apply' restores a snapshot (requires confirm=true).",
@@ -664,7 +664,7 @@ export function registerConfigTools(server: McpServer) {
   server.tool(
     "caddy_config_by_id",
     "Access config by @id tag. Any config object with an '@id' field can be read, updated, or deleted by its ID instead of needing its full path. This is the recommended way to manage individual routes and config objects. The 'delete' action requires confirm=true. " +
-      "If `id` is the config's own top-level '@id', it names the ENTIRE config: 'set' and 'delete' with no subpath (or a lone '...') then act on the whole configuration exactly as caddy_config_set and caddy_config_delete do at the config root -- 'set' replaces it and 'delete' unloads it, the 'admin' block included, so Caddy's admin endpoint can move and CADDY_ADMIN_URL stop reaching it. Both then require confirm=true, snapshot the prior config first so caddy_revert can restore it, and report where the admin endpoint went. A subpath inside it (e.g. 'apps/http') is an ordinary write.",
+      "Every 'set' and 'delete' first asks Caddy where `id` resolves, and refuses an id that does not resolve inside the config tree (including an unknown one). If Caddy resolves `id` to the config ROOT -- normally because it is the config's own top-level '@id', string or number -- it names the ENTIRE config: 'set' and 'delete' with no subpath (or a lone '...') then act on the whole configuration exactly as caddy_config_set and caddy_config_delete do at the config root -- 'set' replaces it and 'delete' unloads it, the 'admin' block included, so Caddy's admin endpoint can move and CADDY_ADMIN_URL stop reaching it. Both then require confirm=true, snapshot the prior config first so caddy_revert can restore it, and report where the admin endpoint went. A subpath inside it (e.g. 'apps/http') is an ordinary write.",
     {
       id: z
         .string()
@@ -685,7 +685,7 @@ export function registerConfigTools(server: McpServer) {
         .optional()
         .default(false)
         .describe(
-          "Must be true to actually delete, and to 'set' when `id` is the config's own top-level '@id' (that replaces the ENTIRE config). Ignored for every other 'set'.",
+          "Must be true to actually delete, and to 'set' when Caddy resolves `id` to the config root (that replaces the ENTIRE config). Ignored for every other 'set'.",
         ),
     },
     // destructiveHint is keyed to the worst thing this tool can do, not the
@@ -705,42 +705,56 @@ export function registerConfigTools(server: McpServer) {
           content: [{ type: "text" as const, text: "Error: value is required for 'set' action" }],
         };
       }
-      // An @id can name the config ROOT: Caddy accepts a top-level "@id" and
-      // indexes it at /config, so `/id/<id>` (and `/id/<id>/...`, whose "..."
-      // Caddy strips before it picks a method) is then byte-for-byte the same
-      // request as `/config/` -- PATCH and POST replace the whole config, PUT
-      // answers 409, DELETE unloads it. Verified against Caddy 2.11.4. That is
-      // the whole-config write caddy_config_set and caddy_config_delete gate,
-      // snapshot and explain, so it takes their branch (issue #60).
+      // Ask Caddy where this id actually goes before writing through it (issue
+      // #60). An @id can resolve to the config ROOT -- a top-level "@id", string
+      // or number, or a nested one under keys whose ".." collapse to it -- and
+      // then `/id/<id>` (and `/id/<id>/...`, whose "..." Caddy strips before it
+      // picks a method) is byte-for-byte the same request as `/config/`: PATCH
+      // and POST replace the whole config, PUT answers 409, DELETE unloads it.
+      // An @id can also collapse OUTSIDE the config tree, to `/` or `/load`,
+      // where `/id/<id>/load` would be a whole-config load and `/id/<id>/stop`
+      // would stop Caddy. Verified against Caddy 2.11.4. So every set and
+      // delete resolves the id first (api.idObjectPath has the mechanism), and:
       //
-      // The check reads only the top-level "@id" -- a few bytes, not the whole
-      // config -- and only when the subpath leaves the request AT the object;
-      // any deeper subpath is a leaf even under a root @id. Caddy answers
-      // `null` when the key is absent, including on an instance with no config
-      // at all, so a failed read is a real failure and nothing is written: this
-      // client cannot tell whether the call it was about to send would replace
-      // the whole config. Race: a config that GAINS this top-level @id between
-      // the read and the write would slip through; that needs a concurrent
-      // whole-config change carrying exactly this id.
-      if (isAtIdentifiedObject(subpath)) {
-        const top = await api.configGet("@id");
-        if (!top.ok) {
-          return formatResult({
-            ...top,
-            error:
-              `Could not read the config's top-level "@id" to check whether @id "${id}" names the whole config, so ` +
-              `nothing was changed.\n${top.error}`,
-          });
+      // - an id that does not resolve inside the config tree -- including an
+      //   unknown id, which Caddy answers 404 -- is refused and nothing is sent;
+      //   the read's own error is passed through as Caddy gave it;
+      // - an id that resolves to the root, with a subpath that stays AT it,
+      //   takes the whole-config branch caddy_config_set and caddy_config_delete
+      //   use: gated, snapshotted, explained;
+      // - anything else is the ordinary /id request it always was.
+      //
+      // Race: a config change between this read and the write could move the
+      // id; that needs a concurrent change that re-points exactly this id.
+      const probe = await api.configByIdGet(id, "@id");
+      if (!probe.ok) {
+        return formatResult({
+          ...probe,
+          error: `Could not check where Caddy resolves @id "${id}", so nothing was changed.\n${probe.error}`,
+        });
+      }
+      const objectPath = api.idObjectPath(probe.etag);
+      if (objectPath === undefined || !(objectPath === "/config" || objectPath.startsWith("/config/"))) {
+        return {
+          isError: true,
+          content: [
+            {
+              type: "text" as const,
+              text:
+                `Caddy's answer to a read of @id "${id}" did not show it resolving to a path inside the config tree, so ` +
+                `this tool cannot tell what a write through it would change. Nothing was changed.`,
+            },
+          ],
+        };
+      }
+      if (objectPath === "/config" && isAtIdentifiedObject(subpath)) {
+        const target = `Caddy resolves @id "${id}" to the config root.`;
+        if (action === "set") {
+          return confirm
+            ? rootConfigWrite(mode, value, "caddy_config_by_id")
+            : rootWriteRefusal(target, "pass a subpath inside it instead (e.g. subpath 'apps/http')");
         }
-        if (top.data === id) {
-          const target = `The @id "${id}" is the config's own top-level "@id", so it names the config root.`;
-          if (action === "set") {
-            return confirm
-              ? rootConfigWrite(mode, value, "caddy_config_by_id")
-              : rootWriteRefusal(target, "pass a subpath inside it instead (e.g. subpath 'apps/http')");
-          }
-          return confirm ? rootConfigDelete("caddy_config_by_id") : rootDeleteRefusal(target);
-        }
+        return confirm ? rootConfigDelete("caddy_config_by_id") : rootDeleteRefusal(target);
       }
       if (action === "set") {
         const method = mode === "append" ? "POST" : mode === "insert" ? "PUT" : "PATCH";
