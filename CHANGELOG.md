@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [2.5.6] — 2026-09-25
+
 ### Security
 - **`caddy_config_by_id` no longer replaces or unloads the entire config, or reaches other
   admin endpoints, ungated.** Fixes [#60](https://github.com/YawLabs/caddy-mcp/issues/60),
