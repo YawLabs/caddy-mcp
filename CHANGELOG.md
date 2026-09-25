@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [2.5.5] — 2026-09-25
+
 ### Security
 - **`caddy_config_set` no longer replaces the entire config without a gate, a snapshot, or
   a word.** Reported by [@gargarnav](https://github.com/gargarnav) in
