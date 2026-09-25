@@ -284,9 +284,18 @@ Browsable read-only data — MCP clients can fetch these directly without a tool
     `mode: "insert"` on a route id, leaves two elements sharing one `@id`, and
     `/id/` resolves to only one of them.
 
-  Older 2.x mostly works, but the `If-Match` (ETag) concurrency guard needs Caddy
-  2.5.2 or later — before that Caddy ignores the header silently. The `@id` write
-  path relies on `PATCH` semantics that the live integration suite pins per release.
+  Older 2.x mostly works, with two exceptions that both come from how Caddy sends
+  its `ETag`. Caddy 2.8.0 and later send it as a response header. Caddy 2.5.2
+  through 2.7.x send it as an HTTP trailer, which this client cannot read, and
+  earlier versions send none. So before 2.8.0:
+  - the `If-Match` (ETag) concurrency guard is inactive, because no ETag is ever
+    cached to echo back;
+  - every `caddy_config_by_id` `set` and `delete` is refused, because the tool
+    reads the ETag to learn where Caddy resolves the `@id` before it writes
+    through it, and fails closed when it cannot.
+
+  The `@id` write path relies on `PATCH` semantics that the live integration
+  suite pins per release.
 
 ## Contributing
 
@@ -297,7 +306,7 @@ npm install
 npm run lint       # Biome check
 npm run lint:fix   # Auto-fix
 npm run build      # tsup bundle
-npm test           # Vitest (778 unit tests, +39 POSIX-only unix-socket and launcher tests; +39 live-Caddy integration tests gated by CADDY_MCP_INTEGRATION=1)
+npm test           # Vitest (781 unit tests, +39 POSIX-only unix-socket and launcher tests; +39 live-Caddy integration tests gated by CADDY_MCP_INTEGRATION=1)
 npm run typecheck  # tsc --noEmit
 ```
 

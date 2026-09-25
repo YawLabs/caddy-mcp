@@ -1800,15 +1800,47 @@ describe("tool handler behavior", () => {
         expect(api.configDelete).not.toHaveBeenCalled();
       });
 
-      it("writes nothing when the resolution carries no readable ETag", async () => {
+      it("writes nothing when the resolution carries no ETag, naming every cause of that", async () => {
+        // Caddy before 2.8.0 sends the ETag as a trailer (2.5.2-2.7.x) or not at
+        // all, and a proxy can strip it: one signal, several causes.
         api.configByIdGet.mockResolvedValue({ ok: true, status: 200, data: "my-route" } as ApiResponse);
 
         const result = await handler({ id: "my-route", action: "set", value: {}, subpath: "", mode: "overwrite" });
 
         expect(result.isError).toBe(true);
-        expect(result.content[0].text).toContain("did not show it resolving to a path inside the config tree");
-        expect(result.content[0].text).toContain("Nothing was changed");
+        const text = result.content[0].text;
+        expect(text).toContain("carried no ETag header");
+        expect(text).toContain("2.8.0");
+        expect(text).toContain("trailer");
+        expect(text).toContain("proxy");
+        expect(text).toContain("Nothing was changed");
         expect(api.configByIdSet).not.toHaveBeenCalled();
+      });
+
+      it.each([
+        ["/load", '"/load/@id 0123abcd"'],
+        ["/configX", '"/configX/@id 0123abcd"'],
+        ["/", '"/@id 0123abcd"'],
+      ])("refuses an id Caddy resolves to %s, outside the config tree, in set and delete alike", async (where, etag) => {
+        // Unreachable on Caddy 2.11.4 (no config handler answers there, so the
+        // read 404s with no ETag), but the guard is what stops a write landing
+        // on /load or /stop if a Caddy ever answered one.
+        api.configByIdGet.mockResolvedValue({ ok: true, status: 200, data: "x", etag } as ApiResponse);
+
+        const set = await handler({ id: "x", action: "set", value: {}, subpath: "", mode: "append", confirm: true });
+        const del = await handler({ id: "x", action: "delete", subpath: "", confirm: true });
+
+        for (const result of [set, del]) {
+          expect(result.isError).toBe(true);
+          expect(result.content[0].text).toContain("Nothing was changed");
+        }
+        expect(set.content[0].text).toContain(`resolves @id "x" to ${where}, which is outside the config tree`);
+        expect(api.configByIdSet).not.toHaveBeenCalled();
+        expect(api.configByIdDelete).not.toHaveBeenCalled();
+        expect(api.configPost).not.toHaveBeenCalled();
+        expect(api.configPatch).not.toHaveBeenCalled();
+        expect(api.configPut).not.toHaveBeenCalled();
+        expect(api.configDelete).not.toHaveBeenCalled();
       });
     });
 

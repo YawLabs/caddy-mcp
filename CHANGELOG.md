@@ -29,7 +29,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   read, sent to the canonical `/config/` so it carries `If-Match`, snapshotted (trigger
   `caddy_config_by_id`), and reported with the same admin-endpoint note. Everything else
   is the ordinary `/id` request it was, after one small read. The root branches of the
-  three tools are now one shared implementation.
+  three tools are now one shared implementation. Resolution reads the ETag, which Caddy
+  sends as a header only from 2.8.0 on (2.5.2 through 2.7.x send it as an HTTP trailer
+  this client cannot read, and earlier versions send none), so on Caddy before 2.8.0 every
+  `set` and `delete` is refused, with a message that says the ETag was missing and names
+  every cause of that. The README's Requirements section now says so, and corrects its
+  claim that the `If-Match` guard works from 2.5.2: for the same reason it is inactive
+  before 2.8.0.
 
 ## [2.5.5] — 2026-09-25
 

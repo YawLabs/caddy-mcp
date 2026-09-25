@@ -523,7 +523,7 @@ export function registerConfigTools(server: McpServer) {
   server.tool(
     "caddy_revert",
     "Manage config snapshots for rollback. Snapshots are auto-captured before caddy_load, and before a caddy_config_delete " +
-      "or caddy_config_set at the config root (any path that addresses the whole config), and before a caddy_config_by_id set or delete whose @id resolves to the root; no other delete or set is snapshotted. Last 10. " +
+      "or caddy_config_set at the config root (any path that addresses the whole config), and before a caddy_config_by_id set or delete whose @id resolves to the root with no subpath (or a lone '...'); no other delete or set is snapshotted. Last 10. " +
       "By default they live in memory only and are LOST when this server restarts -- set CADDY_MCP_SNAPSHOT_DIR " +
       "to a writable directory to persist them across restarts (they contain full Caddy configs, so pick the location deliberately). " +
       "Actions: 'list' shows snapshots with timestamps, 'save' manually captures the current config, 'apply' restores a snapshot (requires confirm=true).",
@@ -735,17 +735,19 @@ export function registerConfigTools(server: McpServer) {
       }
       const objectPath = api.idObjectPath(probe.etag);
       if (objectPath === undefined || !(objectPath === "/config" || objectPath.startsWith("/config/"))) {
-        return {
-          isError: true,
-          content: [
-            {
-              type: "text" as const,
-              text:
-                `Caddy's answer to a read of @id "${id}" did not show it resolving to a path inside the config tree, so ` +
-                `this tool cannot tell what a write through it would change. Nothing was changed.`,
-            },
-          ],
-        };
+        // Keep the two signals apart. A missing ETag has more than one cause --
+        // Caddy before 2.8.0 sends it as a trailer (2.5.2-2.7.x) or not at all,
+        // and a proxy in front of Caddy can strip it -- so the message names
+        // them all rather than picking one.
+        const why = !probe.etag
+          ? `Caddy's answer to a read of @id "${id}" carried no ETag header, so this tool cannot tell where Caddy resolves ` +
+            `that id or what a write through it would change. Caddy sends that header from 2.8.0 on; earlier versions send ` +
+            `it as a trailer or not at all, and a proxy in front of Caddy can strip it.`
+          : objectPath !== undefined
+            ? `Caddy resolves @id "${id}" to ${objectPath || "/"}, which is outside the config tree, so this tool will not write through it.`
+            : `Caddy's answer to a read of @id "${id}" carried an ETag this tool could not read a config path from, so it ` +
+              `cannot tell what a write through that id would change.`;
+        return { isError: true, content: [{ type: "text" as const, text: `${why} Nothing was changed.` }] };
       }
       if (objectPath === "/config" && isAtIdentifiedObject(subpath)) {
         const target = `Caddy resolves @id "${id}" to the config root.`;
