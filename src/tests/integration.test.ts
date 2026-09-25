@@ -1152,5 +1152,63 @@ describe.skipIf(!RUN)("integration: live Caddy admin API", () => {
       assertOk(after, "configGet after the revert");
       expect(after.data).toEqual(before.data);
     });
+
+    // caddy_config_set's description and refusal tell callers that 'append' at
+    // the root REPLACES the whole config (admin.go:1279 at v2.11.4: the root
+    // value is a map, never an array, so POST sets it). Only 'overwrite' was
+    // pinned live; a Caddy that started merging or appending here would turn
+    // that warning into wrong advice with nothing failing.
+    it("caddy_config_set 'append' at the root replaces the whole config, as its warning says", async () => {
+      const known = { apps: { http: { servers: { srv0: { listen: [":18894"], routes: [] } } } } };
+      assertOk(await loadAndSettle(known), "loadConfig known config");
+      const replacement = { apps: { http: { servers: { srv1: { listen: [":18893"], routes: [] } } } } };
+
+      const set = getHandler(registerConfigTools, "caddy_config_set");
+      const result = await set({ path: "", value: replacement, mode: "append", confirm: true });
+      expect(result.isError, result.content?.[0]?.text).toBeFalsy();
+      expect(result.content[0].text).toContain("Replaced the entire config");
+
+      await waitForAdmin();
+      const after = await api.configGet();
+      assertOk(after, "configGet after the root append");
+      // Replaced, not merged: srv0 is gone.
+      expect(after.data).toEqual(replacement);
+    });
+
+    // The two sequences the description and refusal spell out. A root DELETE
+    // removes Caddy's "config" key itself (admin.go:1304), which flips both
+    // verbs: 'insert' (PUT) answers 409 while the key exists -- including on an
+    // instance loaded with {} -- and loads once it is gone; 'overwrite' (PATCH)
+    // answers 404 once it is gone. Driven through the tools so the If-Match the
+    // root branch sends (from its own pre-read) is part of what is pinned.
+    it("root 'insert' answers 409 until a root delete; after one, 'overwrite' answers 404 and 'insert' loads", async () => {
+      const known = { apps: { http: { servers: { srv0: { listen: [":18892"], routes: [] } } } } };
+      assertOk(await loadAndSettle(known), "loadConfig known config");
+      const replacement = { apps: { http: { servers: { srv1: { listen: [":18891"], routes: [] } } } } };
+      const set = getHandler(registerConfigTools, "caddy_config_set");
+      const del = getHandler(registerConfigTools, "caddy_config_delete");
+
+      const conflict = await set({ path: "", value: replacement, mode: "insert", confirm: true });
+      expect(conflict.isError).toBe(true);
+      expect(conflict.content[0].text).toContain("key already exists: config");
+      const untouched = await api.configGet();
+      assertOk(untouched, "configGet after the 409");
+      expect(untouched.data).toEqual(known);
+
+      const unloaded = await del({ path: "", confirm: true });
+      expect(unloaded.isError, unloaded.content?.[0]?.text).toBeFalsy();
+      await waitForAdmin();
+
+      const missing = await set({ path: "", value: replacement, mode: "overwrite", confirm: true });
+      expect(missing.isError).toBe(true);
+      expect(missing.content[0].text).toContain("key does not exist: config");
+
+      const created = await set({ path: "", value: replacement, mode: "insert", confirm: true });
+      expect(created.isError, created.content?.[0]?.text).toBeFalsy();
+      await waitForAdmin();
+      const after = await api.configGet();
+      assertOk(after, "configGet after the root insert");
+      expect(after.data).toEqual(replacement);
+    });
   });
 });

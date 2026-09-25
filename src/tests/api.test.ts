@@ -962,6 +962,33 @@ describe("api", () => {
       expect((await api.configPost("apps/http/servers/srv0/routes/...", [{}])).ok).toBe(true);
       expect(called).toBe(2);
     });
+
+    // Each request function carries its OWN rejectTraversal call, so each needs
+    // its own pin. configDelete matters most: caddy_config_delete classifies "."
+    // as a leaf (it is not a root spelling), so if this guard regressed, fetch
+    // would collapse `DELETE /config/.` to `DELETE /config/` and unload the
+    // entire config through the tool's leaf branch -- no snapshot, no warning.
+    it.each([
+      ["configGet", (a: typeof import("../api.js"), p: string) => a.configGet(p)],
+      ["configPost", (a: typeof import("../api.js"), p: string) => a.configPost(p, {})],
+      ["configPut", (a: typeof import("../api.js"), p: string) => a.configPut(p, {})],
+      ["configPatch", (a: typeof import("../api.js"), p: string) => a.configPatch(p, {})],
+      ["configDelete", (a: typeof import("../api.js"), p: string) => a.configDelete(p)],
+    ])("%s refuses a '.' segment without hitting fetch", async (_name, call) => {
+      const api = await import("../api.js");
+      let called = 0;
+      globalThis.fetch = vi.fn(async () => {
+        called++;
+        return new Response("{}", { status: 200 });
+      }) as any;
+
+      for (const path of [".", "/config/.", "apps/."]) {
+        const res = await call(api, path);
+        expect(res.ok, path).toBe(false);
+        expect(res.error, path).toContain("'.' and '..' segments are not allowed");
+      }
+      expect(called).toBe(0);
+    });
   });
 
   describe("isRootConfigPath", () => {

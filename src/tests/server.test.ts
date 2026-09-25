@@ -6,7 +6,7 @@ import { fileURLToPath } from "node:url";
 import { Client } from "@modelcontextprotocol/sdk/client/index.js";
 import { StdioClientTransport } from "@modelcontextprotocol/sdk/client/stdio.js";
 import { InMemoryTransport } from "@modelcontextprotocol/sdk/inMemory.js";
-import { afterEach, describe, expect, it } from "vitest";
+import { afterEach, describe, expect, it, vi } from "vitest";
 import { createCaddyServer, version } from "../server.js";
 
 const require_ = createRequire(import.meta.url);
@@ -85,6 +85,27 @@ describe("server assembly", () => {
     expect((schema.required ?? []).sort()).toEqual(["from", "to"]);
   });
 
+  // GHSA-6859-g3p8-jc93 was about what a HOST sees: a client that auto-approves
+  // on destructiveHint:false let a root caddy_config_set replace the entire
+  // config unasked. tools.test.ts reads the raw argument handed to server.tool,
+  // which would still pass if the SDK dropped or misread it -- this reads what
+  // actually crosses the wire.
+  it("advertises caddy_config_set as destructive, with an optional boolean confirm, over tools/list", async () => {
+    open = await connectedClient();
+    const { tools } = await open.listTools();
+    const set = tools.find((t) => t.name === "caddy_config_set");
+
+    expect(set).toBeDefined();
+    expect(set?.annotations).toMatchObject({ readOnlyHint: false, destructiveHint: true, idempotentHint: false });
+    const schema = set?.inputSchema as {
+      properties?: Record<string, { type?: string; default?: unknown }>;
+      required?: string[];
+    };
+    expect(schema.properties?.confirm?.type).toBe("boolean");
+    expect(schema.properties?.confirm?.default).toBe(false);
+    expect(schema.required ?? []).not.toContain("confirm");
+  });
+
   it("serves resources/list with the four caddy:// resources", async () => {
     open = await connectedClient();
     const { resources } = await open.listResources();
@@ -96,6 +117,72 @@ describe("server assembly", () => {
       "caddy://servers",
       "caddy://upstreams",
     ]);
+  });
+});
+
+// The advisory's own reproduction, driven the way the reporter drove it: a real
+// MCP client and a real tools/call, so zod's schema defaults are applied exactly
+// as they are for a host. The handler tests call the handler directly and skip
+// that layer, so a schema that lost `confirm` -- or defaulted it to anything
+// but false -- would get past every one of them.
+describe("GHSA-6859-g3p8-jc93 over the real protocol", () => {
+  const originalFetch = globalThis.fetch;
+  let open: Client | undefined;
+
+  afterEach(async () => {
+    globalThis.fetch = originalFetch;
+    await open?.close();
+    open = undefined;
+  });
+
+  type CallResult = { isError?: boolean; content: Array<{ type: string; text: string }> };
+  const lockprobe = { apps: { http: { servers: { lockprobe: { listen: [":9595"], routes: [] } } } } };
+
+  it("refuses the advisory's PoC call -- a root path with no confirm -- and sends nothing to Caddy", async () => {
+    const sent: string[] = [];
+    globalThis.fetch = vi.fn(async (url: any, opts: any) => {
+      sent.push(`${opts?.method ?? "GET"} ${new URL(String(url)).pathname}`);
+      return new Response("{}", { status: 200 });
+    }) as any;
+    open = await connectedClient();
+
+    const res = (await open.callTool({
+      name: "caddy_config_set",
+      arguments: { path: "", value: lockprobe },
+    })) as CallResult;
+
+    expect(res.isError).toBe(true);
+    expect(res.content[0].text).toContain("ENTIRE config");
+    expect(res.content[0].text).toContain("confirm=true");
+    expect(sent).toEqual([]);
+  });
+
+  it("lets the same call through once confirm=true arrives over the wire, reading first and writing the canonical root", async () => {
+    // Proves confirm survives the schema as `true`, not only that its default
+    // is false: the handler reads the config, then PATCHes /config/ (the
+    // default mode, applied by zod), and reports the snapshot.
+    const sent: string[] = [];
+    globalThis.fetch = vi.fn(async (url: any, opts: any) => {
+      const method = opts?.method ?? "GET";
+      sent.push(`${method} ${new URL(String(url)).pathname}`);
+      return method === "GET"
+        ? new Response(JSON.stringify({ apps: { http: { servers: { srv0: { listen: [":8080"] } } } } }), {
+            status: 200,
+            headers: { "Content-Type": "application/json" },
+          })
+        : new Response(null, { status: 200 });
+    }) as any;
+    open = await connectedClient();
+
+    const res = (await open.callTool({
+      name: "caddy_config_set",
+      arguments: { path: "/config/...", value: lockprobe, confirm: true },
+    })) as CallResult;
+
+    expect(res.isError, res.content[0]?.text).toBeFalsy();
+    expect(sent).toEqual(["GET /config/", "PATCH /config/"]);
+    expect(res.content[0].text).toContain("Replaced the entire config");
+    expect(res.content[0].text).toContain("trigger=caddy_config_set");
   });
 });
 
