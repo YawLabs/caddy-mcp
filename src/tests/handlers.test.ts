@@ -1632,10 +1632,161 @@ describe("tool handler behavior", () => {
     let handler: (...args: any[]) => Promise<any>;
 
     beforeEach(async () => {
+      const { clearSnapshots } = await import("../snapshots.js");
+      clearSnapshots();
+      // A set or delete AT the identified object first reads the config's
+      // top-level "@id" (issue #60). Caddy answers `null` when there is none,
+      // which is the ordinary case every test below assumes unless it says
+      // otherwise.
+      api.configGet.mockResolvedValue(ok(null));
       const mockServer = { tool: vi.fn(), resource: vi.fn() };
       const { registerConfigTools } = await import("../tools/config.js");
       registerConfigTools(mockServer as any);
       handler = getToolHandler(mockServer, "caddy_config_by_id");
+    });
+
+    // Issue #60: Caddy accepts a top-level "@id" and indexes it at /config, so
+    // `/id/<that id>` is the config root -- PATCH and POST there replace the
+    // whole config, DELETE unloads it (verified against Caddy 2.11.4). That is
+    // the write caddy_config_set and caddy_config_delete gate, so it has to take
+    // their branch here too, rather than go out as an ungated /id/ request.
+    describe("an @id that names the config root", () => {
+      const prior = { "@id": "root", apps: { http: { servers: { srv0: { listen: [":80"] } } } } };
+      const replacement = { apps: { http: { servers: { lockprobe: { listen: [":9595"], routes: [] } } } } };
+      /** configGet answers the "@id" probe with `topId` and the snapshot read with `config`. */
+      function configIs(topId: unknown, config: unknown = prior) {
+        api.configGet.mockImplementation(async (p?: string) => (p === "@id" ? ok(topId) : ok(config)));
+      }
+
+      it("reads only the top-level @id, and only when the subpath stays at the object", async () => {
+        api.configByIdSet.mockResolvedValue(ok());
+
+        await handler({ id: "my-route", action: "set", value: {}, subpath: "", mode: "overwrite" });
+        expect(api.configGet).toHaveBeenCalledTimes(1);
+        expect(api.configGet).toHaveBeenCalledWith("@id");
+
+        vi.clearAllMocks();
+        await handler({ id: "my-route", action: "set", value: {}, subpath: "handle/0", mode: "overwrite" });
+        expect(api.configGet).not.toHaveBeenCalled();
+        expect(api.configByIdSet).toHaveBeenCalledWith("my-route", {}, "PATCH", "handle/0");
+      });
+
+      it.each([
+        "",
+        "...",
+        "/",
+        "/.../",
+      ])("refuses a set with subpath %o in every mode without confirm, naming the whole config and writing nothing", async (subpath) => {
+        configIs("root");
+        for (const mode of ["overwrite", "append", "insert"]) {
+          const result = await handler({ id: "root", action: "set", value: replacement, subpath, mode });
+          expect(result.isError, mode).toBe(true);
+          const text = result.content[0].text;
+          expect(text, mode).toContain("ENTIRE config");
+          expect(text, mode).toContain(`The @id "root" is the config's own top-level "@id"`);
+          expect(text, mode).toContain("localhost:2019");
+          expect(text, mode).toContain("CADDY_ADMIN_URL");
+          expect(text, mode).toContain("caddy_load");
+        }
+        expect(api.configByIdSet).not.toHaveBeenCalled();
+        expect(api.configPatch).not.toHaveBeenCalled();
+        expect(api.configPost).not.toHaveBeenCalled();
+        expect(api.configPut).not.toHaveBeenCalled();
+      });
+
+      it.each([
+        ["overwrite", "configPatch"],
+        ["append", "configPost"],
+        ["insert", "configPut"],
+      ] as const)("with confirm, mode %s takes the root branch: reads, writes the canonical root, snapshots, says so", async (mode, verb) => {
+        configIs("root");
+        api[verb].mockResolvedValue(ok());
+
+        const result = await handler({
+          id: "root",
+          action: "set",
+          value: replacement,
+          subpath: "",
+          mode,
+          confirm: true,
+        });
+
+        expect(result.isError, result.content[0].text).toBeFalsy();
+        // Sent to /config/ -- the same request /id/root resolves to, but under
+        // the cache key the snapshot read filled, so it carries If-Match.
+        expect(api[verb]).toHaveBeenCalledWith("", replacement);
+        expect(api.configByIdSet).not.toHaveBeenCalled();
+        const { listSnapshots } = await import("../snapshots.js");
+        const snaps = listSnapshots();
+        expect(snaps).toHaveLength(1);
+        expect(snaps[0].trigger).toBe("caddy_config_by_id");
+        expect(snaps[0].config).toEqual(prior);
+        expect(result.content[0].text).toContain("Replaced the entire config");
+        expect(result.content[0].text).toContain("trigger=caddy_config_by_id");
+      });
+
+      it("refuses a root-@id delete with the whole-config text, and with confirm unloads via the canonical root", async () => {
+        configIs("root");
+        api.configDelete.mockResolvedValue(ok({}));
+
+        const refused = await handler({ id: "root", action: "delete", subpath: "" });
+        expect(refused.isError).toBe(true);
+        expect(refused.content[0].text).toContain("Refusing to delete the ENTIRE config");
+        expect(refused.content[0].text).toContain(`The @id "root" is the config's own top-level "@id"`);
+        expect(api.configDelete).not.toHaveBeenCalled();
+        expect(api.configByIdDelete).not.toHaveBeenCalled();
+
+        const result = await handler({ id: "root", action: "delete", subpath: "...", confirm: true });
+        expect(result.isError, result.content[0].text).toBeFalsy();
+        expect(api.configDelete).toHaveBeenCalledWith("");
+        expect(api.configByIdDelete).not.toHaveBeenCalled();
+        expect(result.content[0].text).toContain("Unloaded the entire config");
+        const { listSnapshots } = await import("../snapshots.js");
+        expect(listSnapshots()[0]?.trigger).toBe("caddy_config_by_id");
+      });
+
+      it("treats a subpath inside a root @id as an ordinary write: no confirm, no snapshot", async () => {
+        // `/id/root/apps/http` is `/config/apps/http` -- a leaf.
+        configIs("root");
+        api.configByIdSet.mockResolvedValue(ok());
+
+        const result = await handler({ id: "root", action: "set", value: {}, subpath: "apps/http", mode: "overwrite" });
+
+        expect(result.isError).toBeFalsy();
+        expect(api.configByIdSet).toHaveBeenCalledWith("root", {}, "PATCH", "apps/http");
+        expect(api.configGet).not.toHaveBeenCalled();
+        const { listSnapshots } = await import("../snapshots.js");
+        expect(listSnapshots()).toHaveLength(0);
+      });
+
+      it("leaves an id that is not the top-level @id exactly as before", async () => {
+        configIs("some-other-id");
+        api.configByIdSet.mockResolvedValue(ok());
+        api.configByIdDelete.mockResolvedValue(ok());
+
+        await handler({ id: "my-route", action: "set", value: {}, subpath: "", mode: "overwrite" });
+        expect(api.configByIdSet).toHaveBeenCalledWith("my-route", {}, "PATCH", "");
+        await handler({ id: "my-route", action: "delete", subpath: "", confirm: true });
+        expect(api.configByIdDelete).toHaveBeenCalledWith("my-route", "");
+        expect(api.configPatch).not.toHaveBeenCalled();
+        expect(api.configDelete).not.toHaveBeenCalled();
+      });
+
+      it("writes nothing when the top-level @id cannot be read, and passes the error through", async () => {
+        // Caddy answers `null` for an absent key, even with no config loaded,
+        // so a failed read is a real failure: this client cannot tell whether
+        // the call would replace the whole config, so it does not send it.
+        api.configGet.mockResolvedValue(err(0, "Cannot connect to Caddy admin API at http://localhost:2019"));
+
+        const result = await handler({ id: "my-route", action: "set", value: {}, subpath: "", mode: "overwrite" });
+
+        expect(result.isError).toBe(true);
+        expect(result.content[0].text).toContain(`Could not read the config's top-level "@id"`);
+        expect(result.content[0].text).toContain("nothing was changed");
+        expect(result.content[0].text).toContain("Cannot connect to Caddy admin API");
+        expect(api.configByIdSet).not.toHaveBeenCalled();
+        expect(api.configPatch).not.toHaveBeenCalled();
+      });
     });
 
     it("calls configByIdGet for get action", async () => {

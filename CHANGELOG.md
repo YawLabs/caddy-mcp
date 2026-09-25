@@ -7,6 +7,29 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Security
+- **`caddy_config_by_id` no longer replaces or unloads the entire config ungated when its
+  `id` is the config's own top-level `@id`.** Fixes
+  [#60](https://github.com/YawLabs/caddy-mcp/issues/60), the sibling of
+  [GHSA-6859-g3p8-jc93](https://github.com/YawLabs/caddy-mcp/security/advisories/GHSA-6859-g3p8-jc93).
+  Caddy accepts a top-level `"@id"` and indexes it at `/config`, so `/id/<that id>` is the
+  config root: `PATCH` and `POST` there replace the whole config, `PUT` answers 409, and
+  `DELETE` unloads it, the `admin` block included (verified against Caddy 2.11.4, as was
+  `/id/<id>/...`, whose `...` Caddy strips before it picks a method). `set` had no
+  `confirm` gate at all, and neither action took a snapshot or said where the admin
+  endpoint went. A `set` or `delete` whose subpath leaves the request at the identified
+  object (empty, slashes only, or a lone `...`) now reads the config's top-level `@id`
+  first; when it matches, the call takes the same branch a root `caddy_config_set` or
+  `caddy_config_delete` does: refused without `confirm=true`, then read, sent to the
+  canonical `/config/` so it carries `If-Match`, snapshotted (trigger
+  `caddy_config_by_id`), and reported with the same admin-endpoint note. A failed read of
+  the top-level `@id` writes nothing, since Caddy answers `null` for an absent key even on
+  an instance with no config, so a failure means this client cannot tell whether the call
+  would replace the whole config. A subpath inside the root `@id` (e.g. `apps/http`) stays
+  an ordinary write, and an `id` that is not the top-level `@id` behaves exactly as
+  before, apart from the one small read. The root branches of the three tools are now one
+  shared implementation.
+
 ## [2.5.5] — 2026-09-25
 
 ### Security

@@ -254,6 +254,20 @@ describe("caddy-mcp tools", () => {
       expect(desc).not.toContain("safe and idempotent");
     });
 
+    it("caddy_config_by_id warns that a top-level @id names the whole config, before the fact", async () => {
+      // Issue #60: `/id/<the config's own top-level @id>` IS the config root.
+      // A caller has no way to know that from the refusal alone if it always
+      // sends confirm, so the description has to say it.
+      const regs = await getRegistrations();
+      const desc = regs.find((c) => c[0] === "caddy_config_by_id")?.[1] as string;
+      expect(desc).toContain("top-level '@id'");
+      expect(desc).toContain("ENTIRE config");
+      expect(desc).toContain("caddy_revert");
+      expect(desc).toContain("CADDY_ADMIN_URL");
+      const revert = regs.find((c) => c[0] === "caddy_revert")?.[1] as string;
+      expect(revert).toContain("caddy_config_by_id");
+    });
+
     it("caddy_config_delete names the '...' spelling of the root", async () => {
       const desc = (await getRegistrations()).find((c) => c[0] === "caddy_config_delete")?.[1] as string;
       expect(desc).toContain("'...'");

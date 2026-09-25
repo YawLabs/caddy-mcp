@@ -1175,6 +1175,92 @@ describe.skipIf(!RUN)("integration: live Caddy admin API", () => {
       expect(after.data).toEqual(replacement);
     });
 
+    // Issue #60, pinned live: Caddy accepts a top-level "@id" and resolves
+    // `/id/<it>` to the config root, so caddy_config_by_id there is a
+    // whole-config write. The tool must gate it, snapshot what it replaces or
+    // unloads, and hand caddy_revert something that loads back. A subpath inside
+    // it stays an ordinary write. Safe on the shared instance: no admin block.
+    it("caddy_config_by_id on a top-level @id gates, snapshots and reverts like a root write", async () => {
+      const known = {
+        "@id": "root",
+        apps: { http: { servers: { srv0: { listen: [":18890"], routes: [] } } } },
+      };
+      assertOk(await loadAndSettle(known), "loadConfig config with a top-level @id");
+      const before = await api.configGet();
+      assertOk(before, "configGet before");
+      const byId = getHandler(registerConfigTools, "caddy_config_by_id");
+      const revert = getHandler(registerConfigTools, "caddy_revert");
+      const { listSnapshots } = await import("../snapshots.js");
+      const replacement = { apps: { http: { servers: { srv1: { listen: [":18889"], routes: [] } } } } };
+
+      // No confirm: refused, and nothing changed.
+      const refused = await byId({
+        id: "root",
+        action: "set",
+        value: replacement,
+        subpath: "",
+        mode: "overwrite",
+        confirm: false,
+      });
+      expect(refused.isError).toBe(true);
+      expect(refused.content[0].text).toContain("ENTIRE config");
+      const unchanged = await api.configGet();
+      assertOk(unchanged, "configGet after the refusal");
+      expect(unchanged.data).toEqual(before.data);
+
+      // A subpath inside it is a leaf: no confirm needed.
+      const leaf = await byId({
+        id: "root",
+        action: "set",
+        value: [":18888"],
+        subpath: "apps/http/servers/srv0/listen",
+        mode: "overwrite",
+        confirm: false,
+      });
+      expect(leaf.isError, leaf.content?.[0]?.text).toBeFalsy();
+      await waitForAdmin();
+      const edited = await api.configGet();
+      assertOk(edited, "configGet after the leaf write");
+
+      // Confirmed: replaced, snapshotted, and revertible.
+      const ringBefore = listSnapshots().length;
+      const set = await byId({
+        id: "root",
+        action: "set",
+        value: replacement,
+        subpath: "",
+        mode: "overwrite",
+        confirm: true,
+      });
+      expect(set.isError, set.content?.[0]?.text).toBeFalsy();
+      expect(set.content[0].text).toContain("Replaced the entire config");
+      await waitForAdmin();
+      const replaced = await api.configGet();
+      assertOk(replaced, "configGet after the root @id set");
+      expect(replaced.data).toEqual(replacement);
+      expect(listSnapshots()).toHaveLength(ringBefore + 1);
+      expect(listSnapshots()[0].trigger).toBe("caddy_config_by_id");
+      expect(listSnapshots()[0].config).toEqual(edited.data);
+
+      const restored = await revert({ action: "apply", index: 0, confirm: true });
+      expect(restored.isError, restored.content?.[0]?.text).toBeFalsy();
+      await waitForAdmin();
+      const back = await api.configGet();
+      assertOk(back, "configGet after the revert");
+      expect(back.data).toEqual(edited.data);
+
+      // Delete through the root @id: unloaded, snapshotted.
+      const del = await byId({ id: "root", action: "delete", subpath: "", mode: "overwrite", confirm: true });
+      expect(del.isError, del.content?.[0]?.text).toBeFalsy();
+      expect(del.content[0].text).toContain("Unloaded the entire config");
+      await waitForAdmin();
+      const unloaded = await api.configGet();
+      assertOk(unloaded, "configGet after the root @id delete");
+      expect(unloaded.data).toBeNull();
+      expect(listSnapshots()[0].trigger).toBe("caddy_config_by_id");
+      expect(listSnapshots()[0].config).toEqual(edited.data);
+    });
+
     // The two sequences the description and refusal spell out. A root DELETE
     // removes Caddy's "config" key itself (admin.go:1304), which flips both
     // verbs: 'insert' (PUT) answers 409 while the key exists -- including on an
