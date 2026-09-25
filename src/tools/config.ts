@@ -1,36 +1,100 @@
 import type { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { z } from "zod";
+import type { ApiResponse } from "../api.js";
 import * as api from "../api.js";
 import { formatResult } from "../format.js";
 import { getSnapshot, isSnapshotableConfig, listSnapshots, saveSnapshot } from "../snapshots.js";
 
+// Whether a path addresses the config ROOT is decided by api.isRootConfigPath,
+// which runs the SAME normalization the request functions do. It used to be a
+// private copy of that regex here, with a note that the two had to stay in
+// step -- and they did not: Caddy strips a trailing "..." segment before it
+// picks a method, so "..." reached Caddy as the root while the copy here called
+// it a leaf, and a root unload went through caddy_config_delete's leaf branch
+// with no snapshot and no warning. One predicate, one place to be wrong.
+
 /**
- * Does this path address the config ROOT -- i.e. the whole configuration?
+ * The `admin.listen` a config supplies, when it supplies one worth reporting.
  *
- * "", "/", "config" and "/config/" all normalize to the same request,
- * `DELETE /config/`, which is Caddy's documented "unload the entire current
- * configuration". The first replace is a copy of api.ts's normalizePath (it is
- * module-private there, so it cannot be imported); the test then accepts an
- * all-slashes remainder because "//", "config//" and "/config//" are still the
- * user asking for the root.
- *
- * That tolerance is why the root branch below sends the CANONICAL empty path
- * instead of the caller's spelling. api.ts would encode "//" to `/config//`,
- * and Caddy's admin endpoint is a plain `http.ServeMux` with the config route
- * registered at "/config/" (admin.go:222 and :263 at v2.11.4), so Go answers
- * that spelling with a redirect to /config/ rather than dispatching to
- * handleConfig. On the default transport `fetch` follows the redirect and the
- * unload still happens -- but the ETag this tool cached under "/config/" is
- * never found for "/config//", so the DELETE would go out with no `If-Match`
- * and silently lose the guarantee documented at the read below; over a unix
- * socket node:http does not follow redirects at all, so it would just fail.
- *
- * The two regexes MUST stay in step with api.ts: a path this predicate calls a
- * leaf but api.ts sends to the root would take the unloads-everything branch of
- * Caddy with the leaf branch of this tool -- no warning, no snapshot.
+ * Only a NON-EMPTY string counts. Caddy substitutes DefaultAdminListen for an
+ * absent or empty Listen (admin.go:398-402 and :1391-1398 at v2.11.4), so the
+ * near-universal `{"admin":{"config":{"persist":false}}}`, and a block carrying
+ * only origins / enforce_origin / identity / remote, bind to the same address a
+ * config with no admin key does: nothing to report. Anything that is not a
+ * config object -- Caddy answers a config-less instance with a literal `null`,
+ * and a caller may hand caddy_config_set any JSON value -- yields undefined.
  */
-function isRootConfigPath(path: string): boolean {
-  return /^\/*$/.test(path.replace(/^\/?(config(\/|$))?/, ""));
+function adminListenOf(config: unknown): string | undefined {
+  if (!isSnapshotableConfig(config)) return undefined;
+  const adm = config.admin;
+  if (adm === null || typeof adm !== "object" || Array.isArray(adm)) return undefined;
+  const listen = (adm as { listen?: unknown }).listen;
+  return typeof listen === "string" && listen !== "" ? listen : undefined;
+}
+
+/** Does the config disable Caddy's admin endpoint outright (`admin.disabled: true`)? */
+function adminDisabledIn(config: unknown): boolean {
+  if (!isSnapshotableConfig(config)) return false;
+  const adm = config.admin;
+  return (
+    adm !== null && typeof adm === "object" && !Array.isArray(adm) && (adm as { disabled?: unknown }).disabled === true
+  );
+}
+
+/**
+ * What a whole-config change says about the snapshot it did or did not take.
+ * Shared by the root branches of caddy_config_delete and caddy_config_set so
+ * the two report the same three outcomes in the same words.
+ *
+ * Keep the two "nothing was captured" reasons apart, the way caddy_revert does.
+ * A 200 carrying a body that is not a JSON object (Caddy answers a config-less
+ * instance with a literal `null`) is not a read FAILURE, and calling it one
+ * would send the operator after a connectivity problem that does not exist.
+ */
+function priorConfigNote(kept: boolean, current: ApiResponse, trigger: string): string {
+  if (kept) {
+    return ` The prior config was saved as snapshot [0] (trigger=${trigger}): caddy_revert { action: "apply", index: 0, confirm: true } restores it.`;
+  }
+  return current.ok
+    ? " Warning: the prior config was empty or not a JSON object, so no snapshot was captured -- there was nothing to restore."
+    : " Warning: the prior config could not be read, so no snapshot was captured and this change cannot be reverted.";
+}
+
+/**
+ * What a whole-config write did to Caddy's admin endpoint, as far as this
+ * client can tell. Empty when nothing can have moved.
+ *
+ * Unlike a root delete, a root caddy_config_set holds BOTH sides: the replaced
+ * config (when it was readable) and the value that replaced it. The endpoint
+ * moves when the two resolve to different addresses, in either direction -- a
+ * new config that ADDS an admin.listen moves it away from the address
+ * CADDY_ADMIN_URL was pointed at just as surely as one that drops it. And a
+ * value with `admin.disabled` leaves no endpoint at all: Caddy stops the old
+ * listener and returns before binding a new one (admin.go:383-408 at v2.11.4).
+ * `disabled` is a plain bool, so that case is stated flatly; the address cases
+ * stay hedged for the reasons the delete branch gives -- $CADDY_ADMIN lives in
+ * Caddy's environment, and a listen of "{env.X}" can expand to empty and mean
+ * the default too.
+ */
+function rootWriteAdminNote(current: ApiResponse, value: unknown): string {
+  if (adminDisabledIn(value)) {
+    return " The new config sets admin.disabled, so Caddy no longer answers on ANY admin address: neither this server nor caddy_revert can reach it until Caddy is restarted with a config that does not disable the admin endpoint.";
+  }
+  const adminUrl = process.env.CADDY_ADMIN_URL || "http://localhost:2019";
+  const before = current.ok ? adminListenOf(current.data) : undefined;
+  const after = adminListenOf(value);
+  if (before !== undefined && after !== before) {
+    return (
+      ` The replaced config set admin.listen to "${before}"` +
+      (after !== undefined ? ` and the new one sets it to "${after}".` : " and the new one sets none.") +
+      ` Unless those resolve to the same address, the admin endpoint has moved (to the new value, or back to the default: ` +
+      `localhost:2019 unless $CADDY_ADMIN is set in Caddy's environment) and CADDY_ADMIN_URL (${adminUrl}) may no longer reach it.`
+    );
+  }
+  if (before === undefined && after !== undefined) {
+    return ` The new config sets admin.listen to "${after}". If that is not the address Caddy was already on, the admin endpoint has moved there and CADDY_ADMIN_URL (${adminUrl}) may no longer reach it.`;
+  }
+  return "";
 }
 
 export function registerConfigTools(server: McpServer) {
@@ -44,7 +108,8 @@ export function registerConfigTools(server: McpServer) {
 
   server.tool(
     "caddy_config_set",
-    "Write config at a JSON path. Mode 'overwrite' (default) replaces existing values (PATCH) — safe and idempotent. Mode 'append' (POST) adds to an array — NOT idempotent: calling twice with the same route duplicates it — but on a non-array key it REPLACES whatever is there, and it cannot create missing parent objects. Mode 'insert' (PUT) inserts at an array index (useful for route ordering), or strictly creates an object key together with any missing parents and fails with 409 if the key already exists — the safe way to create a server or app, including on an instance with no config at all.",
+    "Write config at a JSON path. Mode 'overwrite' (default) replaces the value at the path (PATCH) — idempotent, but it replaces the WHOLE subtree there: writing [] to '.../routes' drops every route. Mode 'append' (POST) adds to an array — NOT idempotent: calling twice with the same route duplicates it — but on a non-array key it REPLACES whatever is there, and it cannot create missing parent objects. Mode 'insert' (PUT) inserts at an array index (useful for route ordering), or strictly creates an object key together with any missing parents and fails with 409 if the key already exists — the safe way to create a server or app, including on an instance with no config at all. " +
+      "Any path that addresses the config ROOT ('', '/', 'config', '/config/', a slash-only variant, or any of those followed by a lone '...' segment) addresses the ENTIRE config and requires confirm=true: 'overwrite' and 'append' there REPLACE the whole configuration with `value` — Caddy runs it exactly as caddy_load would — so every app, server and route not in `value` is discarded, and so is the 'admin' block unless `value` carries one. Caddy then re-binds its admin endpoint to the new config's admin.listen, or to its default address (localhost:2019, or $CADDY_ADMIN in Caddy's environment) when it sets none, or to no address at all when it sets admin.disabled; if CADDY_ADMIN_URL points anywhere else, neither this server nor caddy_revert can reach Caddy afterwards. A root write is snapshotted first, so caddy_revert can restore it while Caddy is still reachable; no other path is snapshotted. 'insert' at the root only succeeds after a root caddy_config_delete (Caddy answers 409 on any other instance, including one started with no config). To replace the whole config deliberately, caddy_load does the same thing behind the same gate and also accepts a Caddyfile.",
     {
       path: z.string().describe("Config path to write to (e.g., 'apps/http/servers/srv0/routes')"),
       value: z.any().describe("The JSON value to set at the path"),
@@ -55,23 +120,113 @@ export function registerConfigTools(server: McpServer) {
         .describe(
           "'overwrite' = PATCH (replace existing, default, idempotent; 404 if the key does not exist), 'append' = POST (appends to arrays, NOT idempotent; REPLACES an existing non-array key; cannot create missing parents), 'insert' = PUT (inserts at an array index, or strictly creates an object key and any missing parents; 409 if the key exists)",
         ),
+      confirm: z
+        .boolean()
+        .optional()
+        .default(false)
+        .describe(
+          "Must be true when `path` addresses the config root ('', '/', 'config', '/config/', slash-only variants, or a lone '...' segment): that write replaces the ENTIRE config (safety). Ignored for every other path.",
+        ),
     },
-    { readOnlyHint: false, destructiveHint: false, idempotentHint: false, openWorldHint: false },
-    async ({ path, value, mode }) => {
-      const res =
+    // destructiveHint is TRUE because the hint covers the whole tool and a host
+    // gates on it before it can see the path or the mode: the default mode is a
+    // PATCH that replaces whatever subtree the path names -- a route list, a
+    // server, all of `apps` -- and at the root it replaces the entire config
+    // (below). MCP defines destructiveHint:false as "only additive updates".
+    // Appending to an array or strictly creating a key is additive; the
+    // default mode is not, and neither is 'append' on a non-array key, which
+    // replaces it. idempotentHint stays false for 'append', which is a POST: a
+    // repeated call appends a second copy.
+    { readOnlyHint: false, destructiveHint: true, idempotentHint: false, openWorldHint: false },
+    async ({ path, value, mode, confirm }) => {
+      // A root path is a different operation wearing the same tool. Caddy never
+      // distinguishes the root from a leaf: PATCH and POST at `/config/` set
+      // `rawCfg["config"]` to the body (admin.go:1279 and :1296 at v2.11.4) and
+      // run it -- the same full replace as `POST /load`, minus caddy_load's
+      // confirm gate and snapshot. It takes the 'admin' block with it unless the
+      // new value carries one, after which Caddy re-binds its admin endpoint to
+      // the new config's admin.listen or to DefaultAdminListen (admin.go:398-402
+      // and :411). Verified against Caddy 2.11.4: `PATCH /config/` with a value
+      // lacking an admin block replaced every server and moved the admin
+      // endpoint back to the default address, on which this server -- still
+      // pointed at the old one -- could no longer reach it. So this branch has to
+      // (a) say that before the fact and (b) leave something to revert to.
+      const write = (p: string) =>
         mode === "overwrite"
-          ? await api.configPatch(path, value)
+          ? api.configPatch(p, value)
           : mode === "insert"
-            ? await api.configPut(path, value)
-            : await api.configPost(path, value);
-      return formatResult(res);
+            ? api.configPut(p, value)
+            : api.configPost(p, value);
+      if (!api.isRootConfigPath(path)) return formatResult(await write(path));
+
+      if (!confirm) {
+        return {
+          isError: true,
+          content: [
+            {
+              type: "text" as const,
+              text:
+                `Refusing to write the ENTIRE config without confirm=true. The path "${path}" addresses the config root, so this ` +
+                `call REPLACES the whole configuration with \`value\` ('overwrite' and 'append' both do; Caddy runs it exactly as ` +
+                `caddy_load would, and 'insert' only succeeds after a root caddy_config_delete, 409 otherwise): every app, server and ` +
+                `route not in \`value\` is discarded, and so is the 'admin' block unless \`value\` carries one. Caddy then re-binds its ` +
+                `admin endpoint to the new config's admin.listen, or to its default address (localhost:2019, or $CADDY_ADMIN in ` +
+                `Caddy's environment) when it sets none, or to no address at all when it sets admin.disabled; and if ` +
+                `CADDY_ADMIN_URL points anywhere else neither this server nor ` +
+                `caddy_revert can reach Caddy afterwards. The current config is snapshotted first, so caddy_revert can restore it ` +
+                `while Caddy is still reachable. To change one part of the config, pass its path instead (e.g. ` +
+                `'apps/http/servers/srv0'); to replace all of it deliberately, caddy_load does the same behind the same gate. ` +
+                `Re-run with confirm:true to proceed.`,
+            },
+          ],
+        };
+      }
+
+      // Same pattern as the root branch of caddy_config_delete, and for the
+      // same reasons (see there): read first, so the write carries the If-Match
+      // for exactly the config being snapshotted; send the CANONICAL "" rather
+      // than the caller's spelling, so the request hits the same cache key the
+      // read filled and never the `/config//` redirect; and defer the snapshot
+      // push until the write has come back, keeping it only for a success or a
+      // deadline that fired -- Caddy goes on applying a config change after the
+      // client hangs up, and a timed-out change is never replayed.
+      const current = await api.configGet();
+      const res = await write("");
+      const kept = (res.ok || res.outcomeUnknown === true) && current.ok && isSnapshotableConfig(current.data);
+      if (kept) saveSnapshot(current.data, "caddy_config_set");
+      // Computed once, from the same evidence, for both the success message and
+      // the timed-out one below -- so the two can never make different claims
+      // about where the admin endpoint went.
+      const adminNote = rootWriteAdminNote(current, value);
+      if (!res.ok) {
+        if (res.outcomeUnknown && kept) {
+          return formatResult({
+            ...res,
+            error:
+              `${res.error}\nThe pre-write config was kept anyway, as snapshot [0] (trigger=caddy_config_set): if this write ` +
+              `did apply, caddy_revert { action: "apply", index: 0, confirm: true } restores what it replaced, as long as ` +
+              `this server can still reach Caddy's admin endpoint.${adminNote ? ` If the write applied:${adminNote}` : ""} If ` +
+              `it did not apply, that snapshot is simply the config read just before it was sent.`,
+          });
+        }
+        return formatResult(res);
+      }
+      const note = priorConfigNote(kept, current, "caddy_config_set");
+      return {
+        content: [
+          {
+            type: "text" as const,
+            text: `Replaced the entire config (every app and server, and the 'admin' block).${note}${adminNote}`,
+          },
+        ],
+      };
     },
   );
 
   server.tool(
     "caddy_config_delete",
     "Delete config at a JSON path. Removes the config node at the specified path. Deleting a parent node also deletes every descendant -- e.g. deleting 'apps/http/servers/srv0' removes that server and all of its routes. Requires confirm=true. " +
-      "Any path that addresses the config ROOT ('', '/', 'config', '/config/', and slash-only variants of those) addresses the ENTIRE config and unloads it: every app and server goes, and so does the 'admin' block, after which Caddy re-binds its admin endpoint to its default address " +
+      "Any path that addresses the config ROOT ('', '/', 'config', '/config/', slash-only variants of those, or any of those followed by a lone '...' segment) addresses the ENTIRE config and unloads it: every app and server goes, and so does the 'admin' block, after which Caddy re-binds its admin endpoint to its default address " +
       "(localhost:2019, or $CADDY_ADMIN in Caddy's environment). If CADDY_ADMIN_URL points anywhere else, neither this server nor caddy_revert can reach Caddy afterwards. A root delete is snapshotted first, so caddy_revert can " +
       "restore it while Caddy is still reachable; no other path is snapshotted. To REPLACE the config rather than unload it, use caddy_load.",
     {
@@ -88,8 +243,10 @@ export function registerConfigTools(server: McpServer) {
     // array after a delete, so repeating that call removes a DIFFERENT route each
     // time. caddy_remove_route carries the same correction for the byte-identical
     // underlying request; the two must agree. Nothing here is auto-recoverable
-    // either: apart from a root delete (below), only caddy_load captures a
-    // snapshot, so a spurious repeat cannot be undone with caddy_revert.
+    // either: apart from a root delete (below), only whole-config changes
+    // capture a snapshot -- caddy_load, a caddy_revert apply, and a root
+    // caddy_config_set -- so a spurious repeat cannot be undone with
+    // caddy_revert.
     { readOnlyHint: false, destructiveHint: true, idempotentHint: false, openWorldHint: false },
     async ({ path, confirm }) => {
       // A root path is a different operation wearing the same tool: Caddy deletes
@@ -100,7 +257,7 @@ export function registerConfigTools(server: McpServer) {
       // on an instance whose config set admin.listen, the configured port closed
       // and the admin API answered on the default address instead. So this branch
       // has to (a) say that before the fact and (b) leave something to revert to.
-      const root = isRootConfigPath(path);
+      const root = api.isRootConfigPath(path);
       if (!confirm) {
         return {
           isError: true,
@@ -162,25 +319,13 @@ export function registerConfigTools(server: McpServer) {
         }
         return formatResult(res);
       }
-      // Say what was saved, or why nothing was -- and keep the two reasons apart
-      // the way caddy_revert does. A 200 carrying a body that is not a JSON object
-      // (Caddy answers a config-less instance with a literal `null`) is not a read
-      // FAILURE, and calling it one would send the operator after a connectivity
-      // problem that does not exist.
-      const note = kept
-        ? ` The prior config was saved as snapshot [0] (trigger=caddy_config_delete): caddy_revert { action: "apply", index: 0, confirm: true } restores it.`
-        : current.ok
-          ? " Warning: the prior config was empty or not a JSON object, so no snapshot was captured -- there was nothing to restore."
-          : " Warning: the prior config could not be read, so no snapshot was captured and this unload cannot be reverted.";
+      // Say what was saved, or why nothing was (priorConfigNote keeps the two
+      // "nothing" reasons apart).
+      const note = priorConfigNote(kept, current, "caddy_config_delete");
       // The admin endpoint only MOVES when the unloaded block supplied a `listen`
       // that differs from DefaultAdminListen -- NOT on the mere presence of an
-      // 'admin' key. Caddy substitutes DefaultAdminListen for an empty Listen on
-      // both sides of the delete (admin.go:411 + :1391-1398 before it, :398-402
-      // after), so the very common `{"admin":{"config":{"persist":false}}}`, and
-      // an admin block carrying only origins / enforce_origin / identity /
-      // remote, re-bind to the address they were already on: nothing moves, and
-      // saying it did would send the operator looking for an endpoint that never
-      // changed. `kept` is what makes current.data readable as a config object.
+      // 'admin' key (adminListenOf spells out why). `kept` is what makes
+      // current.data readable as a config object.
       //
       // The message stays hedged because this client cannot resolve the two
       // things that decide it: $CADDY_ADMIN lives in Caddy's environment, not
@@ -188,13 +333,9 @@ export function registerConfigTools(server: McpServer) {
       // (admin.go:1392-1398), so "{env.X}" can expand to empty and mean the
       // default too. A literal "localhost:2019" is the default and does not move
       // either. One sentence has to cover all of them.
-      const adm = kept ? (current.data as Record<string, unknown>).admin : undefined;
-      const listen =
-        adm !== null && typeof adm === "object" && !Array.isArray(adm)
-          ? (adm as { listen?: unknown }).listen
-          : undefined;
+      const listen = kept ? adminListenOf(current.data) : undefined;
       const adminNote =
-        typeof listen === "string" && listen !== ""
+        listen !== undefined
           ? ` The unloaded config set admin.listen to "${listen}". If that was not already Caddy's default admin address, the endpoint has moved back to the default (localhost:2019, unless $CADDY_ADMIN is set in Caddy's environment) and CADDY_ADMIN_URL (${process.env.CADDY_ADMIN_URL || "http://localhost:2019"}) may no longer reach it.`
           : "";
       return {
@@ -285,7 +426,7 @@ export function registerConfigTools(server: McpServer) {
   server.tool(
     "caddy_revert",
     "Manage config snapshots for rollback. Snapshots are auto-captured before caddy_load, and before a caddy_config_delete " +
-      "that unloads the whole config (an empty path); no other delete is snapshotted. Last 10. " +
+      "or caddy_config_set at the config root (any path that addresses the whole config); no other delete or set is snapshotted. Last 10. " +
       "By default they live in memory only and are LOST when this server restarts -- set CADDY_MCP_SNAPSHOT_DIR " +
       "to a writable directory to persist them across restarts (they contain full Caddy configs, so pick the location deliberately). " +
       "Actions: 'list' shows snapshots with timestamps, 'save' manually captures the current config, 'apply' restores a snapshot (requires confirm=true).",

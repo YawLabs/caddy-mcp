@@ -932,6 +932,100 @@ describe("api", () => {
       expect(res.ok).toBe(true);
     });
 
+    it("rejects a '.' segment before encoding, so fetch cannot collapse it onto the parent", async () => {
+      // The WHATWG URL parser behind fetch resolves dot segments before the
+      // request leaves: "apps/." would be sent as `/config/apps/`, and "." on
+      // its own as `/config/` -- the root, past any root check a tool ran on
+      // the spelling it was handed. Verified against Caddy 2.11.4:
+      // `PATCH /config/.` replaced the whole config. Over a unix socket the path
+      // goes out verbatim and Go's ServeMux answers with a redirect node:http
+      // does not follow. Neither is a key, so the segment is refused up front.
+      const api = await import("../api.js");
+      let called = 0;
+      globalThis.fetch = vi.fn(async () => {
+        called++;
+        return new Response("{}", { status: 200 });
+      }) as any;
+
+      for (const path of [".", "./", "/.", "config/.", "apps/.", "apps/./http", "./apps"]) {
+        const res = await api.configPatch(path, {});
+        expect(res.ok, path).toBe(false);
+        expect(res.error, path).toContain("'.' and '..' segments are not allowed");
+      }
+      expect((await api.configByIdSet("my-route", {}, "PATCH", ".")).ok).toBe(false);
+      expect((await api.configByIdDelete("my-route", "handle/.")).ok).toBe(false);
+      expect(called).toBe(0);
+
+      // A key CONTAINING a dot is not a dot segment, and neither is the "..."
+      // bulk-append spelling, which has to reach Caddy (see the encoding tests).
+      expect((await api.configGet("apps/http/servers/my.site")).ok).toBe(true);
+      expect((await api.configPost("apps/http/servers/srv0/routes/...", [{}])).ok).toBe(true);
+      expect(called).toBe(2);
+    });
+  });
+
+  describe("isRootConfigPath", () => {
+    // Every spelling that lands on Caddy's whole-config branch. The "..." family
+    // is there because Caddy strips a trailing "..." segment BEFORE it switches
+    // on the method (admin.go:1196-1199 at v2.11.4), so `/config/...` is
+    // `/config/` for PATCH, POST, PUT and DELETE alike -- verified live: PATCH
+    // and POST `/config/...` with an object body replaced the whole config, and
+    // DELETE `/config/...` unloaded it. The slash-only tails are root because
+    // normalizePath eats exactly one leading "/" and one "config/", and what is
+    // left is still the caller asking for the root.
+    it("accepts every spelling that reaches Caddy's whole-config branch", async () => {
+      const api = await import("../api.js");
+      const rootPaths = [
+        "",
+        "/",
+        "config",
+        "config/",
+        "/config",
+        "/config/",
+        "//",
+        "///",
+        "config//",
+        "/config//",
+        "...",
+        "/...",
+        "config/...",
+        "/config/...",
+        "/config/.../",
+        ".../",
+        "//...",
+        "///...",
+        "config//...",
+      ];
+      for (const path of rootPaths) expect(api.isRootConfigPath(path), JSON.stringify(path)).toBe(true);
+    });
+
+    it("calls everything else a leaf, including a '...' that is not alone", async () => {
+      const api = await import("../api.js");
+      // Caddy strips only ONE trailing "...": ".../..." writes a key literally
+      // named "...". A "." segment is a leaf here and is refused by
+      // rejectTraversal before it can reach the wire. "config2" and "configs"
+      // are keys that merely start with the prefix normalizePath strips.
+      const leaves = [
+        "apps",
+        "apps/",
+        "/apps",
+        "config/apps",
+        "/config/apps/",
+        "apps/http/servers/srv0/routes/...",
+        ".../...",
+        "....",
+        "..../",
+        ".",
+        "./",
+        "..",
+        "config/.",
+        "config2",
+        "configs",
+        "@id",
+      ];
+      for (const path of leaves) expect(api.isRootConfigPath(path), JSON.stringify(path)).toBe(false);
+    });
+
     it("rejects .. in configByIdGet id without hitting fetch", async () => {
       const api = await import("../api.js");
       let called = 0;

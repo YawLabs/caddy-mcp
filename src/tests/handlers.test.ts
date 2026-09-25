@@ -31,6 +31,10 @@ vi.mock("../api.js", async (importOriginal) => {
     configByIdDelete: vi.fn(),
     getMetrics: vi.fn(),
     isMissingConfigPath: actual.isMissingConfigPath,
+    // Same reasoning: the root predicate is what decides whether a write or a
+    // delete takes the whole-config branch, and a stub here would let the
+    // handler tests pass against a spelling the production predicate misses.
+    isRootConfigPath: actual.isRootConfigPath,
   };
 });
 
@@ -946,6 +950,8 @@ describe("tool handler behavior", () => {
     let handler: (...args: any[]) => Promise<any>;
 
     beforeEach(async () => {
+      const { clearSnapshots } = await import("../snapshots.js");
+      clearSnapshots();
       const mockServer = { tool: vi.fn(), resource: vi.fn() };
       const { registerConfigTools } = await import("../tools/config.js");
       registerConfigTools(mockServer as any);
@@ -978,6 +984,367 @@ describe("tool handler behavior", () => {
       expect(api.configPost).not.toHaveBeenCalled();
       expect(result.isError).toBeFalsy();
       expect(result.content[0].text).toBeDefined();
+    });
+
+    it("leaves a non-root write exactly as it was: no confirm, no pre-read, no snapshot", async () => {
+      // The gate and the snapshot are for the whole-config case only. One
+      // snapshot per leaf write would evict the caddy_load rollback targets the
+      // 10-deep ring exists for, and a confirm on every write would train
+      // callers to always send it.
+      api.configPatch.mockResolvedValue(ok());
+      const result = await handler({ path: "apps/http/servers/srv0", value: { listen: [":80"] }, mode: "overwrite" });
+      expect(result.isError).toBeFalsy();
+      expect(api.configPatch).toHaveBeenCalledWith("apps/http/servers/srv0", { listen: [":80"] });
+      expect(api.configGet).not.toHaveBeenCalled();
+      const { listSnapshots } = await import("../snapshots.js");
+      expect(listSnapshots()).toHaveLength(0);
+      // ...and a "..." bulk-append under a real array is still a leaf.
+      api.configPost.mockResolvedValue(ok());
+      await handler({ path: "apps/http/servers/srv0/routes/...", value: [{}], mode: "append" });
+      expect(api.configPost).toHaveBeenCalledWith("apps/http/servers/srv0/routes/...", [{}]);
+      expect(api.configGet).not.toHaveBeenCalled();
+    });
+
+    it("ignores confirm=true on a leaf path, as the schema promises", async () => {
+      // A caller that sends confirm on every write must not turn a leaf write
+      // into a root one: the caller's path goes out unchanged, with no pre-read
+      // and no snapshot.
+      api.configPatch.mockResolvedValue(ok());
+      const result = await handler({
+        path: "apps/http/servers/srv0",
+        value: { listen: [":80"] },
+        mode: "overwrite",
+        confirm: true,
+      });
+      expect(result.isError).toBeFalsy();
+      expect(api.configPatch).toHaveBeenCalledWith("apps/http/servers/srv0", { listen: [":80"] });
+      expect(api.configPatch).not.toHaveBeenCalledWith("", expect.anything());
+      expect(api.configGet).not.toHaveBeenCalled();
+      const { listSnapshots } = await import("../snapshots.js");
+      expect(listSnapshots()).toHaveLength(0);
+      expect(result.content[0].text).not.toContain("Replaced the entire config");
+    });
+
+    // GHSA-6859-g3p8-jc93. A root path is PATCH or POST /config/ -- Caddy sets
+    // the whole config to the body and runs it, exactly as caddy_load does, but
+    // this tool used to do it with no confirm, no snapshot, destructiveHint:false
+    // and a description that called the default mode "safe". It takes the admin
+    // block with it unless the value carries one, so Caddy re-binds the admin
+    // endpoint to the new config's admin.listen or its default address, and a
+    // CADDY_ADMIN_URL pointing at the old one stops working -- with nothing to
+    // revert to. Verified against Caddy 2.11.4.
+    describe("a path that addresses the whole config", () => {
+      // Every spelling api.isRootConfigPath accepts (its own tests pin the
+      // list); the "..." family is here because Caddy strips a lone trailing
+      // "..." before it picks a method, so `/config/...` IS `/config/`.
+      const rootPaths = [
+        "",
+        "/",
+        "config",
+        "/config/",
+        "//",
+        "config//",
+        "...",
+        "/...",
+        "config/...",
+        "/config/.../",
+        "//...",
+      ];
+      const modes = ["overwrite", "append", "insert"] as const;
+      const verb = { overwrite: "configPatch", append: "configPost", insert: "configPut" } as const;
+
+      it.each(
+        rootPaths,
+      )("refuses path %o in every mode without confirm=true, naming the whole config", async (path) => {
+        for (const mode of modes) {
+          const result = await handler({ path, value: { apps: {} }, mode });
+          expect(result.isError, mode).toBe(true);
+          const text = result.content[0].text;
+          expect(text, mode).toContain("ENTIRE config");
+          expect(text, mode).toContain("confirm=true");
+          // The consequence the old tool never mentioned: the admin endpoint moves.
+          expect(text, mode).toContain("admin");
+          expect(text, mode).toContain("localhost:2019");
+          expect(text, mode).toContain("CADDY_ADMIN_URL");
+          // And the deliberate way to do a whole-config replace.
+          expect(text, mode).toContain("caddy_load");
+        }
+        expect(api.configPatch).not.toHaveBeenCalled();
+        expect(api.configPost).not.toHaveBeenCalled();
+        expect(api.configPut).not.toHaveBeenCalled();
+        expect(api.configGet).not.toHaveBeenCalled();
+      });
+
+      it.each(
+        modes,
+      )("with confirm, mode %s reads first, sends the CANONICAL root path, snapshots, and says so", async (mode) => {
+        const prior = {
+          admin: { config: { persist: false } },
+          apps: { http: { servers: { srv0: { listen: [":80"] } } } },
+        };
+        const value = { apps: { http: { servers: { lockprobe: { listen: [":9595"], routes: [] } } } } };
+        api.configGet.mockResolvedValue(ok(prior));
+        api[verb[mode]].mockResolvedValue(ok());
+
+        const result = await handler({ path: "/config/...", value, mode, confirm: true });
+
+        expect(result.isError, result.content[0].text).toBeFalsy();
+        // The caller's spelling would be encoded to `/config/...` -- not the
+        // key the preceding GET cached its ETag under, so the write would go
+        // out with no If-Match. Canonical "" hits the same key.
+        expect(api[verb[mode]]).toHaveBeenCalledWith("", value);
+        // Read first: the GET refreshes that ETag, so the write carries
+        // If-Match for exactly the config being snapshotted.
+        expect(api.configGet.mock.invocationCallOrder[0]).toBeLessThan(api[verb[mode]].mock.invocationCallOrder[0]);
+        const { listSnapshots } = await import("../snapshots.js");
+        const snaps = listSnapshots();
+        expect(snaps).toHaveLength(1);
+        expect(snaps[0].trigger).toBe("caddy_config_set");
+        expect(snaps[0].config).toEqual(prior);
+        expect(result.content[0].text).toContain("Replaced the entire config");
+        expect(result.content[0].text).toContain("snapshot [0]");
+        expect(result.content[0].text).toContain("caddy_revert");
+        // An admin block with no `listen` on the old side and none on the new
+        // side: Caddy binds the default address both times, nothing moves.
+        expect(result.content[0].text).not.toContain("admin.listen");
+      });
+
+      it("does NOT snapshot when the write fails, and passes Caddy's body through", async () => {
+        // A failed write changed nothing server-side; a snapshot for it would
+        // burn a slot in the ring. PUT at the root is the usual failure: Caddy
+        // answers 409 whenever the "config" key exists, which is every instance
+        // except one root-deleted since it started.
+        api.configGet.mockResolvedValue(ok({ apps: {} }));
+        api.configPut.mockResolvedValue(err(409, "[/config/] key already exists: config"));
+
+        const result = await handler({ path: "", value: { apps: {} }, mode: "insert", confirm: true });
+
+        expect(result.isError).toBe(true);
+        expect(result.content[0].text).toContain("[/config/] key already exists: config");
+        const { listSnapshots } = await import("../snapshots.js");
+        expect(listSnapshots()).toHaveLength(0);
+      });
+
+      it("keeps the snapshot when the write's deadline fired, and says it was kept", async () => {
+        // Same exception caddy_load and the root delete make: Caddy goes on
+        // applying a config change it has read after the client hangs up, and a
+        // timed-out change is never replayed -- so the config this write may
+        // have replaced is recorded nowhere else.
+        const prior = { apps: { http: {} } };
+        api.configGet.mockResolvedValue(ok(prior));
+        api.configPatch.mockResolvedValue({
+          ok: false,
+          status: 0,
+          outcomeUnknown: true,
+          error: "Request timed out after 55000ms -- the outcome is unknown: Caddy may still be applying this change.",
+        } as ApiResponse);
+
+        const result = await handler({ path: "", value: { apps: {} }, mode: "overwrite", confirm: true });
+
+        expect(result.isError).toBe(true);
+        expect(result.content[0].text).toContain("the outcome is unknown");
+        expect(result.content[0].text).toContain("kept anyway, as snapshot [0] (trigger=caddy_config_set)");
+        const { listSnapshots } = await import("../snapshots.js");
+        expect(listSnapshots()[0]?.config).toEqual(prior);
+        // Neither side set an admin.listen, so nothing can have moved -- and
+        // the timed-out message must not claim otherwise.
+        expect(result.content[0].text).not.toContain("admin.listen");
+        expect(result.content[0].text).not.toContain("If the write applied:");
+      });
+
+      it("keeps no snapshot when the deadline fired but the prior config could not be read", async () => {
+        // Nothing was read, so there is nothing to keep: the timeout is passed
+        // through as-is, and no ring slot is spent on an empty capture.
+        api.configGet.mockResolvedValue(err(0, "Cannot connect to Caddy admin API"));
+        api.configPatch.mockResolvedValue({
+          ok: false,
+          status: 0,
+          outcomeUnknown: true,
+          error: "Request timed out after 55000ms -- the outcome is unknown: Caddy may still be applying this change.",
+        } as ApiResponse);
+
+        const result = await handler({ path: "", value: { apps: {} }, mode: "overwrite", confirm: true });
+
+        expect(result.isError).toBe(true);
+        expect(result.content[0].text).toContain("the outcome is unknown");
+        expect(result.content[0].text).not.toContain("kept anyway");
+        const { listSnapshots } = await import("../snapshots.js");
+        expect(listSnapshots()).toHaveLength(0);
+      });
+
+      it("makes the SAME admin-endpoint claims on a timed-out write as on a successful one", async () => {
+        // The two messages are built from one note, so a timeout can never say
+        // the endpoint "moved back to the default" when the new value disables
+        // it outright, or when neither side set a listen at all.
+        const timedOut = {
+          ok: false,
+          status: 0,
+          outcomeUnknown: true,
+          error: "Request timed out after 55000ms -- the outcome is unknown: Caddy may still be applying this change.",
+        } as ApiResponse;
+        const prior = { admin: { listen: "localhost:2020" }, apps: {} };
+        const { clearSnapshots } = await import("../snapshots.js");
+
+        api.configGet.mockResolvedValue(ok(prior));
+        api.configPatch.mockResolvedValue(timedOut);
+        const disabled = await handler({
+          path: "",
+          value: { admin: { disabled: true }, apps: {} },
+          mode: "overwrite",
+          confirm: true,
+        });
+        expect(disabled.content[0].text).toContain("If the write applied: The new config sets admin.disabled");
+        expect(disabled.content[0].text).toContain("ANY admin address");
+        expect(disabled.content[0].text).not.toContain("default address");
+
+        clearSnapshots();
+        const dropped = await handler({ path: "", value: { apps: {} }, mode: "overwrite", confirm: true });
+        expect(dropped.content[0].text).toContain(
+          'If the write applied: The replaced config set admin.listen to "localhost:2020"',
+        );
+        expect(dropped.content[0].text).toContain("the new one sets none");
+
+        // The success path carries the identical note for the identical input.
+        clearSnapshots();
+        api.configPatch.mockResolvedValue(ok());
+        const succeeded = await handler({ path: "", value: { apps: {} }, mode: "overwrite", confirm: true });
+        const note = dropped.content[0].text.split("If the write applied:")[1].split(" If it did not apply")[0];
+        expect(succeeded.content[0].text).toContain(note);
+      });
+
+      it("reports an unsnapshotable prior config without calling it a read failure", async () => {
+        // Caddy answers a config-less instance with a literal `null` at HTTP 200.
+        api.configGet.mockResolvedValue(ok(null));
+        api.configPost.mockResolvedValue(ok());
+
+        const result = await handler({ path: "", value: { apps: {} }, mode: "append", confirm: true });
+
+        expect(result.isError).toBeFalsy();
+        expect(result.content[0].text).toContain("empty or not a JSON object");
+        expect(result.content[0].text).not.toContain("could not be read");
+        const { listSnapshots } = await import("../snapshots.js");
+        expect(listSnapshots()).toHaveLength(0);
+      });
+
+      it("still writes when the prior config could not be read, and says nothing was captured", async () => {
+        // The read is the safety net, not the gate: confirm=true was given, so
+        // the write proceeds, and the success says plainly that it cannot be
+        // reverted. Distinct wording from the `null` case above.
+        api.configGet.mockResolvedValue(err(0, "Cannot connect to Caddy admin API"));
+        api.configPatch.mockResolvedValue(ok());
+
+        const result = await handler({ path: "", value: { apps: {} }, mode: "overwrite", confirm: true });
+
+        expect(result.isError).toBeFalsy();
+        expect(api.configPatch).toHaveBeenCalledWith("", { apps: {} });
+        expect(result.content[0].text).toContain("could not be read");
+        const { listSnapshots } = await import("../snapshots.js");
+        expect(listSnapshots()).toHaveLength(0);
+      });
+
+      describe("the admin endpoint note", () => {
+        // This branch holds both sides -- the replaced config and the value
+        // that replaced it -- so it can say more than the delete branch: the
+        // endpoint moves when the two resolve to different addresses, in
+        // EITHER direction. The wording stays hedged because $CADDY_ADMIN lives
+        // in Caddy's environment and "{env.X}" can expand to empty.
+        // Every call passes mode "overwrite" explicitly: calling the handler
+        // directly bypasses zod, so an omitted mode is `undefined` and routes to
+        // POST -- which would pass here only on a mock implementation leaked
+        // from an earlier test (vi.clearAllMocks clears calls, not
+        // implementations).
+        beforeEach(() => {
+          api.configPatch.mockResolvedValue(ok());
+        });
+
+        it("warns when the replaced config set admin.listen and the new value drops it", async () => {
+          // The advisory's PoC: the endpoint falls back to the default and
+          // CADDY_ADMIN_URL, still pointed at :2020, reaches nothing.
+          api.configGet.mockResolvedValue(ok({ admin: { listen: "localhost:2020" }, apps: {} }));
+          const result = await handler({ path: "", value: { apps: {} }, mode: "overwrite", confirm: true });
+          expect(api.configPatch).toHaveBeenCalledWith("", { apps: {} });
+          const text = result.content[0].text;
+          expect(text).toContain('set admin.listen to "localhost:2020"');
+          expect(text).toContain("the new one sets none");
+          expect(text).toContain("localhost:2019");
+          expect(text).toContain("CADDY_ADMIN_URL");
+        });
+
+        it("warns when the new value moves admin.listen elsewhere, naming both", async () => {
+          api.configGet.mockResolvedValue(ok({ admin: { listen: "localhost:2020" }, apps: {} }));
+          const result = await handler({
+            path: "",
+            value: { admin: { listen: "localhost:2021" }, apps: {} },
+            mode: "overwrite",
+            confirm: true,
+          });
+          const text = result.content[0].text;
+          expect(text).toContain('set admin.listen to "localhost:2020"');
+          expect(text).toContain('the new one sets it to "localhost:2021"');
+        });
+
+        it("warns when the new value ADDS an admin.listen the replaced config did not have", async () => {
+          // Moving AWAY from the default is a lockout too: CADDY_ADMIN_URL
+          // pointed at localhost:2019 now reaches nothing.
+          api.configGet.mockResolvedValue(ok({ apps: {} }));
+          const result = await handler({
+            path: "",
+            value: { admin: { listen: "localhost:2020" }, apps: {} },
+            mode: "overwrite",
+            confirm: true,
+          });
+          expect(result.content[0].text).toContain('The new config sets admin.listen to "localhost:2020"');
+        });
+
+        it("stays silent when the new value keeps the same admin.listen", async () => {
+          api.configGet.mockResolvedValue(ok({ admin: { listen: "localhost:2020" }, apps: {} }));
+          const result = await handler({
+            path: "",
+            value: { admin: { listen: "localhost:2020" }, apps: { http: {} } },
+            mode: "overwrite",
+            confirm: true,
+          });
+          expect(result.content[0].text).not.toContain("admin.listen");
+        });
+
+        it("stays silent for admin blocks without a listen on either side", async () => {
+          // Caddy substitutes DefaultAdminListen for an absent or empty Listen
+          // (admin.go:398-402 and :1391-1398), so these all bind the address
+          // the instance was already on.
+          for (const [prior, value] of [
+            [
+              { admin: { config: { persist: false } }, apps: {} },
+              { admin: { origins: ["http://localhost:2019"] }, apps: {} },
+            ],
+            [{ admin: { listen: "" }, apps: {} }, { admin: { listen: "" } }],
+            [{ apps: {} }, { apps: {} }],
+            [{ apps: {} }, "not even an object"],
+          ]) {
+            const { clearSnapshots } = await import("../snapshots.js");
+            clearSnapshots();
+            api.configGet.mockResolvedValue(ok(prior));
+            const result = await handler({ path: "", value, mode: "overwrite", confirm: true });
+            expect(result.content[0].text, JSON.stringify(value)).not.toContain("admin.listen");
+          }
+        });
+
+        it("says so when the new value disables the admin endpoint outright", async () => {
+          // admin.disabled returns before any listener is bound (admin.go:405-408)
+          // and the old one is still stopped: no admin API at all until Caddy is
+          // restarted with a different config.
+          api.configGet.mockResolvedValue(ok({ admin: { listen: "localhost:2020" }, apps: {} }));
+          const result = await handler({
+            path: "",
+            value: { admin: { disabled: true }, apps: {} },
+            mode: "overwrite",
+            confirm: true,
+          });
+          const text = result.content[0].text;
+          expect(text).toContain("admin.disabled");
+          expect(text).toContain("restarted");
+          expect(text).not.toContain("has moved");
+        });
+      });
     });
   });
 
@@ -1015,12 +1382,33 @@ describe("tool handler behavior", () => {
     // anywhere else stops working. The refusal used to read `Refusing to delete
     // ""`, which named neither consequence.
     describe("a path that addresses the whole config", () => {
-      // Every spelling isRootConfigPath accepts. If this list and the predicate
-      // ever disagree, a path would take Caddy's unloads-everything branch with
-      // this tool's leaf branch: no warning, no snapshot. The slash-only tails
-      // are in the list deliberately -- they normalize to `/config//` in api.ts,
+      // Every spelling api.isRootConfigPath accepts. If this list and the
+      // predicate ever disagree, a path would take Caddy's unloads-everything
+      // branch with this tool's leaf branch: no warning, no snapshot -- which is
+      // exactly what "..." did before the predicate learned it (Caddy strips a
+      // lone trailing "..." before it picks a method, so DELETE /config/...
+      // unloads everything; verified against 2.11.4). The slash-only tails are
+      // in the list deliberately -- they normalize to `/config//` in api.ts,
       // which is why the handler sends the canonical "" instead (below).
-      const rootPaths = ["", "/", "config", "config/", "/config", "/config/", "//", "///", "config//", "/config//"];
+      const rootPaths = [
+        "",
+        "/",
+        "config",
+        "config/",
+        "/config",
+        "/config/",
+        "//",
+        "///",
+        "config//",
+        "/config//",
+        "...",
+        "/...",
+        "config/...",
+        "/config/...",
+        "/config/.../",
+        ".../",
+        "//...",
+      ];
 
       it.each(rootPaths)("refuses path %o without confirm=true, naming the whole config", async (path) => {
         const result = await handler({ path });

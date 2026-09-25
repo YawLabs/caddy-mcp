@@ -7,6 +7,69 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Security
+- **`caddy_config_set` no longer replaces the entire config without a gate, a snapshot, or
+  a word.** Reported by [@gargarnav](https://github.com/gargarnav) in
+  [GHSA-6859-g3p8-jc93](https://github.com/YawLabs/caddy-mcp/security/advisories/GHSA-6859-g3p8-jc93).
+  A path that addresses the config root — `''`, `'/'`, `'config'`, `'/config/'`, a
+  slash-only variant — normalizes to `PATCH /config/` (mode `overwrite`, the default) or
+  `POST /config/` (`append`), and Caddy treats either as "set the whole config to the body
+  and run it": the same full replace as `POST /load` (`admin.go:1279` and `:1296`,
+  `caddy.go:136` at v2.11.4), minus everything `caddy_load` puts in front of it. Every
+  app, server and route not in `value` was discarded, and so was the `admin` block unless
+  `value` carried one — after which Caddy re-binds its admin endpoint to the new config's
+  `admin.listen` or to `DefaultAdminListen` (`localhost:2019`, or `$CADDY_ADMIN`), so a
+  `CADDY_ADMIN_URL` pointing at the old address reached nothing, and there was no snapshot
+  to fall back on. The tool had no `confirm` parameter, was annotated `destructiveHint:
+  false` (the value MCP reserves for tools that make *only additive* updates, and the one
+  hosts auto-approve on), and its description called `overwrite` "safe and idempotent".
+  Verified against Caddy 2.11.4 three ways: the admin API directly, the exported api
+  functions, and the tool handler; `PATCH /config/` with a value lacking an `admin` block
+  replaced every server and moved the admin endpoint to the default address. A root write
+  now takes the same branch a root `caddy_config_delete` does: it is refused without
+  `confirm=true`, with a refusal that names the whole-config replace, the admin-endpoint
+  move and `caddy_load` as the deliberate way to do this; with `confirm` it reads the
+  config first (which also refreshes the `/config/` ETag, so the write carries `If-Match`
+  and either replaces exactly what was snapshotted or answers 412), sends the canonical
+  `/config/` whatever spelling the caller used, and snapshots the prior config (trigger
+  `caddy_config_set`) on success or on a deadline that fired, since Caddy goes on applying
+  a change after the client hangs up. The success message reports the snapshot and,
+  because this branch holds both the replaced config and its replacement, says when
+  `admin.listen` differs between them in either direction (dropping it, moving it, or
+  adding one where there was none) and when the new config sets `admin.disabled`, which
+  leaves no admin endpoint at all; a write whose deadline fired carries the same note,
+  prefixed "if the write applied" — hedged, since `$CADDY_ADMIN` and a `{env.X}` listen
+  resolve inside Caddy. The tool is now `destructiveHint: true`: its default mode replaces
+  whatever subtree the path names and `append` replaces any non-array key, while MCP
+  reserves `false` for tools whose every call is additive (appending to an array, or
+  strictly creating a key), and the description and README say all of the above before the
+  fact. `insert` (PUT) at the root is gated the same way for consistency even though Caddy
+  answers it with 409 on every instance whose `config` key exists — which is every
+  instance, including one started with no config, except one root-deleted since it
+  started. Leaf writes are unchanged: no confirm, no pre-read, no snapshot.
+- **`caddy_config_set` and `caddy_config_delete` now treat a lone trailing `...` segment
+  as the config root.** Caddy strips a trailing `...` (its bulk-append spelling) *before*
+  it switches on the method (`admin.go:1196-1199`), for every method, so `/config/...` is
+  `/config/` — while the root predicate here tested for an all-slashes remainder and
+  called `'...'`, `'/...'`, `'config/...'` and `'/config/.../'` leaves.
+  `caddy_config_delete` with any of those and `confirm=true` unloaded the entire config
+  through its leaf branch: no snapshot, no admin-endpoint warning, no `If-Match`. Verified
+  live: `PATCH` and `POST /config/...` with an object body replaced the whole config and
+  `DELETE /config/...` unloaded it. The predicate now lives in `api.ts` as
+  `isRootConfigPath`, sharing `normalizePath` with the request functions instead of
+  carrying a copy of its regex that had to be kept in step by hand — and it was not. Only
+  one trailing `...` is stripped by Caddy, so `'.../...'` stays a leaf (it writes a key
+  literally named `...`), as does a `...` under a real array, which is how bulk append
+  still works.
+- **A `.` path segment is refused, like `..`.** The WHATWG URL parser behind `fetch`
+  collapses dot segments before the request leaves, so `'apps/.'` was sent as
+  `/config/apps/` and `'.'` on its own as `/config/` — the root, past any root check a
+  tool ran on the spelling it was handed (verified: `PATCH /config/.` replaced the whole
+  config). Over a unix socket the path went out verbatim and Go's `ServeMux` answered with
+  a redirect `node:http` does not follow. Neither is a key, so `rejectTraversal` now
+  refuses the segment up front with the same error `..` gets; a key merely *containing* a
+  dot is unaffected.
+
 ## [2.5.4] — 2026-09-19
 
 ### Fixed

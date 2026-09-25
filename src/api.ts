@@ -321,6 +321,40 @@ function normalizePath(path: string): string {
 }
 
 /**
+ * Does this config path address the ROOT -- the whole configuration?
+ *
+ * A write there is a different operation wearing the same request shape: PATCH
+ * and POST replace the entire config (Caddy sets `rawCfg["config"]` to the body,
+ * admin.go:1279 and :1296 at v2.11.4 -- exactly what `POST /load` does,
+ * caddy.go:136), and DELETE unloads it. Every tool that takes a config path has
+ * to know, because Caddy itself never distinguishes the root from a leaf.
+ *
+ * Root spellings, after normalizePath above has eaten one leading "/" and one
+ * "config/": nothing ("", "/", "config", "/config/"), only slashes ("//",
+ * "config//"), and any of those followed by a single "..." segment ("...",
+ * "/...", "config/...", "/config/.../"). The "..." form is Caddy's bulk-append
+ * spelling, and it is stripped BEFORE the method switch (admin.go:1196-1199),
+ * for every method, so `/config/...` lands on the same root branch as
+ * `/config/`. rejectTraversal below lets "..." through on purpose -- a trailing
+ * one under a real array is how `POST .../routes/...` appends in bulk -- so the
+ * root test has to absorb it here. Only ONE trailing "..." is stripped by Caddy:
+ * ".../..." writes a key literally named "...", which is a leaf.
+ *
+ * Verified against Caddy 2.11.4: PATCH and POST `/config/...` with an object
+ * body replaced the whole config, and DELETE `/config/...` unloaded it.
+ *
+ * Callers that branch on this must SEND the canonical "" rather than the
+ * caller's spelling (see caddy_config_delete in tools/config.ts): "//" would be
+ * encoded to `/config//`, which Go's ServeMux answers with a redirect to
+ * `/config/` instead of dispatching, so the ETag cached under "/config/" is
+ * never found and the request goes out with no If-Match; over a unix socket
+ * node:http does not follow the redirect at all.
+ */
+export function isRootConfigPath(path: string): boolean {
+  return /^\/*(\.\.\.\/*)?$/.test(normalizePath(path));
+}
+
+/**
  * Percent-encode a path one SEGMENT at a time.
  *
  * Caddy config keys are arbitrary strings -- a server named "prod#1", a key
@@ -352,13 +386,26 @@ function encodePathSegments(path: string): string {
     .join("/");
 }
 
-/** Reject path-traversal segments so config-scoped tools can't reach sibling admin endpoints like /load or /stop. */
+/**
+ * Reject path-traversal segments so config-scoped tools can't reach sibling
+ * admin endpoints like /load or /stop.
+ *
+ * A single "." segment is rejected too. It never addresses a key: the WHATWG URL
+ * parser behind `fetch` collapses dot segments before the request leaves, so
+ * `PATCH /config/apps/.` is sent as `PATCH /config/apps/` and "." on its own is
+ * sent as `/config/` -- the root, past every root check a tool ran on the
+ * spelling it was handed. Verified against Caddy 2.11.4: `PATCH /config/.`
+ * replaced the whole config. Over a unix socket node:http sends the path
+ * verbatim, Go's ServeMux answers with a redirect, and the request fails. Either
+ * way the segment is a silent parent reference, so it is refused up front.
+ * "..." is deliberately NOT matched: see isRootConfigPath above.
+ */
 function rejectTraversal(path: string): ApiResponse | null {
-  if (/(^|\/)\.\.(\/|$)/.test(path)) {
+  if (/(^|\/)\.\.?(\/|$)/.test(path)) {
     return {
       ok: false,
       status: 0,
-      error: `Invalid path "${path}": '..' segments are not allowed`,
+      error: `Invalid path "${path}": '.' and '..' segments are not allowed`,
     };
   }
   return null;

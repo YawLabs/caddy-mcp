@@ -552,6 +552,27 @@ describe.skipIf(!RUN)("integration: live Caddy admin API", () => {
   // shape only a real Caddy produces -- a failed path traversal, a server
   // object with no keys, an adapter syntax error -- so the mocked suite in
   // tools.test.ts (which feeds hand-built 200s) can never reach them.
+  // The contract api.isRootConfigPath rests on: Caddy strips a lone trailing
+  // "..." segment BEFORE it switches on the method (admin.go:1196-1199 at
+  // v2.11.4), so `PATCH /config/...` is `PATCH /config/` -- a whole-config
+  // replace, not a bulk append and not a key named "...". If a Caddy release
+  // ever validates that segment against the destination type, this test says
+  // so and the predicate can shrink; until then, the "..." family must be gated
+  // as the root.
+  it("a lone trailing '...' addresses the root for PATCH, as isRootConfigPath assumes", async () => {
+    const known = { apps: { http: { servers: { srv0: { listen: [":18898"], routes: [] } } } } };
+    assertOk(await loadAndSettle(known), "loadConfig known config");
+    const replacement = { apps: { http: { servers: { srv1: { listen: [":18897"], routes: [] } } } } };
+
+    const res = await api.configPatch("...", replacement);
+    assertOk(res, "PATCH /config/...");
+
+    await waitForAdmin();
+    const after = await api.configGet();
+    assertOk(after, "configGet after PATCH /config/...");
+    expect(after.data).toEqual(replacement);
+  });
+
   describe("tool handlers against live Caddy", () => {
     type ToolResult = { isError?: boolean; content: Array<{ type: string; text: string }> };
 
@@ -1064,6 +1085,67 @@ describe.skipIf(!RUN)("integration: live Caddy admin API", () => {
       // a 200 carrying `null` -- an unloaded instance is not a failed read.
       expect(restored.content[0].text).toContain("empty or not a JSON object");
       expect(restored.content[0].text).not.toContain("could not be read");
+
+      await waitForAdmin();
+      const after = await api.configGet();
+      assertOk(after, "configGet after the revert");
+      expect(after.data).toEqual(before.data);
+    });
+
+    // GHSA-6859-g3p8-jc93: a root caddy_config_set is caddy_load wearing
+    // caddy_config_set's clothes -- PATCH /config/ sets the whole config to the
+    // body and runs it. Same reasoning as the delete round trip above: the
+    // mocked tests prove saveSnapshot was called, only a live Caddy proves the
+    // snapshot is what was replaced and that it loads back. And the handler's
+    // own GET refreshes the "/config/" ETag, so the PATCH goes out with an
+    // If-Match Caddy accepts -- a stale one would 412 here.
+    //
+    // Safe on the shared instance for the reason the delete test gives: neither
+    // config carries an `admin` block, so the endpoint re-binds to the address
+    // it was already on.
+    it("caddy_config_set at the root snapshots the whole config before replacing it, and caddy_revert brings it back", async () => {
+      const known = {
+        apps: {
+          http: {
+            servers: {
+              srv0: {
+                listen: [":18896"],
+                routes: [{ handle: [{ handler: "static_response", body: "before the replace" }] }],
+              },
+            },
+          },
+        },
+      };
+      assertOk(await loadAndSettle(known), "loadConfig known config");
+      const before = await api.configGet();
+      assertOk(before, "configGet before the replace");
+
+      const { listSnapshots } = await import("../snapshots.js");
+      const ringBefore = listSnapshots().length;
+
+      const set = getHandler(registerConfigTools, "caddy_config_set");
+      const replacement = { apps: { http: { servers: { lockprobe: { listen: [":18895"], routes: [] } } } } };
+      const result = await set({ path: "", value: replacement, mode: "overwrite", confirm: true });
+
+      expect(result.isError, result.content?.[0]?.text).toBeFalsy();
+      expect(result.content[0].text).toContain("Replaced the entire config");
+      expect(result.content[0].text).toContain("snapshot [0]");
+      expect(result.content[0].text).not.toContain("admin.listen");
+
+      await waitForAdmin();
+      const replaced = await api.configGet();
+      assertOk(replaced, "configGet after the replace");
+      expect(replaced.data).toEqual(replacement);
+
+      const snaps = listSnapshots();
+      expect(snaps).toHaveLength(ringBefore + 1);
+      expect(snaps[0].trigger).toBe("caddy_config_set");
+      expect(snaps[0].config).toEqual(before.data);
+
+      const revert = getHandler(registerConfigTools, "caddy_revert");
+      const restored = await revert({ action: "apply", index: 0, confirm: true });
+      expect(restored.isError, restored.content?.[0]?.text).toBeFalsy();
+      expect(restored.content[0].text).toContain("Reverted to snapshot [0]");
 
       await waitForAdmin();
       const after = await api.configGet();

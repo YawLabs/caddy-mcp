@@ -218,13 +218,42 @@ describe("caddy-mcp tools", () => {
       expect(desc).toContain("caddy_load");
     });
 
-    it("caddy_revert names both sources of an auto-captured snapshot", async () => {
+    it("caddy_revert names every source of an auto-captured snapshot", async () => {
       // It used to say "auto-captured before caddy_load" only. A root
-      // caddy_config_delete now captures one too, and a caller told otherwise
-      // would not think to look for it.
+      // caddy_config_delete captures one too, and so does a root
+      // caddy_config_set; a caller told otherwise would not think to look.
       const desc = (await getRegistrations()).find((c) => c[0] === "caddy_revert")?.[1] as string;
       expect(desc).toContain("caddy_load");
       expect(desc).toContain("caddy_config_delete");
+      expect(desc).toContain("caddy_config_set");
+    });
+
+    it("caddy_config_set warns about the root path before the fact, and no longer calls overwrite 'safe'", async () => {
+      // GHSA-6859-g3p8-jc93: a root path is PATCH/POST /config/, which replaces
+      // the ENTIRE config the way caddy_load does -- and took the admin block
+      // with it, moving the admin endpoint, with no gate, no snapshot and a
+      // description that called the default mode "safe and idempotent". The
+      // "..." spelling has to be named too: it reaches the root through Caddy's
+      // trailing-ellipsis strip, so a caller has no other way to know.
+      const desc = (await getRegistrations()).find((c) => c[0] === "caddy_config_set")?.[1] as string;
+      expect(desc).toBeTruthy();
+      expect(desc).toContain("ENTIRE config");
+      expect(desc).toContain("confirm=true");
+      expect(desc).toContain("'...'");
+      expect(desc).toContain("localhost:2019");
+      expect(desc).toContain("$CADDY_ADMIN");
+      expect(desc).toContain("CADDY_ADMIN_URL");
+      expect(desc).toContain("caddy_revert");
+      expect(desc).toContain("caddy_load");
+      // A value that disables the admin endpoint leaves it on NO address -- the
+      // one outcome "re-binds to admin.listen or the default" does not cover.
+      expect(desc).toContain("admin.disabled");
+      expect(desc).not.toContain("safe and idempotent");
+    });
+
+    it("caddy_config_delete names the '...' spelling of the root", async () => {
+      const desc = (await getRegistrations()).find((c) => c[0] === "caddy_config_delete")?.[1] as string;
+      expect(desc).toContain("'...'");
     });
 
     it("caddy_adapt warns that a Caddyfile 'order' option is not preview-only on Caddy <= 2.11.4", async () => {
@@ -523,6 +552,21 @@ describe("caddy-mcp tools", () => {
         idempotentHint: false,
       });
     });
+
+    it("caddy_config_set advertises the worst thing a write can do", async () => {
+      // GHSA-6859-g3p8-jc93 shipped under destructiveHint:false -- the value
+      // MCP reserves for tools that make ONLY additive updates -- so a host
+      // that auto-approves on the hint let a root PATCH replace the entire
+      // config unasked. The default mode is a PATCH that replaces whatever
+      // subtree the path names, and at the root that is everything; only
+      // 'insert' at an array index is additive. idempotentHint stays false for
+      // 'append', which is a POST.
+      expect(await getAnnotations("caddy_config_set")).toMatchObject({
+        readOnlyHint: false,
+        destructiveHint: true,
+        idempotentHint: false,
+      });
+    });
   });
 
   describe("caddy_config_set default mode", () => {
@@ -537,6 +581,20 @@ describe("caddy-mcp tools", () => {
       const schema = calls.find((c) => c[0] === "caddy_config_set")?.[2];
       const parsed = schema.mode.parse(undefined);
       expect(parsed).toBe("overwrite");
+    });
+
+    it("defaults confirm to false, like every other confirm-gated tool", async () => {
+      // A caller that never heard of the root gate sends no confirm and is
+      // refused on a root path -- never silently waved through.
+      const calls: any[] = [];
+      const mockServer = {
+        tool: vi.fn((...args: any[]) => calls.push(args)),
+        resource: vi.fn(),
+      };
+      const { registerConfigTools } = await import("../tools/config.js");
+      registerConfigTools(mockServer as any);
+      const schema = calls.find((c) => c[0] === "caddy_config_set")?.[2];
+      expect(schema.confirm.parse(undefined)).toBe(false);
     });
   });
 
