@@ -7,6 +7,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed
+- **`caddy_reverse_proxy` is now annotated `destructiveHint: true`.** With an `id`, it
+  replaces an existing route under that `@id` wholesale by a `PATCH`, including a subroute
+  holding a whole site's nested routes, which is not the "only additive updates" MCP
+  reserves `destructiveHint: false` for. A host gates on the hint before it can see
+  whether a call carries an `id`, so the hint now covers the worst case, as it does for
+  `caddy_config_set` and `caddy_config_by_id`. Hosts that auto-approve non-destructive
+  tools will now ask before running it. Calls without an `id` still only append.
+
 ## [2.5.6] — 2026-09-25
 
 ### Security
