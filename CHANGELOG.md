@@ -38,7 +38,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `admin.listen` differs between them in either direction (dropping it, moving it, or
   adding one where there was none) and when the new config sets `admin.disabled`, which
   leaves no admin endpoint at all; a write whose deadline fired carries the same note,
-  prefixed "if the write applied" — hedged, since `$CADDY_ADMIN` and a `{env.X}` listen
+  prefixed "if the write applied", whether or not a snapshot was kept; and when the
+  replaced config could not be read, the note says the endpoint may have moved rather than
+  saying nothing (the root branch of `caddy_config_delete` gets the same note for an
+  unreadable unloaded config) — hedged, since `$CADDY_ADMIN` and a `{env.X}` listen
   resolve inside Caddy. The tool is now `destructiveHint: true`: its default mode replaces
   whatever subtree the path names and `append` replaces any non-array key, while MCP
   reserves `false` for tools whose every call is additive (appending to an array, or
@@ -46,7 +49,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   fact. `insert` (PUT) at the root is gated the same way for consistency even though Caddy
   answers it with 409 on every instance whose `config` key exists — which is every
   instance, including one started with no config, except one root-deleted since it
-  started. Leaf writes are unchanged: no confirm, no pre-read, no snapshot.
+  started; on that one `overwrite` is the reverse and answers 404, which the description
+  and the refusal now say. Leaf writes are unchanged: no confirm, no pre-read, no
+  snapshot.
 - **`caddy_config_set` and `caddy_config_delete` now treat a lone trailing `...` segment
   as the config root.** Caddy strips a trailing `...` (its bulk-append spelling) *before*
   it switches on the method (`admin.go:1196-1199`), for every method, so `/config/...` is

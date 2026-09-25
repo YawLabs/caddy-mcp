@@ -1170,6 +1170,37 @@ describe("tool handler behavior", () => {
         expect(result.content[0].text).not.toContain("kept anyway");
         const { listSnapshots } = await import("../snapshots.js");
         expect(listSnapshots()).toHaveLength(0);
+        // No snapshot, but the admin note still rides along: the unread prior
+        // config may have set its own admin.listen, and the value sets none.
+        expect(result.content[0].text).toContain("If the write applied: The replaced config could not be read");
+      });
+
+      it("carries the admin note on a timed-out write even when no snapshot was kept", async () => {
+        // A config-less instance reads back as `null`, so nothing is kept --
+        // but a value that disables the admin endpoint is knowable from the
+        // value alone, and the operator's next re-read will fail without it.
+        api.configGet.mockResolvedValue(ok(null));
+        api.configPatch.mockResolvedValue({
+          ok: false,
+          status: 0,
+          outcomeUnknown: true,
+          error: "Request timed out after 55000ms -- the outcome is unknown: Caddy may still be applying this change.",
+        } as ApiResponse);
+
+        const disabled = await handler({
+          path: "",
+          value: { admin: { disabled: true }, apps: {} },
+          mode: "overwrite",
+          confirm: true,
+        });
+        expect(disabled.content[0].text).toContain("If the write applied: The new config sets admin.disabled");
+        expect(disabled.content[0].text).not.toContain("kept anyway");
+        expect(disabled.content[0].text).not.toContain("that snapshot is simply");
+
+        // Known-empty prior config and a value with no admin block: nothing can
+        // have moved, so the timeout is passed through with no note at all.
+        const quiet = await handler({ path: "", value: { apps: {} }, mode: "overwrite", confirm: true });
+        expect(quiet.content[0].text).not.toContain("If the write applied");
       });
 
       it("makes the SAME admin-endpoint claims on a timed-out write as on a successful one", async () => {
@@ -1240,6 +1271,13 @@ describe("tool handler behavior", () => {
         expect(result.content[0].text).toContain("could not be read");
         const { listSnapshots } = await import("../snapshots.js");
         expect(listSnapshots()).toHaveLength(0);
+        // "Could not be read" is not "set no admin.listen": the replaced config
+        // may have moved the endpoint, so the note names both possibilities
+        // instead of falling silent.
+        expect(result.content[0].text).toContain(
+          "The replaced config could not be read, so this server cannot tell whether it set an admin.listen of its own",
+        );
+        expect(result.content[0].text).toContain("CADDY_ADMIN_URL");
       });
 
       describe("the admin endpoint note", () => {
@@ -1548,6 +1586,24 @@ describe("tool handler behavior", () => {
         expect(result.content[0].text).not.toContain("could not be read");
         const { listSnapshots } = await import("../snapshots.js");
         expect(listSnapshots()).toHaveLength(0);
+      });
+
+      it("says the admin endpoint may have moved when the unloaded config could not be read", async () => {
+        // Same blind spot as a root write: an unread config may have set its
+        // own admin.listen. A config known to be empty (`null`) cannot have,
+        // and stays silent.
+        api.configDelete.mockResolvedValue(ok({}));
+
+        api.configGet.mockResolvedValue(err(0, "Cannot connect to Caddy admin API"));
+        const unread = await handler({ path: "", confirm: true });
+        expect(unread.isError).toBeFalsy();
+        expect(unread.content[0].text).toContain(
+          "The unloaded config could not be read, so this server cannot tell whether it set an admin.listen of its own",
+        );
+
+        api.configGet.mockResolvedValue(ok(null));
+        const empty = await handler({ path: "", confirm: true });
+        expect(empty.content[0].text).not.toContain("cannot tell whether");
       });
 
       it("leaves a non-root delete exactly as it was: no pre-read, no snapshot", async () => {

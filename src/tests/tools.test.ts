@@ -248,6 +248,9 @@ describe("caddy-mcp tools", () => {
       // A value that disables the admin endpoint leaves it on NO address -- the
       // one outcome "re-binds to admin.listen or the default" does not cover.
       expect(desc).toContain("admin.disabled");
+      // A root delete removes Caddy's "config" key, after which PATCH at the
+      // root answers 404 (admin.go:1290-1294) -- the mirror of insert's 409.
+      expect(desc).toContain("after a root caddy_config_delete it answers 404");
       expect(desc).not.toContain("safe and idempotent");
     });
 
