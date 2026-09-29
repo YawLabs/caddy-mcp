@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [2.5.7] — 2026-09-29
+
 ### Changed
 - `release.sh` reads npm's per-version document
   (`registry.npmjs.org/@yawlabs%2Fcaddy-mcp/<version>`) for every "is this
