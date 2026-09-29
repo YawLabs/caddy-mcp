@@ -7,6 +7,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed
+- `release.sh` waits up to 600 s, not 300, for npm to serve a new version before
+  the MCP Registry step, and polls npm up to 120 times 5 s apart in its final
+  check, not five times. On 2026-09-29 the @yawlabs/fetch-mcp 0.8.2 release
+  spent 295 s of its 300 s gate waiting for npm to serve the new version.
+  Release tooling only; the server itself is unchanged.
+
 ## [2.5.7] — 2026-09-29
 
 ### Changed

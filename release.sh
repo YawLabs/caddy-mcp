@@ -514,14 +514,14 @@ elif [ -f ".github/workflows/release.yml" ] && grep -q "npm publish\|NODE_AUTH_T
   # takes to surface it. Verification here is a courtesy check; warn rather
   # than fail when the mirror lags (existing memory: lag can exceed a minute).
   NPM_NOW=""
-  for i in 1 2 3 4 5 6 7 8 9 10; do
+  for i in $(seq 1 100); do
     if npm_version_live; then NPM_NOW="$VERSION"; break; fi
     sleep 6
   done
   if [ "$NPM_NOW" = "$VERSION" ]; then
     info "Published @yawlabs/caddy-mcp@${VERSION} via CI Release run $RUN_ID"
   else
-    warn "CI Release run $RUN_ID succeeded but npm still does not serve @yawlabs/caddy-mcp@${VERSION} after 60s. Likely registry propagation lag -- verify with 'curl -sSI https://registry.npmjs.org/@yawlabs%2Fcaddy-mcp/${VERSION}' (200 = live) in a minute. Publish is authoritative on CI's exit code."
+    warn "CI Release run $RUN_ID succeeded but npm still does not serve @yawlabs/caddy-mcp@${VERSION} after 600s. Likely registry propagation lag -- verify with 'curl -sSI https://registry.npmjs.org/@yawlabs%2Fcaddy-mcp/${VERSION}' (200 = live) in a minute. Publish is authoritative on CI's exit code."
   fi
 else
   # Workstation IS the publisher (no CI fallback). WebAuthn-fresh sessions can
@@ -638,7 +638,9 @@ elif ! command -v curl >/dev/null 2>&1; then
   warn "curl not found -- skipping the npm propagation wait; step 7 may 404 on a fresh publish"
 else
   PKG_NAME=$(node -p "require('./package.json').name")
-  NPM_WAIT_TIMEOUT_S=${NPM_WAIT_TIMEOUT_S:-300}
+  # 600 s: the @yawlabs/fetch-mcp 0.8.2 release (2026-09-29) spent 295 s of
+  # the 300 s this used to be waiting for npm to serve its new version.
+  NPM_WAIT_TIMEOUT_S=${NPM_WAIT_TIMEOUT_S:-600}
   NPM_WAITED_S=0
   # 5s: this is a remote read on a minutes-scale wait, so a tighter spin buys
   # nothing. (Under MSYS every `sleep` forks a process -- ~0.1s each -- which is
@@ -788,11 +790,14 @@ fi
 
 step 8 "Verify"
 # A successful `npm publish` doesn't guarantee instant registry visibility.
-# Poll up to 5 times with 5s spacing, matching the CI smoke-test cadence.
+# Poll up to 120 times 5s apart (about 600s of sleeps, plus each read): the
+# @yawlabs/fetch-mcp 0.8.2 release (2026-09-29) spent 295 s of its 300 s gate
+# waiting for npm to serve its new version, and the npm gate before the MCP
+# Registry step only warns when it runs out.
 LIVE_VERSION=""
-for i in 1 2 3 4 5; do
+for i in $(seq 1 120); do
   if npm_version_live; then LIVE_VERSION="$VERSION"; break; fi
-  if [ "$i" -lt 5 ]; then sleep 5; fi
+  if [ "$i" -lt 120 ]; then sleep 5; fi
 done
 [ "$LIVE_VERSION" = "$VERSION" ] && info "npm: @yawlabs/caddy-mcp@${LIVE_VERSION}" || warn "npm: not yet visible (registry propagating)"
 GH_TAG=$(gh release view "v${VERSION}" --json tagName --jq '.tagName' 2>/dev/null || echo "")
