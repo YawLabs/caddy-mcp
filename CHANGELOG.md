@@ -16,8 +16,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   "cannot publish over the previously published versions"; that E403 now
   counts as already published. The MCP Registry publish now gets up to four
   attempts, 30, 60, then 90 s apart, but only while the registry answers that it
-  cannot see the version yet or that npm was transiently unavailable; a
-  duplicate version counts as done, and every other error still fails at once.
+  cannot see the version yet or that npm was transiently unavailable, or answers
+  HTTP 429, 502, 503 or 504 itself, with a fresh registry login before each
+  retry; a duplicate version counts as done, and every other error still fails
+  at once.
 
 ## [2.5.6] — 2026-09-25
 
