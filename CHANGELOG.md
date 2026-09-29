@@ -7,6 +7,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed
+- `release.sh` reads npm's per-version document
+  (`registry.npmjs.org/@yawlabs%2Fcaddy-mcp/<version>`) for every "is this
+  version on npm?" check instead of `npm view`, whose whole-package document
+  Cloudflare's edge caches for up to 5 minutes. A re-run straight after a
+  failed later step could read it stale, publish again, and die on npm's E403
+  "cannot publish over the previously published versions"; that E403 now
+  counts as already published. The MCP Registry publish now gets up to four
+  attempts, 30, 60, then 90 s apart, but only while the registry answers that it
+  cannot see the version yet or that npm was transiently unavailable; a
+  duplicate version counts as done, and every other error still fails at once.
+
 ## [2.5.6] — 2026-09-25
 
 ### Security
