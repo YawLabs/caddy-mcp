@@ -21,6 +21,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   retry; a duplicate version counts as done, and every other error still fails
   at once.
 
+### Documentation
+- **The README's Add to Yaw MCP button now sits directly under the title, and
+  the follow badge links to @YawLabs.** The one-click install button and its
+  one-line caption moved up from further down the page, so they are the first
+  thing under the name on npm and GitHub, and the X badge at the bottom points
+  at [@YawLabs](https://x.com/YawLabs) instead of @TokenLimitNews. npm shows the
+  README from the published package, which is why it takes a release to carry
+  this there; the package's code is unchanged from 2.5.6.
+
 ## [2.5.6] — 2026-09-25
 
 ### Security
