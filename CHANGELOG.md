@@ -7,6 +7,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed
+- `release.sh` runs every mcp-publisher call to the MCP Registry, each login and
+  each publish attempt, under coreutils `timeout` (`MCP_PUBLISH_TIMEOUT_S`,
+  default 90 s) where one (or Homebrew's `gtimeout`) is on PATH -- without one
+  the call runs unbounded, and a warning says so -- because mcp-publisher waits
+  for the registry's answer with no limit of its own and a registry that never
+  answered would have hung the release. A publish attempt that gets no answer is
+  retried on the same 30, 60 and 90 s clock as the registry's own 429-504: one
+  the limit stopped, which used to hang the step, and one whose connection
+  failed or dropped (the client's `error sending request` or
+  `error reading response`), which used to fail it at once. A login the limit
+  stopped says the registry did not answer, instead of blaming the credentials.
+  Release tooling only; the server itself is unchanged.
+
 ## [2.5.8] — 2026-09-29
 
 ### Changed
