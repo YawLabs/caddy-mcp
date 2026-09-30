@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [2.5.8] — 2026-09-29
+
 ### Changed
 - **`caddy_reverse_proxy` is now annotated `destructiveHint: true`.** With an `id`, it
   replaces an existing route under that `@id` wholesale by a `PATCH`, including a subroute
