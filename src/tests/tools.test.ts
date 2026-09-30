@@ -570,6 +570,18 @@ describe("caddy-mcp tools", () => {
       });
     });
 
+    it("caddy_reverse_proxy advertises its id-replace path as destructive", async () => {
+      // With an `id`, an existing route under that @id is replaced wholesale by
+      // a PATCH -- a subroute holding a whole site's nested routes included.
+      // That is not the "only additive updates" destructiveHint:false promises,
+      // and a host gates on the hint before it can see whether `id` was sent.
+      expect(await getAnnotations("caddy_reverse_proxy")).toMatchObject({
+        readOnlyHint: false,
+        destructiveHint: true,
+        idempotentHint: false,
+      });
+    });
+
     it("caddy_config_set advertises the worst thing a write can do", async () => {
       // GHSA-6859-g3p8-jc93 shipped under destructiveHint:false -- the value
       // MCP reserves for tools that make ONLY additive updates -- so a host

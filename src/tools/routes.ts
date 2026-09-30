@@ -441,7 +441,14 @@ export function registerRouteTools(server: McpServer) {
           "Optional stable @id for the route. When set, repeat calls REPLACE the route in place (idempotent). When omitted, the route is APPENDED — calling twice with identical args creates a duplicate route. @ids are config-global in Caddy: if this id is already used by a non-route object the call refuses rather than clobbering it.",
         ),
     },
-    { readOnlyHint: false, destructiveHint: false, idempotentHint: false, openWorldHint: false },
+    // destructiveHint is TRUE because the hint covers the whole tool and a host
+    // gates on it before it can see whether the call carries an `id`: with one,
+    // an existing route under that @id is REPLACED wholesale by a PATCH -- its
+    // matchers, its handlers, a subroute holding a whole site's nested routes,
+    // all of it -- which is not the "only additive updates" MCP reserves
+    // destructiveHint:false for. Without an `id` the call only appends. Same
+    // worst-case rule as caddy_config_set and caddy_config_by_id.
+    { readOnlyHint: false, destructiveHint: true, idempotentHint: false, openWorldHint: false },
     async ({ from, to, server: srv, id }) => {
       // Trim before parsing so surrounding whitespace doesn't become part of a
       // matcher: "  /api" is a legitimate path, but parsing it untrimmed yields
