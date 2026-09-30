@@ -15,6 +15,36 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   whether a call carries an `id`, so the hint now covers the worst case, as it does for
   `caddy_config_set` and `caddy_config_by_id`. Hosts that auto-approve non-destructive
   tools will now ask before running it. Calls without an `id` still only append.
+- `release.sh` waits up to 600 s, not 300, for npm to serve a new version before
+  the MCP Registry step, and polls npm up to 120 times 5 s apart in its final
+  check, not five times. On 2026-09-29 the @yawlabs/fetch-mcp 0.8.2 release
+  spent 295 s of its 300 s gate waiting for npm to serve the new version.
+  Release tooling only; the server itself is unchanged.
+
+## [2.5.7] — 2026-09-29
+
+### Changed
+- `release.sh` reads npm's per-version document
+  (`registry.npmjs.org/@yawlabs%2Fcaddy-mcp/<version>`) for every "is this
+  version on npm?" check instead of `npm view`, whose whole-package document
+  Cloudflare's edge caches for up to 5 minutes. A re-run straight after a
+  failed later step could read it stale, publish again, and die on npm's E403
+  "cannot publish over the previously published versions"; that E403 now
+  counts as already published. The MCP Registry publish now gets up to four
+  attempts, 30, 60, then 90 s apart, but only while the registry answers that it
+  cannot see the version yet or that npm was transiently unavailable, or answers
+  HTTP 429, 502, 503 or 504 itself, with a fresh registry login before each
+  retry; a duplicate version counts as done, and every other error still fails
+  at once.
+
+### Documentation
+- **The README's Add to Yaw MCP button now sits directly under the title, and
+  the follow badge links to @YawLabs.** The one-click install button and its
+  one-line caption moved up from further down the page, so they are the first
+  thing under the name on npm and GitHub, and the X badge at the bottom points
+  at [@YawLabs](https://x.com/YawLabs) instead of @TokenLimitNews. npm shows the
+  README from the published package, which is why it takes a release to carry
+  this there; the package's code is unchanged from 2.5.6.
 
 ## [2.5.6] — 2026-09-25
 

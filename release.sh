@@ -171,6 +171,27 @@ release_notes() {
   fi
 }
 
+# True when npm itself serves @yawlabs/caddy-mcp@${VERSION}: a 200 from the
+# per-version document, the exact URL the MCP Registry's validator fetches. NOT
+# `npm view`: that reads the whole packument, which registry.npmjs.org serves
+# from Cloudflare's edge for up to 300 s (Cache-Control: public, max-age=300;
+# measured 2026-09-28 still HIT with no-cache request headers), so right after
+# a publish it can keep saying the version is absent. The per-version document
+# is served uncached (CF-Cache-Status DYNAMIC). The `_` query is belt-and-braces
+# against that changing; npm ignores it. Probe-only: any failure reads as "not
+# served".
+npm_version_live() {
+  local code
+  if command -v curl >/dev/null 2>&1; then
+    code=$(curl -sS -o /dev/null -w '%{http_code}' --max-time 20 \
+      -H 'Cache-Control: no-cache' -H 'Pragma: no-cache' \
+      "https://registry.npmjs.org/@yawlabs%2Fcaddy-mcp/${VERSION}?_=$(date +%s)${RANDOM}" 2>/dev/null || true)
+    [ "$code" = "200" ]
+  else
+    [ "$(npm view "@yawlabs/caddy-mcp@${VERSION}" version --prefer-online 2>/dev/null || echo "")" = "$VERSION" ]
+  fi
+}
+
 # SKIP_LINT=1 escape hatch -- wraps `npm`/`pnpm` so lint-related runs are
 # no-ops.
 #
@@ -430,7 +451,7 @@ step 5 "Publish to npm"
 #                                       is set; --provenance for sigstore).
 #   2. IS_CI=false + release.yml     -> CI will publish on the tag we just pushed.
 #      exists with CI publish path      Watch `gh run watch` for that run and
-#                                       verify via `npm view`. Workstation MUST
+#                                       verify npm serves it. Workstation MUST
 #                                       NOT also publish -- stale ~/.npmrc fails
 #                                       E404, valid one races CI for the same
 #                                       version. CI is authoritative. (Replaces
@@ -438,8 +459,7 @@ step 5 "Publish to npm"
 #                                       manual flag; detection is now automatic.)
 #   3. IS_CI=false + no CI publish   -> Workstation IS the publisher. Try locally
 #      path                             with EOTP retry for fresh WebAuthn sessions.
-NPM_VERSION=$(npm view "@yawlabs/caddy-mcp@${VERSION}" version 2>/dev/null || echo "")
-if [ "$NPM_VERSION" = "$VERSION" ]; then
+if npm_version_live; then
   info "Already published to npm -- skipping"
   # Resume-path safety: a prior interrupted run may have published but never
   # observed `gh run watch` to completion. Later CI steps (smoke test, MCP
@@ -494,27 +514,38 @@ elif [ -f ".github/workflows/release.yml" ] && grep -q "npm publish\|NODE_AUTH_T
   # takes to surface it. Verification here is a courtesy check; warn rather
   # than fail when the mirror lags (existing memory: lag can exceed a minute).
   NPM_NOW=""
-  for i in 1 2 3 4 5 6 7 8 9 10; do
-    NPM_NOW=$(npm view "@yawlabs/caddy-mcp@${VERSION}" version 2>/dev/null || echo "")
-    [ "$NPM_NOW" = "$VERSION" ] && break
+  for i in $(seq 1 100); do
+    if npm_version_live; then NPM_NOW="$VERSION"; break; fi
     sleep 6
   done
   if [ "$NPM_NOW" = "$VERSION" ]; then
     info "Published @yawlabs/caddy-mcp@${VERSION} via CI Release run $RUN_ID"
   else
-    DISPLAY_NPM="${NPM_NOW:-(not found)}"
-    warn "CI Release run $RUN_ID succeeded but npm registry still shows '$DISPLAY_NPM' for @yawlabs/caddy-mcp@${VERSION} after 60s. Likely registry propagation lag -- verify with 'npm view @yawlabs/caddy-mcp@${VERSION}' in a minute. Publish is authoritative on CI's exit code."
+    warn "CI Release run $RUN_ID succeeded but npm still does not serve @yawlabs/caddy-mcp@${VERSION} after 600s. Likely registry propagation lag -- verify with 'curl -sSI https://registry.npmjs.org/@yawlabs%2Fcaddy-mcp/${VERSION}' (200 = live) in a minute. Publish is authoritative on CI's exit code."
   fi
 else
   # Workstation IS the publisher (no CI fallback). WebAuthn-fresh sessions can
-  # EOTP for ~30s; retry only on OTP-class errors. Fail fast on everything else
-  # so a packaging error or duplicate-version doesn't waste 60s spinning.
+  # EOTP for ~30s; retry only on OTP-class errors. npm's "already published"
+  # E403 ends the loop as done (below). Fail fast on everything else so a
+  # packaging error doesn't waste 60s spinning.
   ATTEMPT=1
   MAX_ATTEMPTS=3
+  NPM_ALREADY_THERE=false
   while true; do
     PUBLISH_LOG=$(mktemp)
     if npm publish --access public 2>&1 | tee "$PUBLISH_LOG"; then
       rm -f "$PUBLISH_LOG"
+      break
+    fi
+    # npm's own word that the version is already there: the E403 "You
+    # cannot publish over the previously published versions". Reachable
+    # when the skip check above missed a version npm holds -- its read
+    # path lagging the write, or this host unable to read it -- which is
+    # the state an immediate re-run after a failed later step starts from.
+    # Treated as the skip it should have been, not as a token problem.
+    if grep -q 'cannot publish over the previously published versions' "$PUBLISH_LOG"; then
+      rm -f "$PUBLISH_LOG"
+      NPM_ALREADY_THERE=true
       break
     fi
     if ! grep -qE 'EOTP|EAUTH|one-time password|OTP' "$PUBLISH_LOG"; then
@@ -546,7 +577,11 @@ else
     ATTEMPT=$((ATTEMPT + 1))
     sleep 30
   done
-  info "Published @yawlabs/caddy-mcp@${VERSION} to npm (workstation)"
+  if [ "$NPM_ALREADY_THERE" = "true" ]; then
+    warn "npm already holds @yawlabs/caddy-mcp@${VERSION} (its E403 said so) though the pre-publish read did not show it -- treating the publish as done"
+  else
+    info "Published @yawlabs/caddy-mcp@${VERSION} to npm (workstation)"
+  fi
 fi
 
 step 6 "Create GitHub release"
@@ -581,8 +616,9 @@ fi
 # Polling here makes one invocation enough (ported from aws-mcp's release.sh).
 # Three deliberate choices:
 #
-#   * curl, not `npm view`. npm caches registry metadata (5 min by default), so
-#     a poll through it can keep reporting the pre-publish answer well after the
+#   * curl (npm_version_live), not `npm view`. `npm view` reads the whole
+#     packument, which Cloudflare's edge caches for up to 5 min, so a poll
+#     through it can keep reporting the pre-publish answer well after the
 #     version is live -- the loop would then outlast the condition it is waiting
 #     on.
 #   * The EXACT URL the MCP Registry fetches. Its npm validator requests
@@ -590,6 +626,7 @@ fi
 #     slash into %2F (`@yawlabs%2Fpkg`, the `@` left bare). A literal-slash URL
 #     reaches the same origin but can be a different CDN cache entry, so success
 #     there would be a proxy rather than evidence about the path that fails.
+#     (The helper adds only a cache-busting query, which npm ignores.)
 #   * WARN, never fail, on timeout. If propagation is genuinely stuck, letting
 #     mcp-publisher run produces its own precise error naming the version and
 #     status; a timeout message from this loop would replace that with something
@@ -601,14 +638,15 @@ elif ! command -v curl >/dev/null 2>&1; then
   warn "curl not found -- skipping the npm propagation wait; step 7 may 404 on a fresh publish"
 else
   PKG_NAME=$(node -p "require('./package.json').name")
-  NPM_WAIT_URL="https://registry.npmjs.org/${PKG_NAME//\//%2F}/${VERSION}"
-  NPM_WAIT_TIMEOUT_S=${NPM_WAIT_TIMEOUT_S:-300}
+  # 600 s: the @yawlabs/fetch-mcp 0.8.2 release (2026-09-29) spent 295 s of
+  # the 300 s this used to be waiting for npm to serve its new version.
+  NPM_WAIT_TIMEOUT_S=${NPM_WAIT_TIMEOUT_S:-600}
   NPM_WAITED_S=0
   # 5s: this is a remote read on a minutes-scale wait, so a tighter spin buys
   # nothing. (Under MSYS every `sleep` forks a process -- ~0.1s each -- which is
   # noise at this interval but the reason not to poll sub-second.)
   while [ "$NPM_WAITED_S" -lt "$NPM_WAIT_TIMEOUT_S" ]; do
-    if curl -fsS -o /dev/null "$NPM_WAIT_URL" 2>/dev/null; then
+    if npm_version_live; then
       break
     fi
     sleep 5
@@ -672,19 +710,94 @@ else
   fi
   "$MP" login github -token "$MCP_REGISTRY_TOKEN" >/dev/null 2>&1 \
     || fail "mcp-publisher login failed -- check MCP_REGISTRY_TOKEN scopes (needs read:org for YawLabs)"
-  "$MP" publish \
-    || fail "mcp-publisher publish failed -- npm + GitHub release succeeded, but the MCP Registry did not. Retry the step (re-run the script) once the cause is identified."
-  info "Published to MCP Registry"
+  # Up to four attempts, 30 s, 60 s, then 90 s apart, and ONLY for the
+  # shape waiting cures. The npm gate above reads npm from THIS machine's
+  # CDN edge, so it can go green while the MCP Registry's own read still
+  # lags (ctxlint v0.27.0 needed the 3rd of 3 retries, ~150 s after the
+  # publish). The live registry (v1.8.1; wording from registry PR #1411)
+  # answers that lag with "exists, but version '<v>' was not found
+  # (status: 404)", and a bad moment on npm's side with "... Likely
+  # transient, retry later" (429, 5xx, an inconclusive 404) or "failed to
+  # fetch package metadata from NPM" (no status at all). Every other
+  # failure -- bad server.json, namespace not owned, auth -- fails the same
+  # after any wait, so it stops on the first attempt. A duplicate version
+  # means an earlier run already registered it: the state this step wants.
+  # The registry's OWN transient answers are retried on the same clock too:
+  # HTTP 429, 502, 503 or 504 on the publish call. Cutting @yawlabs/mcp 1.0.17
+  # (2026-09-29) met a 504 from the registry's nginx gateway while its search
+  # requests were timing out -- the registry was slow, not saying no. A retry
+  # is safe even when the timed-out attempt landed: it then meets the
+  # duplicate-version branch below.
+  MCP_PUBLISH_LOG=$(mktemp)
+  MCP_DONE=false
+  MCP_ATTEMPT=1
+  MCP_MAX_ATTEMPTS=4
+  MCP_GATEWAY_RETRIED=false
+  while true; do
+    if "$MP" publish 2>&1 | tee "$MCP_PUBLISH_LOG"; then
+      MCP_DONE=true
+      break
+    fi
+    if grep -qiE 'duplicate version|already exists' "$MCP_PUBLISH_LOG"; then
+      if [ "$MCP_GATEWAY_RETRIED" = "true" ]; then
+        info "MCP Registry refused the retry of ${VERSION} as a duplicate: the attempt that timed out landed"
+      else
+        info "MCP Registry already has ${VERSION} -- nothing to publish"
+      fi
+      MCP_DONE=true
+      break
+    fi
+    # The registry's own 429/502/503/504 on the publish call, if that is what
+    # this attempt got: empty otherwise. `|| true` because no match is the
+    # normal case, and the failing grep would then make the assignment fail,
+    # which `set -e` turns into the end of the script.
+    MCP_GATEWAY_STATUS=$(grep -oE 'server returned status (429|502|503|504)([^0-9]|$)' "$MCP_PUBLISH_LOG" | head -n 1 | grep -oE '[0-9]{3}' || true)
+    # The not-found shape counts only when the validator's own "version '<v>'"
+    # names this version. A bare version match is not enough: the registry's
+    # publisher after v1.8.1 (registry main) prints "Publishing <name>@<v> to"
+    # before any error, and this script downloads the latest release, so a
+    # missing-package 404 would then buy all the waits.
+    if ! { { grep -qE 'not found \(status: *[0-9]+\)' "$MCP_PUBLISH_LOG" && grep -qF "version '${VERSION}'" "$MCP_PUBLISH_LOG"; } \
+        || grep -qE 'Likely transient, retry later|failed to fetch package metadata from NPM' "$MCP_PUBLISH_LOG" \
+        || [ -n "$MCP_GATEWAY_STATUS" ]; }; then
+      break
+    fi
+    if [ "$MCP_ATTEMPT" -ge "$MCP_MAX_ATTEMPTS" ]; then break; fi
+    MCP_WAIT=$((MCP_ATTEMPT * 30))
+    if [ -n "$MCP_GATEWAY_STATUS" ]; then
+      MCP_GATEWAY_RETRIED=true
+      warn "MCP Registry answered HTTP ${MCP_GATEWAY_STATUS} itself -- busy or timing out, not a verdict -- waiting ${MCP_WAIT}s, then attempt $((MCP_ATTEMPT + 1)) of ${MCP_MAX_ATTEMPTS}"
+    else
+      warn "MCP Registry cannot see @yawlabs/caddy-mcp@${VERSION} on npm yet -- waiting ${MCP_WAIT}s, then attempt $((MCP_ATTEMPT + 1)) of ${MCP_MAX_ATTEMPTS}"
+    fi
+    sleep "$MCP_WAIT"
+    # A fresh registry token before every retry: tokens last 5 minutes, and an
+    # attempt that meets a timing-out gateway spends the gateway's own timeout
+    # before its 504 arrives, so the waits plus four slow attempts can outlast
+    # the token the login above issued -- and an expired token is a 401 that
+    # fails the step.
+    "$MP" login github -token "${MCP_REGISTRY_TOKEN:-}" >/dev/null 2>&1 \
+      || warn "mcp-publisher login refresh failed -- the next attempt may be refused as unauthorized"
+    MCP_ATTEMPT=$((MCP_ATTEMPT + 1))
+  done
+  rm -f "$MCP_PUBLISH_LOG"
+  if [ "$MCP_DONE" = "true" ]; then
+    info "Published to MCP Registry"
+  else
+    fail "mcp-publisher publish failed -- npm + GitHub release succeeded, but the MCP Registry did not. Retry the step (re-run the script) once the cause is identified."
+  fi
 fi
 
 step 8 "Verify"
 # A successful `npm publish` doesn't guarantee instant registry visibility.
-# Poll up to 5 times with 5s spacing, matching the CI smoke-test cadence.
+# Poll up to 120 times 5s apart (about 600s of sleeps, plus each read): the
+# @yawlabs/fetch-mcp 0.8.2 release (2026-09-29) spent 295 s of its 300 s gate
+# waiting for npm to serve its new version, and the npm gate before the MCP
+# Registry step only warns when it runs out.
 LIVE_VERSION=""
-for i in 1 2 3 4 5; do
-  LIVE_VERSION=$(npm view "@yawlabs/caddy-mcp@${VERSION}" version 2>/dev/null || echo "")
-  [ "$LIVE_VERSION" = "$VERSION" ] && break
-  if [ "$i" -lt 5 ]; then sleep 5; fi
+for i in $(seq 1 120); do
+  if npm_version_live; then LIVE_VERSION="$VERSION"; break; fi
+  if [ "$i" -lt 120 ]; then sleep 5; fi
 done
 [ "$LIVE_VERSION" = "$VERSION" ] && info "npm: @yawlabs/caddy-mcp@${LIVE_VERSION}" || warn "npm: not yet visible (registry propagating)"
 GH_TAG=$(gh release view "v${VERSION}" --json tagName --jq '.tagName' 2>/dev/null || echo "")
