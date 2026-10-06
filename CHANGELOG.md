@@ -7,6 +7,27 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Security
+- **The MCP SDK moves from 1.30.0 to 1.32.1** (GHSA-6qxp-vccf-f47h, high: the
+  SDK's OAuth client could send credentials to an authorization server chosen by
+  the MCP server; this server does not import that client, but the SDK version
+  it runs on changes). The SDK is a runtime dependency that npm installs beside
+  `dist`, and `scripts/build-binary.mjs` bundles it into the single-file release
+  binaries, so the dependency floor is now `^1.32.1`. Its `fast-uri`, loaded
+  through ajv and bundled into those binaries, moves from 3.1.7 to 3.1.8
+  (GHSA-hrr3-gc8f-f4qj, moderate: inconsistent host case normalization via
+  percent-encoded octets). Installed with the SDK but never loaded by this server
+  (express and express-rate-limit are not imported, and neither package is in the
+  binary bundle): `proxy-addr` 2.0.7 -> 2.0.8 (GHSA-jqcg-44mw-7w3h, critical: IP
+  spoofing via an IPv4-mapped IPv6 trust subnet) and `ip-address` 10.7.0 -> 10.7.3
+  (GHSA-j6r3-76f7-8jcv and GHSA-h3mg-xc3c-68pw, moderate: cross-family subnet
+  checks and an unbounded parse diagnostic). Development-scope only:
+  `source-map-js` 1.2.1 -> 1.2.2 (GHSA-68fv-2mgg-jv7q, high: event-loop denial of
+  service through indexed source-map section offsets), reached through tsup and
+  postcss. The `overrides` floors for `ip-address` and `fast-uri` move to the
+  patched versions, and a new `proxy-addr` floor of `^2.0.8` is added. `npm audit`
+  reports 0 vulnerabilities.
+
 ### Changed
 - **The oam floor moves from 0.15.2 to 0.18.0, so the `caddy-mcp` launcher no
   longer runs the server on an older oam.** This server is verified on one oam
@@ -57,6 +78,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   403 says what the io.github.YawLabs namespace takes: a YawLabs org Owner whose
   token can read org roles. Release tooling only; the server itself is
   unchanged.
+
+### Fixed
+- `scripts/update-manifests.mjs` escapes every package.json value it writes into
+  a Ruby double-quoted string in the Homebrew formula (`desc`, `homepage`,
+  `version`, `license`) with an exported `rubyString()`: backslash first, then
+  `"`, `#` where it starts an interpolation (`#{`, `#@`, `#$`; a plain `#` such as
+  "issue #12" stays), and CR / LF. The old escaper handled only `"`, so a
+  backslash or `#{...}` in the description reached the formula raw and a
+  multi-line description could break out of the one-line `desc` stanza (CodeQL
+  js/incomplete-sanitization, code-scanning alert #1). The formula is built by an
+  exported `renderFormula()`, and the script body moved into `main()`, which runs
+  only when the file is executed directly -- compared by real path, so a junction
+  or symlink still reaches it. `src/tests/update-manifests.test.ts` round-trips
+  hostile strings through a Ruby double-quoted literal reader. For the real
+  package.json both generated files are byte-identical to the old script's.
+  Release tooling only; the server itself is unchanged.
 
 ## [2.5.8] — 2026-09-29
 
