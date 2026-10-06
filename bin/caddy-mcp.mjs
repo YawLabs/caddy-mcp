@@ -68,8 +68,8 @@
  * real oam 0.8.2 host, the MCP handshake never answered. Piping the streams
  * explicitly completes it, to both oam and Node. The sandbox spawn from a
  * supported oam host pipes too -- one rule for every oam host, verified with a
- * real handshake on 0.15.2. A Node host keeps `inherit`, which hands over the
- * same fds untouched.
+ * real handshake on 0.18.0 (first measured on 0.15.2). A Node host keeps
+ * `inherit`, which hands over the same fds untouched.
  *
  * The sandbox asks for a spawn; it does not guarantee one. Discovery can still
  * come up empty -- no usable oam binary, or a spawn that fails -- and under
@@ -112,7 +112,7 @@
  * "unauthenticated". The env list is derived from the shipped bundle.
  *
  * MINIMUM OAM VERSION
- * The latest oam release, 0.15.2 -- bump OAM_MIN when oam ships a newer one.
+ * The latest oam release, 0.18.0 -- bump OAM_MIN when oam ships a newer one.
  * Only the current oam is used and verified; an older one is passed over. The
  * floor is not cosmetic: before 0.9.0 `child_process.execFile` ran its
  * arguments through a SHELL, `exec` accepted `timeout` and ignored it,
@@ -142,7 +142,7 @@ import { delimiter, join } from "node:path";
 import { fileURLToPath } from "node:url";
 
 /** Oldest oam this server is served on. See MINIMUM OAM VERSION above. */
-const OAM_MIN = [0, 15, 2];
+const OAM_MIN = [0, 18, 0];
 
 /**
  * Bound on each `oam --version` probe. A healthy oam answers in milliseconds;
@@ -357,7 +357,7 @@ function sandboxFlags() {
   // Omitting the flag DENIES the category (oam reads an absent --allow-net as
   // false, a bare one as "*"), and denial costs nothing here: oam has no unix
   // socket transport at all, so api.ts's node:http `socketPath` dial cannot work
-  // under oam whether the grant is open or closed. Re-verified against oam 0.15.2 --
+  // under oam whether the grant is open or closed. Re-verified against oam 0.18.0 --
   // bare grant lets an unrelated host through, omitted grant denies it.
   //
   // This mirrors getMalformedUnixUrl's predicate in src/api.ts, NOT the stricter

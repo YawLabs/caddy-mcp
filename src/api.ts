@@ -779,16 +779,18 @@ function isConnectionRefused(err: unknown): boolean {
  *
  * The message is runtime-specific text. Node's fetch rejects an
  * AbortSignal.timeout with DOMException TimeoutError "The operation was aborted
- * due to timeout"; oam's -- the runtime bin/caddy-mcp.mjs prefers when oam
- * 0.15.2 or newer is installed -- rejects with DOMException TimeoutError "The
- * operation timed out", which contains neither "abort" nor "timeout". Matching
- * on the text alone missed that, so under oam a timed-out config change was
- * never recognised as one: rule 3 of shouldRetry did not fire, the write was
- * replayed up to 1 + CADDY_MAX_RETRIES times (into the false 404 / 412 rule 3
- * exists to prevent), and the caller got the bare runtime message instead of
- * the outcome-unknown one. The name is what the platform standardises:
- * `TimeoutError` for an AbortSignal.timeout reason, `AbortError` for an abort
- * (node:http wraps a signal abort in one, with the TimeoutError as its cause).
+ * due to timeout"; oam's up to 0.17.x -- the runtime bin/caddy-mcp.mjs
+ * preferred when one was installed -- rejected with DOMException TimeoutError
+ * "The operation timed out", which contains neither "abort" nor "timeout".
+ * (oam 0.18.0, the launcher's floor now, uses Node's wording; measured on the
+ * published build.) Matching on the text alone missed that, so under oam a
+ * timed-out config change was never recognised as one: rule 3 of shouldRetry
+ * did not fire, the write was replayed up to 1 + CADDY_MAX_RETRIES times (into
+ * the false 404 / 412 rule 3 exists to prevent), and the caller got the bare
+ * runtime message instead of the outcome-unknown one. The name is what the
+ * platform standardises: `TimeoutError` for an AbortSignal.timeout reason,
+ * `AbortError` for an abort (node:http wraps a signal abort in one, with the
+ * TimeoutError as its cause).
  *
  * Walks `cause` like isConnectionRefused. The caller still keeps the old
  * substring test as a fallback for a runtime whose error carries neither name.
@@ -838,6 +840,7 @@ function sendViaUnixSocket(
     // req.destroy -- but oam's node:http ignores `signal`: a request under
     // AbortSignal.timeout(200) had still not aborted after 3 s on oam 0.16.2
     // (Node: 203 ms), which left this transport with no deadline at all there.
+    // Re-measured on oam 0.18.0: still not aborted after 3 s.
     // Once the timer has fired, every rejection that follows is reported as the
     // deadline itself: destroying a request whose response has already started
     // also fails the response with a generic "aborted", and the catch must see

@@ -1966,10 +1966,11 @@ describe("api", () => {
       expect(calls).toBe(1);
     });
 
-    // oam -- which bin/caddy-mcp.mjs serves on by default when a recent one is
-    // installed -- rejects a fired AbortSignal.timeout with DOMException
-    // TimeoutError "The operation timed out": the same error NAME as Node, but
-    // a message with neither "abort" nor "timeout" in it. Classified by message
+    // oam up to 0.17.x -- the runtime bin/caddy-mcp.mjs served on by default
+    // when one was installed -- rejected a fired AbortSignal.timeout with
+    // DOMException TimeoutError "The operation timed out": the same error NAME
+    // as Node, but a message with neither "abort" nor "timeout" in it. (oam
+    // 0.18.0 uses Node's wording; the name check covers both.) Classified by message
     // alone, it fell through to the generic transport branch, so these writes
     // were replayed up to 1 + CADDY_MAX_RETRIES times and the caller got the
     // bare runtime text. Observed under oam 0.16.2 with the old classifier:
