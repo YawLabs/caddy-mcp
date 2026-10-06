@@ -8,6 +8,37 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Changed
+- **The oam floor moves from 0.15.2 to 0.18.0, so the `caddy-mcp` launcher no
+  longer runs the server on an older oam.** This server is verified on one oam
+  release at a time, and the floor keeps the launcher off anything older than that
+  release. 0.18.0 is verified on the published aarch64-pc-windows-msvc binary,
+  checksum matched against the release SHA256SUMS, through the launcher with
+  `OAM_BIN` pointing at it and `PATH` holding only Node: a full MCP handshake
+  listing all 18 tools (the same 18 as on Node), `caddy_list_servers` against a
+  stand-in admin endpoint answering byte-for-byte as it does on Node, and the
+  server process confirmed as that binary (`oam run .../dist/index.js` as the
+  launcher's child; `process.versions.oam` reads 0.18.0). The opt-in sandbox was
+  re-measured on it: with `CADDY_MCP_SANDBOX=1 CADDY_MCP_RUNTIME=oam` the launcher
+  spawns `oam --permission --allow-net=127.0.0.1 --allow-env=... run`, and the
+  tools answer as they do on Node; launched as `oam run bin/caddy-mcp.mjs`, the
+  piped sandbox spawn from the oam host completes the handshake too, and without
+  the sandbox that host serves in-process. The net grant behaves as the launcher
+  assumes (`--allow-net=127.0.0.1` admits 127.0.0.1 and refuses `localhost`, a
+  bare `--allow-net` admits it, an omitted one refuses it with
+  `ERR_ACCESS_DENIED`), and oam's `node:http` still ignores `signal` (not aborted
+  after 3 s), so the unix-socket transport's explicit deadline timer stays. oam's
+  fetch now words an `AbortSignal.timeout` rejection as Node does; timeouts were
+  already recognised by the error's name, so nothing changes there. **If the
+  launcher finds only an oam from 0.15.2 to 0.17.x, it now falls back to Node
+  under the default `CADDY_MCP_RUNTIME=auto`, and exits with an error under
+  `CADDY_MCP_RUNTIME=oam`** -- it says so on stderr, naming the version it found
+  and the floor (measured with oam 0.17.0: `is oam 0.17.0, older than 0.18.0;
+  using Node instead.`). On Node every tool answers the same; what is lost is
+  `CADDY_MCP_SANDBOX=1`, which needs a fresh oam at the floor, so under `auto` the
+  server then runs without `--permission`, and under `CADDY_MCP_RUNTIME=oam` it
+  does not start. A client that runs `oam run /path/to/caddy-mcp/dist/index.js`
+  directly bypasses the launcher and keeps the oam it names. Run
+  `oam self-update`, or set `CADDY_MCP_RUNTIME=node` to make the choice explicit.
 - `release.sh` runs every mcp-publisher call to the MCP Registry, each login and
   each publish attempt, under coreutils `timeout` (`MCP_PUBLISH_TIMEOUT_S`,
   default 90 s) where one (or Homebrew's `gtimeout`) is on PATH -- without one
