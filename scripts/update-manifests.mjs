@@ -23,7 +23,7 @@
 // gh auth). Without --push it writes the files and prints the git commands.
 
 import { execFileSync } from "node:child_process";
-import { mkdirSync, mkdtempSync, readdirSync, readFileSync, writeFileSync } from "node:fs";
+import { mkdirSync, mkdtempSync, readdirSync, readFileSync, realpathSync, writeFileSync } from "node:fs";
 import { homedir, tmpdir } from "node:os";
 import { dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -39,23 +39,74 @@ const expand = (p) => (p.startsWith("~") ? join(homedir(), p.slice(1)) : p);
 
 // Escape a value for the inside of a Ruby double-quoted string literal. The
 // backslash goes first, or the backslashes added for the other characters get
-// doubled. `#` is escaped because `#{...}`, `#@x` and `#$x` interpolate inside
-// double quotes -- an unescaped `#{` in package.json's description would run as
-// Ruby when brew loads the formula. Raw newlines become `\n` so a multi-line
-// value cannot spill out of the one-line `desc` stanza.
+// doubled. `#` is escaped only where it starts interpolation (`#{...}`, `#@x`,
+// `#$x`) -- an unescaped `#{` in package.json's description would run as Ruby
+// when brew loads the formula. A plain `#` ("issue #12") stays as written.
+// Raw newlines become `\n` so a multi-line value cannot spill out of the
+// one-line `desc` stanza.
 export function rubyString(value) {
   return String(value ?? "")
     .replace(/\\/g, "\\\\")
     .replace(/"/g, '\\"')
-    .replace(/#/g, "\\#")
+    .replace(/#(?=[{@$])/g, "\\#")
     .replace(/\r/g, "\\r")
     .replace(/\n/g, "\\n");
 }
 
+// Render the Homebrew formula (CLI -> formula, NOT cask). Every value that came
+// from package.json goes through rubyString(); the urls and sha256s are built
+// by this script from the repo slug, tag and release sidecars.
+export function renderFormula({ className, cmd, description, homepage, version, license, proprietary, assets }) {
+  const licenseLine = proprietary ? "license :cannot_represent" : `license "${rubyString(license)}"`;
+  return `class ${className} < Formula
+  desc "${rubyString(description)}"
+  homepage "${rubyString(homepage)}"
+  version "${rubyString(version)}"
+  ${licenseLine}
+
+  on_macos do
+    on_arm do
+      url "${assets.macArm64.url}", using: :nounzip
+      sha256 "${assets.macArm64.sha256}"
+    end
+    on_intel do
+      url "${assets.macX64.url}", using: :nounzip
+      sha256 "${assets.macX64.sha256}"
+    end
+  end
+
+  on_linux do
+    on_intel do
+      url "${assets.linuxX64.url}", using: :nounzip
+      sha256 "${assets.linuxX64.sha256}"
+    end
+  end
+
+  def install
+    # Each per-arch release asset is a single bare binary; rename to the command.
+    bin.install Dir["*"].first => "${cmd}"
+  end
+
+  test do
+    assert_match version.to_s, shell_output("#{bin}/${cmd} --version")
+  end
+end
+`;
+}
+
 // Only run the release side effects when executed as a script, so a test can
-// import rubyString without triggering `gh release download`.
-const invokedPath = process.argv[1] ? resolve(process.argv[1]) : "";
-if (invokedPath === fileURLToPath(import.meta.url)) main();
+// import the helpers without triggering `gh release download`. Compare real
+// paths, so a run through a symlink or junction to the script still counts as
+// direct instead of silently doing nothing.
+function invokedDirectly() {
+  if (!process.argv[1]) return false;
+  try {
+    return realpathSync(process.argv[1]) === realpathSync(fileURLToPath(import.meta.url));
+  } catch {
+    return false;
+  }
+}
+if (invokedDirectly()) main();
 
 function main() {
   const pkg = JSON.parse(readFileSync(join(repoRoot, "package.json"), "utf-8"));
@@ -139,42 +190,18 @@ function main() {
     },
   };
 
-  // 3. Homebrew formula (CLI -> formula, NOT cask).
-  const licenseLine = proprietary ? "license :cannot_represent" : `license "${rubyString(pkg.license)}"`;
-  const formula = `class ${className} < Formula
-  desc "${rubyString(pkg.description)}"
-  homepage "${rubyString(homepage)}"
-  version "${rubyString(version)}"
-  ${licenseLine}
-
-  on_macos do
-    on_arm do
-      url "${dl(ASSETS.macArm64)}", using: :nounzip
-      sha256 "${hashFor(ASSETS.macArm64)}"
-    end
-    on_intel do
-      url "${dl(ASSETS.macX64)}", using: :nounzip
-      sha256 "${hashFor(ASSETS.macX64)}"
-    end
-  end
-
-  on_linux do
-    on_intel do
-      url "${dl(ASSETS.linuxX64)}", using: :nounzip
-      sha256 "${hashFor(ASSETS.linuxX64)}"
-    end
-  end
-
-  def install
-    # Each per-arch release asset is a single bare binary; rename to the command.
-    bin.install Dir["*"].first => "${cmd}"
-  end
-
-  test do
-    assert_match version.to_s, shell_output("#{bin}/${cmd} --version")
-  end
-end
-`;
+  // 3. Homebrew formula.
+  const asset = (name) => ({ url: dl(name), sha256: hashFor(name) });
+  const formula = renderFormula({
+    className,
+    cmd,
+    description: pkg.description,
+    homepage,
+    version,
+    license: pkg.license,
+    proprietary,
+    assets: { macArm64: asset(ASSETS.macArm64), macX64: asset(ASSETS.macX64), linuxX64: asset(ASSETS.linuxX64) },
+  });
 
   // 4. Write both manifests into the sibling repos.
   const scoopRel = `bucket/${pkgShort}.json`;
