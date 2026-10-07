@@ -147,7 +147,7 @@ describe("update-manifests renderFormula", () => {
       ...base,
       assets: { ...base.assets, macArm64: { url: hostileUrl, sha256: hostileSha } },
     });
-    const urlLine = formula.split("\n").find((l) => l.trimStart().startsWith("url ") && l.includes("v1"));
+    const urlLine = formula.split("\n").find((l) => l.trimStart().startsWith("url ") && l.includes("system"));
     expect(
       parseRubyDq(
         urlLine
