@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [2.5.10] — 2026-10-07
+
 ### Fixed
 - `scripts/update-manifests.mjs` now also runs the formula's `url`, `sha256` and
   command-name strings through `rubyString()`. 2.5.9 escaped only the
