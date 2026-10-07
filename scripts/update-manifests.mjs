@@ -53,10 +53,16 @@ export function rubyString(value) {
     .replace(/\n/g, "\\n");
 }
 
-// Render the Homebrew formula (CLI -> formula, NOT cask). Every value that came
-// from package.json goes through rubyString(); the urls and sha256s are built
-// by this script from the repo slug, tag and release sidecars.
+// Render the Homebrew formula (CLI -> formula, NOT cask). Every value that lands
+// inside a Ruby string goes through rubyString(), the urls and sha256s included:
+// a url carries the --version argument (through the tag) and a sha256 is the
+// text of a downloaded release sidecar, so neither is known-safe here. The class
+// name is a Ruby constant, which cannot be escaped, so anything but a plain
+// CamelCase word is refused.
 export function renderFormula({ className, cmd, description, homepage, version, license, proprietary, assets }) {
+  if (!/^[A-Z][A-Za-z0-9]*$/.test(className)) {
+    throw new Error(`cannot use ${JSON.stringify(className)} as a Homebrew formula class name`);
+  }
   const licenseLine = proprietary ? "license :cannot_represent" : `license "${rubyString(license)}"`;
   return `class ${className} < Formula
   desc "${rubyString(description)}"
@@ -66,29 +72,29 @@ export function renderFormula({ className, cmd, description, homepage, version, 
 
   on_macos do
     on_arm do
-      url "${assets.macArm64.url}", using: :nounzip
-      sha256 "${assets.macArm64.sha256}"
+      url "${rubyString(assets.macArm64.url)}", using: :nounzip
+      sha256 "${rubyString(assets.macArm64.sha256)}"
     end
     on_intel do
-      url "${assets.macX64.url}", using: :nounzip
-      sha256 "${assets.macX64.sha256}"
+      url "${rubyString(assets.macX64.url)}", using: :nounzip
+      sha256 "${rubyString(assets.macX64.sha256)}"
     end
   end
 
   on_linux do
     on_intel do
-      url "${assets.linuxX64.url}", using: :nounzip
-      sha256 "${assets.linuxX64.sha256}"
+      url "${rubyString(assets.linuxX64.url)}", using: :nounzip
+      sha256 "${rubyString(assets.linuxX64.sha256)}"
     end
   end
 
   def install
     # Each per-arch release asset is a single bare binary; rename to the command.
-    bin.install Dir["*"].first => "${cmd}"
+    bin.install Dir["*"].first => "${rubyString(cmd)}"
   end
 
   test do
-    assert_match version.to_s, shell_output("#{bin}/${cmd} --version")
+    assert_match version.to_s, shell_output("#{bin}/${rubyString(cmd)} --version")
   end
 end
 `;

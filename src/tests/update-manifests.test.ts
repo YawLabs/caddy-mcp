@@ -140,6 +140,50 @@ describe("update-manifests renderFormula", () => {
     expect(parseRubyDq(stanza(formula, "license"))).toBe('MIT"#@l');
   });
 
+  it("escapes the urls and sha256s, which carry the --version tag and downloaded sidecar text", () => {
+    const hostileUrl = 'https://x/v1"#{system("id")}/caddy-mcp-darwin-arm64';
+    const hostileSha = '00"\nend\nclass Evil < Formula\n#{`id`}';
+    const formula = renderFormula({
+      ...base,
+      assets: { ...base.assets, macArm64: { url: hostileUrl, sha256: hostileSha } },
+    });
+    const urlLine = formula.split("\n").find((l) => l.trimStart().startsWith("url ") && l.includes("v1"));
+    expect(
+      parseRubyDq(
+        urlLine
+          ?.trim()
+          .replace(/^url "/, "")
+          .replace(/", using: :nounzip$/, "") ?? "",
+      ),
+    ).toBe(hostileUrl);
+    const shaLine = formula.split("\n").find((l) => l.trimStart().startsWith("sha256 ") && !l.includes('"0000'));
+    expect(
+      parseRubyDq(
+        shaLine
+          ?.trim()
+          .replace(/^sha256 "/, "")
+          .replace(/"$/, "") ?? "",
+      ),
+    ).toBe(hostileSha);
+    expect(formula).not.toMatch(/^class Evil/m);
+  });
+
+  it("escapes the command name in bin.install and the test block", () => {
+    const formula = renderFormula({ ...base, cmd: 'caddy"#{x}' });
+    expect(formula).toContain('bin.install Dir["*"].first => "caddy\\"\\#{x}"');
+    expect(formula).toContain('shell_output("#{bin}/caddy\\"\\#{x} --version")');
+  });
+
+  it.each([
+    ["caddyMcp"],
+    ["2fa"],
+    ["Foo.Bar"],
+    ["Evil < Object; end; class X"],
+    [""],
+  ])("refuses %j as a class name", (className) => {
+    expect(() => renderFormula({ ...base, className })).toThrow("class name");
+  });
+
   it("writes license :cannot_represent for a proprietary package", () => {
     const formula = renderFormula({ ...base, license: "UNLICENSED", proprietary: true });
     expect(formula).toContain("\n  license :cannot_represent\n");

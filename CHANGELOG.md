@@ -7,6 +7,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+- `scripts/update-manifests.mjs` now also runs the formula's `url`, `sha256` and
+  command-name strings through `rubyString()`. 2.5.9 escaped only the
+  package.json values, but a `url` carries the `--version` argument (through the
+  release tag) and a `sha256` is the text of a downloaded `.sha256` sidecar, so
+  either could still put a raw `"` or `#{...}` into the formula. The class name,
+  a Ruby constant that cannot be escaped, must now be a plain CamelCase word.
+  Release tooling only; the server itself is unchanged.
+
 ## [2.5.9] — 2026-10-06
 
 ### Security
