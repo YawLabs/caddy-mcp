@@ -104,6 +104,21 @@ that socket: over a unix path caddy-mcp is usually talking to Caddy's own
 socket, where the token does nothing — and, before Caddy 2.11.3, is logged in
 clear.
 
+**Runtime (oam or Node):**
+
+The `caddy-mcp` command prefers [oam](https://oamjs.org) when it finds a usable
+one and otherwise runs on Node. It never serves on an oam older than 0.18.0.
+
+| Environment variable | Default | Description |
+|---|---|---|
+| `CADDY_MCP_RUNTIME` | `auto` | `auto`: the newest oam at 0.18.0 or newer, else Node. `oam`: oam or exit with an error. `node`: always Node -- the escape hatch when a problem only shows up under oam. |
+| `CADDY_MCP_SANDBOX` | (unset) | `1` runs the server under oam's `--permission` sandbox: network limited to the `CADDY_ADMIN_URL` host and port, filesystem limited to `CADDY_MCP_SNAPSHOT_DIR`, no child processes. Needs oam; under `auto` a machine without one runs unsandboxed, so pair it with `CADDY_MCP_RUNTIME=oam` when the sandbox has to hold. A unix-socket `CADDY_ADMIN_URL` is not reachable under the sandbox yet. |
+| `OAM_BIN` | (unset) | Path to the oam binary to use. Otherwise the launcher checks `OAM_INSTALL_DIR`, the installed locations (`~/.oam/bin`, and `%LOCALAPPDATA%\oam\bin` on Windows) and `PATH`, and takes the newest. |
+
+An outdated oam is fixed with `oam self-update`. Under Yaw MCP, which runs servers
+on oam by default, `yaw-mcp set <namespace> runtime=node` switches this server to
+Node.
+
 **Alternate MCP clients:**
 
 | Client | Config file |

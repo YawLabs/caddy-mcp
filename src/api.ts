@@ -924,9 +924,15 @@ async function sendViaFetch(
  * `disconnect` per socket that closes -- its own idle timeout, or the server
  * hanging up -- with the origin as the first argument. The dispatcher lives at
  * a well-known symbol (the same one Node's fetch reads on every call), so no
- * import of undici is needed. If a future Node moves it, hookGlobalDispatcher
- * finds nothing, the count stays empty, and settleAdminRestart is a no-op:
- * the pre-fix behavior, never anything worse.
+ * import of undici is needed.
+ *
+ * On oam the hook finds nothing: oam's fetch pool is its own, the symbol is
+ * undefined after a fetch (measured on 0.18.0), and oam's builtin `undici`
+ * Agent emits no connect/disconnect events even when installed as the global
+ * dispatcher. settleAdminRestart therefore cannot count sockets there and
+ * falls back to a fixed wait instead -- see its comment. On a Node that moves
+ * the symbol the hook finds nothing too, and the settle is a no-op: the pre-fix
+ * behavior, never anything worse.
  */
 const GLOBAL_DISPATCHER_KEY = Symbol.for("undici.globalDispatcher.1");
 interface DispatcherEvents {
@@ -1004,9 +1010,24 @@ function originOf(origin: unknown): string | undefined {
  *
  * The wait is event-driven and short (the close arrives with the response);
  * ADMIN_RESTART_SETTLE_MS caps it for the cases where no close is coming.
+ *
+ * On oam there are no socket events to wait on (see GLOBAL_DISPATCHER_KEY), so
+ * the wait is the fixed ADMIN_RESTART_SETTLE_MS instead. It used to be no wait
+ * at all there, and the race came back: against Caddy 2.11.4 on Windows with
+ * oam 0.18.0, about 2,100 back-to-back config changes produced one "Cannot
+ * connect" reset and then wedged the admin endpoint in the accept-loop bug
+ * above (Caddy logging "accept tcp ...: i/o timeout; retrying" until it was
+ * restarted). With the fixed wait the same probe ran 1,800 changes with no
+ * failure and no accept timeout. The cost is 250 ms per config change on oam,
+ * where Node usually waits well under a millisecond.
  */
 function settleAdminRestart(origin: string | undefined): Promise<void> {
-  if (!origin || !dispatcherHooked || (liveSockets.get(origin) ?? 0) === 0) return Promise.resolve();
+  if (!origin) return Promise.resolve();
+  if (!dispatcherHooked) {
+    if (process.versions.oam === undefined) return Promise.resolve();
+    return new Promise((resolve) => setTimeout(resolve, ADMIN_RESTART_SETTLE_MS));
+  }
+  if ((liveSockets.get(origin) ?? 0) === 0) return Promise.resolve();
   return new Promise((resolve) => {
     const timer = setTimeout(done, ADMIN_RESTART_SETTLE_MS);
     function check() {
@@ -1338,8 +1359,10 @@ async function sendOnce<T = any>(
       };
     }
     // By name first (isTimeoutError explains why the text is not enough); the
-    // substring test stays as a fallback for a runtime whose error carries no
-    // standard name, with "timed out" added for oam's wording.
+    // substring test stays as a generic fallback for a runtime whose error
+    // carries no standard name. "timed out" is part of that fallback: it is the
+    // other common phrasing of a deadline, not one any runtime the launcher
+    // serves on still produces.
     if (isTimeoutError(err) || msg.includes("abort") || msg.includes("timeout") || msg.includes("timed out")) {
       transport.timedOut = true;
       const timedOutMsg = `Request timed out after ${effectiveTimeout}ms`;

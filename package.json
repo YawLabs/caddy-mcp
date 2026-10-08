@@ -32,6 +32,7 @@
     "lint:fix": "node scripts/lint.mjs check --write src/ bin/ scripts/",
     "typecheck": "node scripts/typecheck.mjs",
     "typecheck:tsc": "tsc --noEmit",
+    "check:oam-floor": "node scripts/check-oam-floor.mjs",
     "test:ci": "npm run build && npm test",
     "prepublishOnly": "npm run build",
     "prepare": "git config core.hooksPath .githooks 2>/dev/null || true",

@@ -1966,18 +1966,16 @@ describe("api", () => {
       expect(calls).toBe(1);
     });
 
-    // oam up to 0.17.x -- the runtime bin/caddy-mcp.mjs served on by default
-    // when one was installed -- rejected a fired AbortSignal.timeout with
-    // DOMException TimeoutError "The operation timed out": the same error NAME
-    // as Node, but a message with neither "abort" nor "timeout" in it. (oam
-    // 0.18.0 uses Node's wording; the name check covers both.) Classified by message
-    // alone, it fell through to the generic transport branch, so these writes
-    // were replayed up to 1 + CADDY_MAX_RETRIES times and the caller got the
-    // bare runtime text. Observed under oam 0.16.2 with the old classifier:
-    // configPatch, configDelete of a key and loadConfig each reached a server
-    // that never answered 3 times.
-    describe("with oam's wording", () => {
-      const oamTimeout = () => new DOMException("The operation timed out", "TimeoutError");
+    // A TimeoutError whose MESSAGE says neither "abort" nor "timeout" -- "The
+    // operation timed out". The NAME is what classifies it (isTimeoutError);
+    // classified by message alone it fell through to the generic transport
+    // branch, so these writes were replayed up to 1 + CADDY_MAX_RETRIES times and
+    // the caller got the bare runtime text. History: oam up to 0.17.x worded its
+    // timeouts this way (observed under 0.16.2 with the old classifier). No
+    // runtime the launcher serves on does now -- oam 0.18.0, the floor, uses
+    // Node's wording -- so this pins the name-based rule, not any one runtime.
+    describe("with a TimeoutError worded 'timed out'", () => {
+      const timedOutError = () => new DOMException("The operation timed out", "TimeoutError");
 
       it.each<[string, Call]>([
         ["PATCH", (api) => api.configPatch("apps/http/servers/srv0", { listen: [":443"] })],
@@ -1989,7 +1987,7 @@ describe("api", () => {
         let calls = 0;
         globalThis.fetch = vi.fn(async () => {
           calls++;
-          throw oamTimeout();
+          throw timedOutError();
         }) as any;
 
         const res = await call(api);
@@ -2007,7 +2005,7 @@ describe("api", () => {
         let calls = 0;
         globalThis.fetch = vi.fn(async () => {
           calls++;
-          throw oamTimeout();
+          throw timedOutError();
         }) as any;
 
         const res = await api.configGet("apps");
@@ -3901,5 +3899,65 @@ describe("api", () => {
         await srv.close();
       }
     });
+  });
+});
+
+// On oam the global-dispatcher hook finds nothing (oam's fetch pool is its own
+// and emits no socket events), so settleAdminRestart has no sockets to count and
+// waits the fixed ADMIN_RESTART_SETTLE_MS instead. It used to return at once
+// there, which let the reused-socket reset and Caddy's Windows accept-loop wedge
+// back in. Simulated here: no dispatcher at the well-known symbol, and
+// process.versions.oam defined, against a fresh module so no earlier real fetch
+// has hooked the Node dispatcher.
+describe("settleAdminRestart when no dispatcher can be hooked", () => {
+  const KEY = Symbol.for("undici.globalDispatcher.1");
+  const originalFetch = globalThis.fetch;
+  const savedUrl = process.env.CADDY_ADMIN_URL;
+  const savedRetries = process.env.CADDY_MAX_RETRIES;
+  let savedDispatcher: unknown;
+
+  beforeEach(() => {
+    savedDispatcher = (globalThis as Record<symbol, unknown>)[KEY];
+    (globalThis as Record<symbol, unknown>)[KEY] = undefined;
+    process.env.CADDY_ADMIN_URL = "http://localhost:2019";
+    process.env.CADDY_MAX_RETRIES = "0";
+    globalThis.fetch = vi.fn(async () => new Response("", { status: 200 })) as unknown as typeof fetch;
+    vi.resetModules();
+  });
+
+  afterEach(() => {
+    (globalThis as Record<symbol, unknown>)[KEY] = savedDispatcher;
+    globalThis.fetch = originalFetch;
+    delete (process.versions as Record<string, string | undefined>).oam;
+    if (savedUrl !== undefined) process.env.CADDY_ADMIN_URL = savedUrl;
+    else delete process.env.CADDY_ADMIN_URL;
+    if (savedRetries !== undefined) process.env.CADDY_MAX_RETRIES = savedRetries;
+    else delete process.env.CADDY_MAX_RETRIES;
+    vi.resetModules();
+  });
+
+  async function timedConfigChange(): Promise<number> {
+    const api = await import("../api.js");
+    const started = performance.now();
+    const res = await api.configPost("apps/http/servers/srv0/routes", { handle: [] });
+    expect(res.ok).toBe(true);
+    return performance.now() - started;
+  }
+
+  it("waits the fixed settle window after a config change on oam", async () => {
+    Object.defineProperty(process.versions, "oam", { value: "0.18.0", configurable: true, enumerable: true });
+    expect(await timedConfigChange()).toBeGreaterThanOrEqual(240);
+  });
+
+  it("does not wait on a non-oam runtime whose dispatcher cannot be hooked", async () => {
+    expect(await timedConfigChange()).toBeLessThan(200);
+  });
+
+  it("does not wait after a read, even on oam", async () => {
+    Object.defineProperty(process.versions, "oam", { value: "0.18.0", configurable: true, enumerable: true });
+    const api = await import("../api.js");
+    const started = performance.now();
+    expect((await api.configGet("apps")).ok).toBe(true);
+    expect(performance.now() - started).toBeLessThan(200);
   });
 });

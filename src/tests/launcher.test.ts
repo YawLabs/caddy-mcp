@@ -146,6 +146,9 @@ describe.skipIf(!existsSync(DIST_CLI))("launcher: runtime selection", () => {
     expect(res.stdout).toBe("");
     expect(res.stderr).toContain("no usable oam (0.18.0 or newer) was found");
     expect(res.stderr).toContain("does not exist");
+    // The remedy names the cause that was seen: a wrong OAM_BIN, not an install.
+    expect(res.stderr).toContain("Point OAM_BIN at an existing oam binary, or unset it.");
+    expect(res.stderr).not.toContain("self-update");
     // This diagnostic precedes process.exit and is written synchronously. If
     // that ever regressed to an async write, the exit would truncate it away.
     expect(res.stderr).toContain("CADDY_MCP_RUNTIME=node");
@@ -468,6 +471,27 @@ describe.skipIf(!existsSync(DIST_CLI))("launcher: with no usable oam", () => {
   );
 
   it(
+    "strips oam's permission flags from NODE_OPTIONS before handing off to Node",
+    async () => {
+      // oam 0.18.0 reads --permission / --allow-* from NODE_OPTIONS and appends
+      // its own to every child's, and Node refuses an oam-only flag there
+      // outright: `NODE_OPTIONS=--allow-net node` exits 9 before any script
+      // runs. Set inside the launcher process (the preload), not in the env the
+      // test spawns it with, because the Node running the LAUNCHER here would
+      // refuse it the same way. --no-warnings is a Node flag and must survive.
+      const run = await runOnHost(
+        "0.18.0",
+        isolated({ CADDY_MCP_RUNTIME: "node", OAM_BIN: MISSING_OAM }),
+        `process.env.NODE_OPTIONS = "--permission --allow-net=localhost:2019 --allow-fs-read=/tmp --no-warnings";`,
+      );
+      expect(servedVersion(run), JSON.stringify(run)).toBe(true);
+      expect(run.stderr).toMatch(HANDED_OFF_MARKER);
+      expect(run.stderr).not.toContain("is not allowed in NODE_OPTIONS");
+    },
+    TIMEOUT_MS,
+  );
+
+  it(
     "hands CADDY_MCP_RUNTIME=node off to Node even on a supported oam host, sandbox or not",
     async () => {
       for (const sandbox of [undefined, "1"]) {
@@ -668,6 +692,10 @@ describe.skipIf(isWin || !existsSync(DIST_CLI))("launcher: signal handling", () 
     const res = await runLauncher(["--version"], isolated({ CADDY_MCP_RUNTIME: "oam", OAM_BIN: writeFake(TOO_OLD) }));
     expect(res.code).toBe(1);
     expect(res.stderr).toContain("is oam 0.8.9, older than 0.18.0");
+    // An outdated oam is fixed in place; sending this user to the website
+    // would make them reinstall what `oam self-update` does for them.
+    expect(res.stderr).toContain("Run `oam self-update` to get oam 0.18.0 or newer.");
+    expect(res.stderr).not.toContain("https://oamjs.org");
   }, 30000);
 
   /** Signal the launcher `count` times, starting once the child is up. */
@@ -765,21 +793,35 @@ describe.skipIf(isWin || !existsSync(DIST_CLI))("launcher: sandbox grants", () =
     // the dial are matched as TEXT, so a launcher defaulting to 127.0.0.1 while
     // the server dials localhost denies every request out of the box -- with
     // both files reading correctly on their own.
-    expect(grant(argv, "--allow-net")).toBe("localhost");
+    expect(grant(argv, "--allow-net")).toBe("localhost:2019");
     // Process-level flags belong BEFORE the subcommand: `oam run --permission`
     // is rejected outright.
     expect(argv.indexOf("--permission")).toBe(0);
     expect(argv[argv.indexOf("run") + 1]).toBe(DIST_CLI);
   }, 30000);
 
-  it("derives the grant from CADDY_ADMIN_URL, host only", async () => {
+  it("derives the grant from CADDY_ADMIN_URL, host and port", async () => {
     const argv = await argvFor({ CADDY_ADMIN_URL: "http://caddy.internal:9000" });
-    // Host WITHOUT the port. oam presents the bare hostname to the net check for
-    // `fetch` and "host:port" only for sockets, and grants are prefix-matched --
-    // "caddy.internal" does not start with "caddy.internal:9000", so pinning the
-    // port denies every request api.ts makes over TCP.
-    expect(grant(argv, "--allow-net")).toBe("caddy.internal");
+    // Port-scoped. Since oam 0.18.0 the resource fetch presents is "host:port"
+    // and a port-scoped entry admits it, so the grant names exactly the endpoint
+    // api.ts dials -- not every port on the host, as the bare host used to.
+    expect(grant(argv, "--allow-net")).toBe("caddy.internal:9000");
   }, 30000);
+
+  for (const [url, want] of [
+    ["http://caddy.internal", "caddy.internal:80"],
+    ["https://caddy.internal", "caddy.internal:443"],
+    ["https://caddy.internal:8443", "caddy.internal:8443"],
+    // `URL.hostname` keeps the brackets, which is the spelling oam matches:
+    // `--allow-net=[::1]:2019` admits fetch to http://[::1]:2019/, and
+    // `--allow-net=::1:2019` is refused (measured on 0.18.0).
+    ["http://[::1]:2019", "[::1]:2019"],
+  ]) {
+    it(`fills in the port for ${url}`, async () => {
+      const argv = await argvFor({ CADDY_ADMIN_URL: url });
+      expect(grant(argv, "--allow-net")).toBe(want);
+    }, 30000);
+  }
 
   for (const [label, value] of [
     ["empty", ""],
@@ -787,7 +829,7 @@ describe.skipIf(isWin || !existsSync(DIST_CLI))("launcher: sandbox grants", () =
   ]) {
     it(`treats an ${label} CADDY_ADMIN_URL as unset, not as "grant everything"`, async () => {
       const argv = await argvFor({ CADDY_ADMIN_URL: value });
-      expect(grant(argv, "--allow-net")).toBe("localhost");
+      expect(grant(argv, "--allow-net")).toBe("localhost:2019");
       // The regression: `??` keeps "" (only null/undefined fall through), the
       // URL parse is skipped, and the BARE --allow-net grants every host on the
       // network -- a sandbox switched on and silently doing nothing. api.ts
@@ -836,7 +878,7 @@ describe.skipIf(isWin || !existsSync(DIST_CLI))("launcher: sandbox grants", () =
     // case in getMalformedUnixUrl by matching "unix:" / "unix/" rather than a
     // bare "unix" prefix.
     const argv = await argvFor({ CADDY_ADMIN_URL: "http://unix.example.com:2019" });
-    expect(grant(argv, "--allow-net")).toBe("unix.example.com");
+    expect(grant(argv, "--allow-net")).toBe("unix.example.com:2019");
   }, 30000);
 
   it("grants every environment variable the shipped bundle reads", async () => {
@@ -863,8 +905,7 @@ describe.skipIf(isWin || !existsSync(DIST_CLI))("launcher: sandbox grants", () =
 
   it("grants exactly the snapshot directory when persistence is on", async () => {
     // A path, not a real directory: the grant is derived textually and the
-    // launcher never stats it. An absolute path is already normalized, so the
-    // two spellings collapse to one entry (see the relative case below).
+    // launcher never stats it.
     const dir = join(tmpdir(), "caddy-mcp-snapshots");
     const argv = await argvFor({ CADDY_MCP_SNAPSHOT_DIR: dir });
     // Read AND write: snapshots.ts writes each snapshot and reads the directory
@@ -875,15 +916,15 @@ describe.skipIf(isWin || !existsSync(DIST_CLI))("launcher: sandbox grants", () =
     expect(grant(argv, "--allow-fs-write")).toBe(dir);
   }, 30000);
 
-  it("grants both spellings of a relative snapshot directory", async () => {
-    // Grants are plain string PREFIXES matched against the path each call
-    // passes. snapshots.ts hands the raw variable to readdirSync/mkdirSync but
-    // builds per-file paths with path.join, which normalizes "./snaps" to
-    // "snaps" -- so the raw form alone misses the files and the normalized form
-    // alone misses the directory listing.
+  it("grants a relative snapshot directory as one entry, spelled as given", async () => {
+    // oam 0.18.0 resolves a relative grant against the cwd at startup and each
+    // path a call passes against the cwd of the moment, so one "./snaps" admits
+    // the raw spelling snapshots.ts hands readdirSync/mkdirSync AND the
+    // path.join-normalized "snaps/<file>" it reads and writes. It used to be
+    // granted twice ("./snaps,snaps"), when grants were string prefixes.
     const argv = await argvFor({ CADDY_MCP_SNAPSHOT_DIR: "./snaps" });
-    expect(grant(argv, "--allow-fs-read")).toBe("./snaps,snaps");
-    expect(grant(argv, "--allow-fs-write")).toBe("./snaps,snaps");
+    expect(grant(argv, "--allow-fs-read")).toBe("./snaps");
+    expect(grant(argv, "--allow-fs-write")).toBe("./snaps");
   }, 30000);
 
   it("emits no permission flags at all unless CADDY_MCP_SANDBOX=1", async () => {
@@ -937,6 +978,16 @@ describe.skipIf(isWin || !existsSync(DIST_CLI))("launcher: discovery", () => {
     expect(res.code, res.stderr).toBe(0);
     expect(res.stderr).toContain("CHILD: path");
     expect(res.stderr).not.toContain("CHILD: installed");
+  }, 30000);
+
+  it("finds an oam in OAM_INSTALL_DIR that is on neither PATH nor a default location", async () => {
+    // OAM_INSTALL_DIR is the installer's target. An oam installed there and never
+    // put on PATH used to be invisible to discovery.
+    const installDir = mkdtempSync(join(tmpdir(), "caddy-mcp-install-dir-"));
+    writeFake(fake("0.18.0", "install-dir"), installDir);
+    const res = await runLauncher([], isolated({ CADDY_MCP_RUNTIME: "oam", OAM_INSTALL_DIR: installDir }));
+    expect(res.code, res.stderr).toBe(0);
+    expect(res.stderr).toContain("CHILD: install-dir");
   }, 30000);
 
   it("keeps the installed copy on a tie", async () => {
@@ -1022,14 +1073,15 @@ describe.skipIf(isWin || !existsSync(DIST_CLI))("launcher: version gate fallback
 
   it("names the unreadable binary, not self-update, under CADDY_MCP_RUNTIME=oam", async () => {
     // The loud counterpart of the case above: exit 1, with the detail and the
-    // generic remedy line.
+    // remedy for an unrunnable binary -- not an install, and not self-update.
     const res = await runLauncher(
       ["--version"],
       isolated({ CADDY_MCP_RUNTIME: "oam", OAM_BIN: writeFake(UNREADABLE) }),
     );
     expect(res.code).toBe(1);
     expect(res.stderr).toContain("could not be run, or did not report a version this launcher understands");
-    expect(res.stderr).toContain("Install or update from https://oamjs.org");
+    expect(res.stderr).toContain("Check that it is an executable oam binary for this platform.");
+    expect(res.stderr).not.toContain("https://oamjs.org");
     // The regression that would matter: `oam self-update` cannot fix a binary
     // that never ran, so offering it costs the operator the real cause.
     expect(res.stderr).not.toContain("self-update");
