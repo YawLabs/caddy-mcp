@@ -19,7 +19,11 @@ MCP server for managing Caddy web servers via the admin API. 18 tools across con
 ## Runtime: oam for the dev loop, Node for artifacts
 
 [oam](https://oamjs.org) is **not** an npm dependency and is never assumed present.
-Discovery lives in `scripts/runtime.mjs`: `$OAM_BIN`, then `oam` on PATH, then Node.
+Discovery lives in `scripts/runtime.mjs`: `$OAM_BIN`, then the installed locations
+(`~/.oam/bin`, `%LOCALAPPDATA%\oam\bin`), then `oam` on PATH, then Node. The `bin`
+launcher (`bin/caddy-mcp.mjs`) searches `OAM_INSTALL_DIR`, the installed locations and
+PATH too, but asks every candidate for its version and picks the NEWEST usable one
+rather than the first found.
 
 The split is deliberate — **auto-detect for tools, explicit for artifacts**:
 
@@ -38,8 +42,10 @@ on one machine and a 75 MB SEA binary on another, silently. So oam is opt-in the
 downgrade to a different artifact. Type-checking auto-detects because it emits nothing —
 a type error is a type error under either checker.
 
-**oam is currently a local dev build**, not a published release. Anyone without it gets
-the Node path everywhere, which is the default for the shipped binary anyway.
+**oam ships signed releases** (a signed release manifest, Authenticode on Windows,
+codesigned on macOS); 0.18.0 is the floor this server is verified on, and
+`scripts/check-oam-floor.mjs` keeps the floor consistent and current. Anyone without
+oam gets the Node path everywhere, which is the default for the shipped binary anyway.
 
 Measured on windows-arm64, 7-run averages:
 
@@ -71,7 +77,7 @@ Read by `src/api.ts`. All optional.
 | `CADDY_ADMIN_URL` | `http://localhost:2019` | Admin API base URL. Trailing slashes stripped. A `unix:///path` or `unix//path` value switches the transport from global `fetch` to `node:http` with `socketPath` — `fetch` cannot dial a unix socket. The unix path deliberately sends **no** `Origin` header: Caddy builds no default origin allowlist for a unix/fd admin listener and only runs its origin check when `Origin` or `Sec-Fetch-Mode` is present, so sending one opts into a check against an empty list and always 403s. |
 | `CADDY_API_TOKEN` | (unset) | Sent as `Authorization: Bearer <token>` when present. |
 | `CADDY_TIMEOUT` | `10000` | Per-request timeout in ms for requests that do not change the config (GETs, `/adapt`, `/stop`, PKI, upstreams, metrics). Values that floor below 1 fall back to the default. |
-| `CADDY_LOAD_TIMEOUT` | `55000` | Timeout for every config change — `POST /load` and every non-GET under `/config` and `/id` — because each is the same synchronous full reload inside Caddy. A timeout on one of these is never retried, and its error says the outcome is unknown (the response carries `outcomeUnknown`, on which `caddy_load` / `caddy_revert` keep their snapshot). A timeout is recognised by the error's name (`TimeoutError` / `AbortError`), not its text, which differs under oam. The default is one constant, `LOAD_TIMEOUT`, deliberately below the MCP SDK client's 60 s request timeout; at or above it the outcome-unknown error is never delivered. Values that floor below 1 fall back to the default. |
+| `CADDY_LOAD_TIMEOUT` | `55000` | Timeout for every config change — `POST /load` and every non-GET under `/config` and `/id` — because each is the same synchronous full reload inside Caddy. A timeout on one of these is never retried, and its error says the outcome is unknown (the response carries `outcomeUnknown`, on which `caddy_load` / `caddy_revert` keep their snapshot). A timeout is recognised by the error's name (`TimeoutError` / `AbortError`), not its text, which differs between runtimes. The default is one constant, `LOAD_TIMEOUT`, deliberately below the MCP SDK client's 60 s request timeout; at or above it the outcome-unknown error is never delivered. Values that floor below 1 fall back to the default. |
 | `CADDY_MAX_RETRIES` | `2` | Retries on transient failures: a network error, or a 502/503/504 (only a proxy in front of Caddy sends those). Hard-capped at 5; exceeding the cap warns once on stderr. Never retries 4xx (including 412), Caddy's own 500s, a config change whose timeout fired, or — unless the connection was refused — a POST under `/config` or `/id`, a PUT/DELETE at an array index, or a PUT to a bare `/id/<id>` (Caddy resolves it to an array index for a route). Those path shapes match with trailing slashes and with the trailing `/...` segment Caddy strips before it picks a method, so `.../routes/0/...` and `PUT /id/<id>/...` are covered; a trailing `/...` with no index in front of it is not, and still retries. |
 | `CADDY_MCP_SNAPSHOT_DIR` | (unset) | Persist `caddy_revert` snapshots here instead of memory-only. Opt-in because snapshots are full configs and can carry secrets. Write failures degrade to in-memory rather than failing the tool call. |
 

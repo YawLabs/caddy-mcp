@@ -88,18 +88,24 @@
  *
  * The admin API endpoint is DERIVED from CADDY_ADMIN_URL (default
  * http://localhost:2019 -- byte-identical to DEFAULT_URL in src/api.ts, see
- * sandboxFlags). For a TCP endpoint the grant is the HOST, deliberately WITHOUT
- * a port: oam checks `fetch` against the bare hostname and sockets against
- * "host:port", and grants are prefix-matched, so pinning the port denies every
- * fetch -- and fetch is the transport api.ts uses for everything but a unix
- * socket. Granting the host therefore also admits its other ports; that is the
- * cost of the check having no port to match against.
+ * sandboxFlags). For a TCP endpoint the grant is "host:port" -- the port taken
+ * from the URL, or the scheme's default (80/443) when it names none. Since oam
+ * 0.18.0, the floor, a port-scoped `--allow-net` entry admits `fetch` to that
+ * port exactly as it admits a socket, and the resource fetch presents is
+ * "host:port" (an IPv6 literal bracketed, "[::1]:2019"). Up to 0.17.1 a
+ * port-scoped entry admitted no HTTP request at all, which is why this grant
+ * used to be the bare host -- and the bare host admits every port on it.
  *
  * A unix-socket CADDY_ADMIN_URL gets NO net grant, which DENIES the category
  * outright -- it is not an oversight that it looks narrower than the TCP case.
- * oam ships no unix socket transport, so the socket dial cannot work under the
- * sandbox regardless; the alternative was a bare `--allow-net`, which grants
- * every host on the network. See sandboxFlags for the mechanism.
+ * oam 0.18.0 added net over pipes (Unix domain sockets, Windows named pipes)
+ * with `http.request({ socketPath })` riding on them, and under --permission a
+ * socket would need `--allow-net=<absolute path>` plus fs read and write grants
+ * naming it. That has not been measured for this server: oam's own changelog
+ * calls the Unix half untested off Windows, and this server has not been
+ * run that way on Linux/macOS. Until it is, the socket stays
+ * denied; the alternative was a bare `--allow-net`, which grants every host on
+ * the network. See sandboxFlags for the mechanism.
  *
  * Child-process stays denied: this server drives Caddy entirely over its admin
  * HTTP API and never shells out to the `caddy` binary (the only execFileSync
@@ -184,7 +190,9 @@ function pathKey(p) {
  * Both installed forms are checked on Windows: the installer defaults to
  * %LOCALAPPDATA%\oam\bin there, but oam's docs name ~/.oam/bin first and
  * OAM_INSTALL_DIR can pick either, so checking one silently misses a real
- * install.
+ * install. OAM_INSTALL_DIR itself, when set, is checked FIRST: it is the
+ * installer's target directory (oam docs/cli-reference.md), so an oam installed
+ * there and never put on PATH would otherwise be invisible.
  *
  * PATH is resolved manually rather than by spawning `which`/`where`, which
  * would cost a subprocess on every launch just to decide whether to spawn.
@@ -209,6 +217,7 @@ function discoverOamPaths() {
   if (isWin) {
     installed.unshift(join(process.env.LOCALAPPDATA ?? join(homedir(), "AppData", "Local"), "oam", "bin", exe));
   }
+  if (process.env.OAM_INSTALL_DIR) installed.unshift(join(process.env.OAM_INSTALL_DIR, exe));
   const onPath = (process.env.PATH ?? "")
     .split(delimiter)
     .filter(Boolean)
@@ -317,7 +326,8 @@ function runtimePlan({ mode, hostOam, sandbox }) {
  * not after it. `oam run --permission file.js` is rejected outright, which is a
  * good failure but only because it is loud -- ordering here is load-bearing.
  *
- * Net grants prefix-match `host` for fetch and `host:port` for sockets.
+ * Net grants (oam 0.18.0): an entry without a port admits every port on that
+ * host; "host:port" is exact, for sockets and HTTP requests alike.
  * A denied environment variable is ABSENT from process.env rather than throwing,
  * so the env list below is derived from what the bundle actually reads; trimming
  * it produces silent misbehaviour, not a clear denial.
@@ -355,10 +365,14 @@ function sandboxFlags() {
   // guards against, reached by a different route.
   //
   // Omitting the flag DENIES the category (oam reads an absent --allow-net as
-  // false, a bare one as "*"), and denial costs nothing here: oam has no unix
-  // socket transport at all, so api.ts's node:http `socketPath` dial cannot work
-  // under oam whether the grant is open or closed. Re-verified against oam 0.18.0 --
-  // bare grant lets an unrelated host through, omitted grant denies it.
+  // false, a bare one as "*"). Re-verified against oam 0.18.0 -- bare grant lets
+  // an unrelated host through, omitted grant denies it. What denial costs is
+  // NOT yet measured: oam 0.18.0 added Unix domain sockets, and api.ts's
+  // node:http `socketPath` dial rides on them, so a granted socket may now work
+  // there (it would need `--allow-net=<absolute path>` plus --allow-fs-read and
+  // --allow-fs-write naming the socket file). Upstream calls the Unix half
+  // untested off Windows, so the socket stays denied until it is run on
+  // Linux/macOS; an operator who needs it can run unsandboxed meanwhile.
   //
   // This mirrors getMalformedUnixUrl's predicate in src/api.ts, NOT the stricter
   // getUnixSocketPath -- deliberately, and the difference is the whole point.
@@ -383,14 +397,13 @@ function sandboxFlags() {
   if (!isUnixDsn) {
     try {
       const u = new URL(dsn);
-      // HOST ONLY, no port, deliberately. Grants are prefix-matched against the
-      // resource string, and the resource `fetch` presents is the bare hostname
-      // ("localhost") while sockets present "host:port". "localhost" does not
-      // start with "localhost:2019", so pinning the port denies every fetch --
-      // and fetch is how api.ts talks to a TCP admin endpoint. Granting the host
-      // alone also admits the other ports on that host; that is the cost of the
-      // check having no port to match against, not an oversight here.
-      if (u.hostname) netFlag = `--allow-net=${u.hostname}`;
+      // HOST:PORT. Since oam 0.18.0 the resource `fetch` presents is "host:port"
+      // and a port-scoped entry admits it, so the grant names exactly the
+      // endpoint api.ts dials. `u.port` is "" when the URL names the scheme's
+      // default port, so fill that in: 443 for https, 80 otherwise (api.ts only
+      // dials http and https). `u.hostname` keeps an IPv6 literal's brackets,
+      // which is the form oam matches ("[::1]:2019"; "::1:2019" is refused).
+      if (u.hostname) netFlag = `--allow-net=${u.hostname}:${u.port || (u.protocol === "https:" ? "443" : "80")}`;
     } catch {
       // Genuinely unparseable CADDY_ADMIN_URL (not the unix forms -- those are
       // handled above): leave the grant open. The server will fail on its own
@@ -422,20 +435,23 @@ function sandboxFlags() {
   // quietly stop surviving a restart -- the thing the operator turned the
   // variable on to get.
   //
-  // TWO spellings, because grants are matched as plain string PREFIXES against
-  // whatever path each call passes: snapshots.ts hands the raw variable to
-  // readdirSync/mkdirSync but builds per-file paths with path.join, which
-  // normalizes ("./snaps" -> "snaps"). The raw form alone then misses the files;
-  // the normalized form alone misses the directory listing.
+  // ONE spelling is enough. Since oam 0.18.0 a relative --allow-fs-* entry is
+  // resolved against the cwd at startup, and each path a call passes is resolved
+  // against the cwd of the moment before it is matched, so "./snaps", "snaps"
+  // and "snaps/c.json" all land inside the same grant (snapshots.ts hands the
+  // raw variable to readdirSync/mkdirSync and builds per-file paths with
+  // path.join). Matching is path CONTAINMENT, not a string prefix: a grant for
+  // "/var/snap" does not admit "/var/snapshots-elsewhere" (measured on 0.18.0).
+  // On Windows the comparison follows node's path resolution with the `\\?\`
+  // prefix and is case-SENSITIVE, so spell the directory the way the server
+  // will.
   //
-  // Two consequences worth naming rather than discovering: a prefix also admits
-  // a sibling path that merely starts with the same string ("/var/snap" grants
-  // "/var/snapshots-elsewhere"), and oam splits the list on commas with no
-  // escape, so a directory whose path contains a comma cannot be granted here.
+  // One consequence worth naming rather than discovering: oam splits the list
+  // on commas with no escape, so a directory whose path contains a comma cannot
+  // be granted here.
   const snapshotDir = process.env.CADDY_MCP_SNAPSHOT_DIR?.trim();
   if (snapshotDir) {
-    const forms = [...new Set([snapshotDir, join(snapshotDir, ".")])].join(",");
-    flags.push(`--allow-fs-read=${forms}`, `--allow-fs-write=${forms}`);
+    flags.push(`--allow-fs-read=${snapshotDir}`, `--allow-fs-write=${snapshotDir}`);
   }
 
   return flags;
@@ -510,20 +526,29 @@ function unusableReason(path, version, label = path) {
 
 /**
  * Choose the oam to spawn: a usable OAM_BIN, else the newest usable discovered
- * binary. Returns the choice (or null) plus stderr notes: `overrideNote` about
- * an unusable OAM_BIN, and `skipped` describing what was found and rejected
- * when nothing was usable.
+ * binary. Returns the choice (or null) plus what stderr needs:
+ *   overrideNote     why OAM_BIN was passed over, or null
+ *   skipped          why each discovered binary was passed over, when none was chosen
+ *   passedOver       the `version` of every existing binary rejected (OAM_BIN
+ *                    included), so a hard failure can name the right remedy
+ *   overrideMissing  OAM_BIN was set to a path that does not exist
  */
 function chooseOam() {
   const override = process.env.OAM_BIN;
   let overrideNote = null;
+  let overrideMissing = false;
+  const passedOver = [];
   if (override) {
     if (!existsSync(override)) {
       overrideNote = `OAM_BIN=${override} does not exist`;
+      overrideMissing = true;
     } else {
       const version = oamVersion(override);
-      if (atLeast(version, OAM_MIN)) return { chosen: { path: override, version }, overrideNote, skipped: [] };
+      if (atLeast(version, OAM_MIN)) {
+        return { chosen: { path: override, version }, overrideNote, skipped: [], passedOver, overrideMissing };
+      }
       overrideNote = unusableReason(override, version, `OAM_BIN=${override}`);
+      passedOver.push(version);
     }
   }
   const overrideKey = override ? pathKey(override) : null;
@@ -532,7 +557,66 @@ function chooseOam() {
     .map((path) => ({ path, version: oamVersion(path) }));
   const chosen = pickNewest(candidates);
   const skipped = chosen ? [] : candidates.map((c) => unusableReason(c.path, c.version));
-  return { chosen, overrideNote, skipped };
+  if (!chosen) passedOver.push(...candidates.map((c) => c.version));
+  return { chosen, overrideNote, skipped, passedOver, overrideMissing };
+}
+
+/**
+ * What would fix "no usable oam", one line per cause that was actually seen.
+ *
+ * An outdated oam is fixed by `oam self-update`; an unrunnable one is not (it
+ * never ran, so updating it in place cannot help); and only when NO oam was
+ * found is installing one the answer. Even that line is replaced where there is
+ * nothing to install: oam publishes darwin arm64/x64, windows arm64/x64 and
+ * linux x64, so on any other Linux arch (a Pi, an arm64 cloud instance, WSL on
+ * an ARM Windows host) "install oam" is an impossible remedy.
+ */
+function remedyFor({ passedOver, overrideMissing, shim }) {
+  const lines = [];
+  if (passedOver.some((v) => v !== null)) {
+    lines.push(`Run \`oam self-update\` to get oam ${OAM_MIN.join(".")} or newer.\n`);
+  }
+  if (passedOver.some((v) => v === null)) {
+    lines.push("Check that it is an executable oam binary for this platform.\n");
+  }
+  if (overrideMissing) lines.push("Point OAM_BIN at an existing oam binary, or unset it.\n");
+  if (lines.length === 0 && !shim) {
+    lines.push(
+      process.platform === "linux" && process.arch !== "x64"
+        ? `oam publishes no build for linux-${process.arch}, so there is nothing to install here; set OAM_BIN=/path/to/oam if you built one yourself.\n`
+        : "Install oam from https://oamjs.org, or set OAM_BIN=/path/to/oam.\n",
+    );
+  }
+  lines.push("Or use CADDY_MCP_RUNTIME=node to run on Node.\n");
+  return lines.join("");
+}
+
+/**
+ * The env a child is spawned with: process.env as-is on Node, and on an oam host
+ * a copy whose NODE_OPTIONS has every `--permission` / `--allow-*` token removed.
+ *
+ * An oam host can carry those in NODE_OPTIONS -- since 0.18.0 oam reads them
+ * from there, and appends its own execArgv's permission flags to every child's
+ * NODE_OPTIONS -- and handing them on breaks both children this launcher
+ * spawns. Node refuses an oam-only flag outright: `NODE_OPTIONS=--allow-net node`
+ * exits 9 with "--allow-net is not allowed in NODE_OPTIONS" (Node 22), so the
+ * Node handoff would die before the server loads. A fresh oam would instead
+ * inherit the HOST's grants rather than the ones sandboxFlags derived for it.
+ * The child's sandbox, if any, is decided by its own argv and nothing else.
+ *
+ * Tokens are split on whitespace, as Node splits NODE_OPTIONS; a value-taking
+ * permission flag is always written `--allow-x=value`, one token. An emptied
+ * NODE_OPTIONS is removed rather than left as "".
+ */
+function childEnv() {
+  if (process.versions.oam === undefined) return process.env;
+  const raw = process.env.NODE_OPTIONS;
+  if (!raw) return process.env;
+  const kept = raw.split(/\s+/).filter((token) => token && token !== "--permission" && !token.startsWith("--allow-"));
+  const env = { ...process.env };
+  if (kept.length > 0) env.NODE_OPTIONS = kept.join(" ");
+  else delete env.NODE_OPTIONS;
+  return env;
 }
 
 /** Run the server in THIS process. The zero-overhead fallback. */
@@ -581,7 +665,7 @@ async function launchChild(cmd, args, onLaunchFailed) {
       // server's shutdown path. Piping preserves both as well: bytes are copied
       // unchanged, and stdin's end propagates to the child.
       stdio: piped ? ["pipe", "pipe", "pipe"] : "inherit",
-      env: process.env,
+      env: childEnv(),
       windowsHide: true,
     });
   } catch (err) {
@@ -752,7 +836,7 @@ if (plan === "in-process") {
   const belowFloor = !atLeast(parseVersion(hostOam), OAM_MIN);
   await handOffToNode(belowFloor ? `this process is oam ${hostOam}, older than ${OAM_MIN.join(".")}` : "");
 } else {
-  const { chosen, overrideNote, skipped } = chooseOam();
+  const { chosen, overrideNote, skipped, passedOver, overrideMissing } = chooseOam();
 
   if (chosen) {
     if (overrideNote)
@@ -789,7 +873,7 @@ if (plan === "in-process") {
       await errSync(
         `caddy-mcp: CADDY_MCP_RUNTIME=oam but no usable oam (${OAM_MIN.join(".")} or newer) was found.\n` +
           notes.map((note) => `  ${note}\n`).join("") +
-          "Install or update from https://oamjs.org, set OAM_BIN=/path/to/oam, or use CADDY_MCP_RUNTIME=node.\n",
+          remedyFor({ passedOver, overrideMissing, shim }),
       );
       process.exit(1);
     }

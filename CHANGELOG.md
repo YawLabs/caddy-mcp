@@ -7,6 +7,51 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed
+- **`CADDY_MCP_SANDBOX=1` now grants the admin endpoint's host AND port**
+  (`--allow-net=localhost:2019` by default; the scheme's port when the URL names
+  none, an IPv6 literal as `[::1]:2019`) instead of every port on that host.
+  oam 0.18.0, the floor, admits `fetch` through a port-scoped grant; up to
+  0.17.1 it did not, which is why the grant used to be the bare host.
+- **The sandbox's snapshot-directory grant is a single entry**, spelled as
+  `CADDY_MCP_SNAPSHOT_DIR` gives it. oam 0.18.0 resolves relative grants and
+  paths against the cwd and matches by path containment, so the second,
+  normalized spelling (`./snaps,snaps`) is no longer needed.
+- **Under oam, a config change now waits 250 ms for Caddy's admin restart**
+  before it reports success. The event-driven wait used on Node cannot see oam's
+  connection pool, so under oam it did not run at all, and back-to-back changes
+  against Caddy 2.11.4 on Windows hit a reset and then wedged Caddy's admin
+  endpoint until it was restarted. Node is unchanged.
+- **`CADDY_MCP_RUNTIME=oam` failures name the fix for what was found**:
+  `oam self-update` for an outdated oam, "check that it is an executable oam
+  binary" for one that would not run, a corrected `OAM_BIN` for one that does not
+  exist, and the install link only when no oam was found at all (and not on a
+  Linux architecture oam publishes no build for).
+
+### Fixed
+- **A handoff from an oam host no longer passes oam's permission flags to the
+  child.** The launcher strips `--permission` / `--allow-*` from `NODE_OPTIONS`
+  before it spawns Node or a fresh oam. Node exits 9 on `--allow-net` in
+  `NODE_OPTIONS`, so a `CADDY_MCP_RUNTIME=node` handoff from such a host failed
+  before the server loaded.
+- **The launcher finds an oam installed to `OAM_INSTALL_DIR`** when it is on
+  neither `PATH` nor a default install location.
+
+### Documentation
+- README gains a Runtime section: `CADDY_MCP_RUNTIME`, `CADDY_MCP_SANDBOX`,
+  `OAM_BIN`, the oam 0.18.0 floor, `oam self-update`, and
+  `yaw-mcp set <namespace> runtime=node` to run this server on Node under Yaw MCP.
+- Corrected stale oam notes in CLAUDE.md and the launcher: oam ships signed
+  releases, the discovery order, and the unix-socket note (oam 0.18.0 added Unix
+  domain sockets; a unix-socket admin endpoint stays denied under the sandbox
+  until that is verified on Linux/macOS).
+
+### Internal
+- `scripts/check-oam-floor.mjs` (ported from aws-mcp, `npm run check:oam-floor`):
+  fails on any floor claim that disagrees with `OAM_MIN`, offline on every
+  `npm test`, and on a floor behind the latest oam release from `release.sh`
+  (`CADDY_MCP_ALLOW_STALE_OAM=1` to release on it deliberately).
+
 ## [2.5.10] — 2026-10-07
 
 ### Fixed

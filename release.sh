@@ -306,6 +306,19 @@ npm run lint || fail "Lint failed"
 npm run typecheck || fail "Type check failed"
 npm test || fail "Tests failed"
 
+# --- oam floor: consistent and current ----------------------------------------
+# `npm test` already ran the offline half (src/tests/oam-floor.test.ts: every
+# floor claim in the repo agrees with OAM_MIN). This adds the online half: is
+# OAM_MIN behind the latest published oam release? The launcher is verified on
+# one oam release at a time, so a stale floor means shipping on an oam nobody
+# re-verified against. Exits non-zero when the floor is behind;
+# CADDY_MCP_ALLOW_STALE_OAM=1 is the deliberate way past it. A machine with no
+# network is not a failure -- the check says so and continues.
+if [ -f scripts/check-oam-floor.mjs ]; then
+  echo ""
+  node scripts/check-oam-floor.mjs || fail "oam floor check failed -- see above. Set CADDY_MCP_ALLOW_STALE_OAM=1 to release on the old floor deliberately."
+fi
+
 # --- Live-Caddy admin-API semantics gate -------------------------------------
 # The 9 tests in src/tests/integration.test.ts are the ONLY thing pinning the
 # Caddy contracts this server is built on: PUT at an array index INSERTS (it
