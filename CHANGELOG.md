@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [2.6.0] — 2026-10-09
+
 ### Changed
 - **`CADDY_MCP_SANDBOX=1` now grants the admin endpoint's host AND port**
   (`--allow-net=localhost:2019` by default; the scheme's port when the URL names
