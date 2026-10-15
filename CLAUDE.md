@@ -46,7 +46,8 @@ error is a type error under either checker.
 **oam ships signed releases** (a signed release manifest, Authenticode on Windows,
 codesigned on macOS); 0.18.0 is the floor this server is verified on, and
 `scripts/check-oam-floor.mjs` keeps the floor consistent and current. Anyone without
-oam gets the Node path everywhere, which is the default for the shipped binary anyway.
+oam still gets the Node path for the dev loop (`npm test`, `npm start`) and the `bin`
+launcher's fallback; the release binary itself is oam-only.
 
 Measured on windows-arm64, 7-run averages:
 
