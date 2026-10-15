@@ -33,6 +33,7 @@
     "typecheck": "node scripts/typecheck.mjs",
     "typecheck:tsc": "tsc --noEmit",
     "check:oam-floor": "node scripts/check-oam-floor.mjs",
+    "build:binary:oam": "node scripts/build-binary-oam.mjs",
     "test:ci": "npm run build && npm test",
     "prepublishOnly": "npm run build",
     "prepare": "git config core.hooksPath .githooks 2>/dev/null || true",
@@ -56,7 +57,6 @@
     "@biomejs/biome": "~2.4.11",
     "@types/node": "^26.0.0",
     "esbuild": "^0.28.1",
-    "postject": "^1.0.0-alpha.6",
     "tsup": "^8.4.0",
     "typescript": "^7.0.2",
     "vitest": "^4.1.4"

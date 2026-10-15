@@ -1,20 +1,21 @@
 #!/usr/bin/env node
-// Stage the host-built SEA binary as a named release asset + sha256 sidecar.
+// Stage the host-built oam binary as a named release asset + sha256 sidecar.
 //
-// build-binary.mjs emits bin/<platform>-<arch>/caddy-mcp(.exe) -- both scripts
-// derive that name from package.json's first `bin` key rather than hardcoding
-// it, which is what keeps them copy-paste generic across @yawlabs/* servers.
-// This renames it to the public asset name the Scoop/Homebrew manifests point
-// at (caddy-mcp-<platform>-<arch>[.exe]) and writes a `<asset>.sha256` sidecar
-// in sha256sum format (`<hex>  <asset>`) that Scoop's autoupdate `hash.url`
-// reads.
+// build-binary-oam.mjs emits bin/<platform>-<arch>/caddy-mcp(.exe) -- both
+// scripts derive that name from package.json's first `bin` key rather than
+// hardcoding it, which is what keeps them copy-paste generic across @yawlabs/*
+// servers. This renames it to the public asset name the Scoop/Homebrew manifests
+// point at (caddy-mcp-<platform>-<arch>[.exe]) and writes a `<asset>.sha256`
+// sidecar in sha256sum format (`<hex>  <asset>`) that Scoop's autoupdate
+// `hash.url` reads.
 //
-// The build is host-native (Node SEA cannot cross-compile), so every platform
-// you ship needs its own run of build-binary.mjs + this script. There is no CI
-// matrix doing that here -- this repo has no .github/workflows at all, so it is
-// a manual per-host step (see update-manifests.mjs for the full release chain).
+// The build is host-native (oam compile cannot cross-compile without an explicit
+// carrier), so every platform you ship needs its own run of build-binary-oam.mjs
+// + this script. There is no CI matrix doing that here -- this repo has no
+// .github/workflows at all, so it is a manual per-host step (see
+// update-manifests.mjs for the full release chain).
 //
-// Pure stdlib; writes only to dist-release/. Run after build-binary.mjs:
+// Pure stdlib; writes only to dist-release/. Run after build-binary-oam.mjs:
 //   node scripts/stage-release-asset.mjs
 
 import { createHash } from "node:crypto";

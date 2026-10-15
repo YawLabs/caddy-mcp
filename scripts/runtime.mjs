@@ -20,7 +20,7 @@
 // a measurement of anything.
 //
 // That is not hypothetical -- it produced a wrong conclusion in this repo. A
-// benchmark in build-binary.mjs recorded `oam run` at 853 ms against node's
+// benchmark in the binary build script recorded `oam run` at 853 ms against node's
 // 701 ms and concluded oam should not be used at launch. It is not slower.
 // Measured against an INSTALLED oam, interleaved, n=12 medians:
 //
@@ -109,7 +109,7 @@ export function isBuildTreeBinary(p) {
  *
  * `require: true` makes absence an ERROR instead of a fallback. Used by the
  * binary build, where silently swapping runtimes would make the release
- * artifact depend on workstation state (see the note in build-binary.mjs).
+ * artifact depend on workstation state (see the note in build-binary-oam.mjs).
  */
 export function findOam({ require = false } = {}) {
   if (process.env.CADDY_MCP_RUNTIME === "node") {
@@ -143,9 +143,9 @@ export function findOam({ require = false } = {}) {
 
   if (require) {
     throw new Error(
-      "CADDY_MCP_RUNTIME=oam was requested but no working oam was found. " +
-        "Set $OAM_BIN to the executable, put `oam` on PATH, or unset CADDY_MCP_RUNTIME " +
-        "to build with the Node SEA carrier.",
+      "the oam runtime is required but no working oam was found. " +
+        "Set $OAM_BIN to the executable, or install oam (https://oamjs.org) so it is " +
+        "on PATH or in ~/.oam/bin.",
     );
   }
   return null;

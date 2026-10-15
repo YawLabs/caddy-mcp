@@ -9,7 +9,7 @@ import { registerRouteTools } from "./tools/routes.js";
 import { registerTlsTools } from "./tools/tls.js";
 
 // __VERSION__ is substituted at build time by the single-binary esbuild build
-// (scripts/build-binary.mjs defines it). The SEA bundle is CJS, where
+// (scripts/build-binary-oam.mjs defines it). The oam bundle is CJS, where
 // `import.meta.url` is empty -- so calling `createRequire(import.meta.url)` at
 // load time would throw ERR_INVALID_ARG_VALUE and crash the binary. Prefer the
 // define when present; fall back to the createRequire+package.json read only

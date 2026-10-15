@@ -12,7 +12,7 @@
 // Nothing in this repo's release chain runs in CI -- there is no
 // .github/workflows directory at all, only CODEOWNERS. The whole flow is local
 // and ordered: release.sh cuts the tag, publishes to npm and creates the GitHub
-// release; each platform then runs build-binary.mjs + stage-release-asset.mjs
+// release; each platform then runs build-binary-oam.mjs + stage-release-asset.mjs
 // by hand and uploads its asset + `.sha256` sidecar to that release; this
 // manifest BUMP runs last, because step 1 below downloads those sidecars.
 //

@@ -2,6 +2,7 @@ node_modules/
 dist/
 *.tgz
 .claude/
+# Single-binary build pipeline (oam compile): build-binary-oam.mjs + stage-release-asset.mjs
 bin/*
 !bin/caddy-mcp.mjs
 build-tmp/

@@ -30,17 +30,18 @@ The split is deliberate — **auto-detect for tools, explicit for artifacts**:
 | Task | Default | Alternate |
 |---|---|---|
 | `npm run typecheck` | `oam check .` if available, else `tsc --noEmit` | `CADDY_MCP_RUNTIME=node` forces tsc; `typecheck:tsc` pins it |
-| `node scripts/build-binary.mjs` | **Node SEA + postject** | `CADDY_MCP_RUNTIME=oam` builds the oam carrier |
+| `npm run build:binary:oam` | **oam compile** | — (single carrier; no oam is a hard error) |
 | `npm test` | vitest (Node) | — |
 | `npm start` | Node | — |
 | `bin` entry (`bin/caddy-mcp.mjs`) | newest oam at or above 0.18.0, else Node | `CADDY_MCP_RUNTIME=node` / `=oam`, `OAM_BIN`; see the launcher header |
 
-**Why the binary does NOT auto-detect.** It is a release artifact. If the carrier were
-chosen by what happens to be installed, the same git tag would produce a 57 MB oam binary
-on one machine and a 75 MB SEA binary on another, silently. So oam is opt-in there, and
-`CADDY_MCP_RUNTIME=oam` with no working oam is a hard **error** rather than a quiet
-downgrade to a different artifact. Type-checking auto-detects because it emits nothing —
-a type error is a type error under either checker.
+**Why the binary does NOT auto-detect a fallback carrier.** It is a release
+artifact. If a carrier were chosen by what happens to be installed, the same git
+tag could produce a different binary on one machine and another, silently. So the
+single carrier is `oam compile`, and a missing oam is a hard **error** rather than
+a quiet downgrade. (The repo used to carry a second carrier -- Node SEA + postject
+-- which is gone.) Type-checking auto-detects because it emits nothing — a type
+error is a type error under either checker.
 
 **oam ships signed releases** (a signed release manifest, Authenticode on Windows,
 codesigned on macOS); 0.18.0 is the floor this server is verified on, and
@@ -52,7 +53,6 @@ Measured on windows-arm64, 7-run averages:
 | | startup | size |
 |---|---|---|
 | `node dist/index.js` | 730 ms | needs node + node_modules |
-| Node SEA binary | 808 ms | 75.22 MB |
 | **oam compiled binary** | **529 ms** | **57.53 MB** |
 | `tsc --noEmit` | 8449 ms | — |
 | **`oam check .`** | **832 ms** | — |
@@ -62,7 +62,7 @@ Two deliberate non-changes:
 - **`oam run` is used only by the published `bin` launcher**, on the built
   `dist/index.js`. An earlier note here called it *slower* than Node (853 ms vs
   701 ms); that timed an oam inside `target/release` mid-rebuild. Against an
-  installed oam it is faster (184 ms vs 213 ms, see `scripts/build-binary.mjs`).
+  installed oam it is faster (184 ms vs 213 ms, see `scripts/build-binary-oam.mjs`).
   The launcher never serves on an oam older than 0.18.0.
 - **Tests stay on vitest.** oam ships its own runner (`import 'oam:test'`), but the
   suite leans on `vi.mock` for module-level api mocking; porting it would trade a
