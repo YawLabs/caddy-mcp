@@ -18,8 +18,8 @@ import { describe, expect, it } from "vitest";
  *
  * `OAM_BIN` is the seam that makes this testable without installing oam: the
  * launcher uses the override, before any discovery, once it answers
- * `--version` at or above the floor, so a shell script can stand in for the
- * runtime and behave however a case needs.
+ * `--version` with oam's own banner (`oam x.y.z`) at or above the floor, so a
+ * shell script can stand in for the runtime and behave however a case needs.
  */
 const REPO_ROOT = join(dirname(fileURLToPath(import.meta.url)), "..", "..");
 const LAUNCHER = join(REPO_ROOT, "bin", "caddy-mcp.mjs");
@@ -336,8 +336,10 @@ describe("launcher: pickNewest()", () => {
  * outcomes unmistakable without a real oam, and cross-platform where the bash
  * fakes below are not. In-process, `--version` reaches dist/index.js and
  * prints `caddy-mcp <version>` with exit 0. On the discovery path, OAM_BIN is
- * that pinned Node, `node --version` clears the floor, and the launcher
- * spawns `node [flags] run <entry>` -- which has no `run` subcommand, prints no
+ * that pinned Node, the preload makes the launcher's `--version` probe of it
+ * read "oam 0.18.0" (the real `node --version` has no oam banner and would be
+ * passed over, see "launcher: a non-oam OAM_BIN"), and the launcher spawns
+ * `node [flags] run <entry>` -- which has no `run` subcommand, prints no
  * version and exits non-zero. A usable OAM_BIN is taken before discovery runs,
  * so a real oam installed on the developer's box is never reached either.
  *
@@ -363,7 +365,21 @@ function runOnHost(
     hostOam === undefined
       ? ""
       : `Object.defineProperty(process.versions, "oam", { value: ${JSON.stringify(hostOam)}, enumerable: true });`;
-  const preload = ["--import", `data:text/javascript,${encodeURIComponent(`${exitMarker}${posing}\n${extraPreload}`)}`];
+  // The probe answers like oam only for this Node; every other execFileSync is real.
+  const probe = [
+    'import poseCp from "node:child_process";',
+    'import { syncBuiltinESMExports as poseSync } from "node:module";',
+    "const poseReal = poseCp.execFileSync;",
+    "poseCp.execFileSync = function (cmd, args, opts) {",
+    `  if (cmd === ${JSON.stringify(process.execPath)} && args?.[0] === "--version") return "oam 0.18.0\\n";`,
+    "  return poseReal.call(this, cmd, args, opts);",
+    "};",
+    "poseSync();",
+  ].join("\n");
+  const preload = [
+    "--import",
+    `data:text/javascript,${encodeURIComponent(`${exitMarker}${posing}\n${probe}\n${extraPreload}`)}`,
+  ];
   return runLauncher(
     ["--version"],
     { OAM_BIN: process.execPath, CADDY_MCP_RUNTIME: undefined, CADDY_MCP_SANDBOX: undefined, ...extraEnv },
@@ -544,6 +560,46 @@ describe.skipIf(!existsSync(DIST_CLI))("launcher: with no usable oam", () => {
     },
     TIMEOUT_MS,
   );
+});
+
+/**
+ * An OAM_BIN that runs and prints a version but is not oam (here: the real
+ * Node, `v22.x.y`). The probe needs oam's own banner, so it is passed over like
+ * an unreadable one instead of clearing the floor and being spawned as
+ * `<node> [flags] run dist/index.js`, which dies with MODULE_NOT_FOUND and no
+ * fallback because the spawn itself succeeded. Cross-platform: no bash fake.
+ */
+describe.skipIf(!existsSync(DIST_CLI))("launcher: a non-oam OAM_BIN", () => {
+  it("auto passes it over, says so, and serves on Node", async () => {
+    const res = await runLauncher(["--version"], isolated({ OAM_BIN: process.execPath }));
+    expect(res.code, res.stderr).toBe(0);
+    expect(res.stdout.trim()).toMatch(/^caddy-mcp \d+\.\d+\.\d+/);
+    expect(res.stderr).toMatch(
+      /^caddy-mcp: OAM_BIN=.* could not be run, or did not report a version this launcher understands; using Node instead\.$/m,
+    );
+    expect(res.stderr).not.toContain("MODULE_NOT_FOUND");
+  }, 30000);
+
+  it("CADDY_MCP_RUNTIME=oam refuses it rather than spawning it", async () => {
+    const res = await runLauncher(["--version"], isolated({ OAM_BIN: process.execPath, CADDY_MCP_RUNTIME: "oam" }));
+    expect(res.code).toBe(1);
+    expect(res.stdout).toBe("");
+    expect(res.stderr).toContain("no usable oam (0.18.0 or newer) was found");
+    expect(res.stderr).toContain("Check that it is an executable oam binary for this platform.");
+    expect(res.stderr).not.toContain("MODULE_NOT_FOUND");
+  }, 30000);
+
+  it("a below-floor oam host hands off to Node rather than spawning it", async () => {
+    // The sandbox path spawns even on a supported host; a below-floor host
+    // always discovers. Either way the non-oam OAM_BIN must not be the child.
+    const run = await runLauncher(["--version"], isolated({ OAM_BIN: process.execPath }), undefined, [
+      "--import",
+      `data:text/javascript,${encodeURIComponent('Object.defineProperty(process.versions, "oam", { value: "0.9.0", enumerable: true });')}`,
+    ]);
+    expect(servedVersion(run), JSON.stringify(run)).toBe(true);
+    expect(run.stderr).toMatch(/could not be run, or did not report a version this launcher understands/);
+    expect(run.stderr).not.toContain("MODULE_NOT_FOUND");
+  }, 45000);
 });
 
 /**

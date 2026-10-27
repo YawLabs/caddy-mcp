@@ -239,13 +239,27 @@ function discoverOamPaths() {
  * A pre-release suffix (0.9.0-rc.1) truncates to its base version.
  *
  * Shared by the two places a version is read -- a discovered binary's
- * `oam --version` output ("oam 0.15.1") and the host's own
+ * `oam --version` banner ("oam 0.15.1", via oamBanner) and the host's own
  * `process.versions.oam` ("0.15.1") -- so they cannot disagree about what a
  * version string means, or which floor it has to clear.
  */
 function parseVersion(text) {
   const m = /(\d+)\.(\d+)\.(\d+)/.exec(text);
   return m ? [Number(m[1]), Number(m[2]), Number(m[3])] : null;
+}
+
+/**
+ * `oam --version` output -> [major, minor, patch], or null unless it carries
+ * oam's own banner ("oam 0.18.0" at the start of a line). Any x.y.z is NOT
+ * enough: an OAM_BIN (or an oam.exe on disk) that is really another program --
+ * node prints "v22.22.2" -- would clear the floor, and the launcher would then
+ * spawn `<it> [flags] run dist/index.js`, which dies with no fallback because
+ * the spawn itself succeeded. process.versions.oam needs no banner: only oam
+ * sets it.
+ */
+function oamBanner(text) {
+  const m = /^oam\s+(\d+\.\d+\.\d+)/m.exec(text);
+  return m ? parseVersion(m[1]) : null;
 }
 
 /** `oam --version` -> [major, minor, patch], or null when it cannot be read. */
@@ -257,7 +271,7 @@ function oamVersion(cmd) {
       timeout: VERSION_PROBE_TIMEOUT_MS,
       windowsHide: true,
     });
-    return parseVersion(out);
+    return oamBanner(out);
   } catch {
     // Not executable, wrong arch, wedged, or deleted since the stat. Caller degrades.
     return null;

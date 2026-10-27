@@ -7,6 +7,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+- **The `caddy-mcp` launcher accepts a binary as oam only when its `--version`
+  output carries oam's own `oam x.y.z` banner.** Any `x.y.z` used to count, so an
+  `OAM_BIN` (or an `oam.exe` on disk) that was really another program -- node
+  prints `v22.x.y` -- cleared the 0.18.0 floor and was spawned as
+  `<it> run dist/index.js`, which died with no Node fallback because the spawn
+  itself succeeded. It is now passed over like an unreadable binary: auto mode
+  says so and serves on Node, `CADDY_MCP_RUNTIME=oam` refuses it.
+  `process.versions.oam` (only oam sets it) needs no banner.
+- **`npm run typecheck` and `npm run build:binary:oam` apply the same banner
+  test** (`OAM_BIN` pointing at node falls back to tsc, and is no oam for the
+  binary build), bound each `oam --version` probe at 5 s so a wedged binary
+  cannot hang them, and read `CADDY_MCP_RUNTIME` case-insensitively like the
+  launcher (`=NODE` forces tsc).
+
 ## [2.6.0] — 2026-10-09
 
 ### Changed

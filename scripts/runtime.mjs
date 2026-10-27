@@ -48,6 +48,24 @@ const isWin = process.platform === "win32";
 const exeName = isWin ? "oam.exe" : "oam";
 
 /**
+ * Bound on each `oam --version` probe, the same as the launcher's
+ * (bin/caddy-mcp.mjs): a wedged oam on PATH must not hang `npm run typecheck`
+ * or the binary build -- a timed-out candidate is skipped like a broken one.
+ */
+export const VERSION_PROBE_TIMEOUT_MS = 5_000;
+
+/**
+ * True when `--version` output carries oam's own banner ("oam 0.18.0" at the
+ * start of a line), the same test as the launcher's oamBanner. Answering
+ * `--version` is not enough: OAM_BIN pointing at node ("v22.x.y") would be
+ * accepted, and the typecheck would run `node check .` and fail instead of
+ * falling back to tsc (or the binary build would try to compile with node).
+ */
+function isOamBanner(text) {
+  return /^oam\s+\d+\.\d+\.\d+/m.test(text);
+}
+
+/**
  * The per-user locations oamjs.org's installers write to. Both forms are
  * checked on Windows: the installer defaults to %LOCALAPPDATA%\oam\bin there,
  * but oam's own docs name ~/.oam/bin first and OAM_INSTALL_DIR can put it
@@ -100,8 +118,9 @@ export function isBuildTreeBinary(p) {
 
 /**
  * Resolve an oam executable, or null when oam should not be used.
- * Verifies the binary actually runs -- a stale $OAM_BIN or a broken PATH entry
- * must degrade to Node rather than fail the build.
+ * Verifies the binary actually runs and identifies as oam -- a stale $OAM_BIN,
+ * a broken PATH entry or a non-oam binary must degrade to Node rather than
+ * fail the build.
  *
  * Returns `{ cmd, version, fromBuildTree }`. `fromBuildTree` is true when the
  * only oam available lives under `target/`; callers doing anything
@@ -112,7 +131,10 @@ export function isBuildTreeBinary(p) {
  * artifact depend on workstation state (see the note in build-binary-oam.mjs).
  */
 export function findOam({ require = false } = {}) {
-  if (process.env.CADDY_MCP_RUNTIME === "node") {
+  // Case-insensitive, matching the launcher's own read of the same variable
+  // (bin/caddy-mcp.mjs lowercases it): `=NODE` must force the Node path here
+  // too, or the typecheck silently uses oam the launcher would have refused.
+  if ((process.env.CADDY_MCP_RUNTIME ?? "").toLowerCase() === "node") {
     if (require) {
       throw new Error("CADDY_MCP_RUNTIME=node conflicts with an explicit request for the oam runtime.");
     }
@@ -134,10 +156,17 @@ export function findOam({ require = false } = {}) {
       const out = execFileSync(cmd, ["--version"], {
         encoding: "utf-8",
         stdio: ["ignore", "pipe", "ignore"],
+        // Bounded like the launcher's probe: a wedged oam must not hang the
+        // typecheck or the build with no way out.
+        timeout: VERSION_PROBE_TIMEOUT_MS,
+        windowsHide: true,
       });
+      // Runs, but is not oam (node, some other tool on PATH): try the next one.
+      if (!isOamBanner(out)) continue;
       return { cmd, version: out.trim(), fromBuildTree: isBuildTreeBinary(cmd) };
     } catch {
-      // Not executable, wrong arch, or a stale entry -- try the next candidate.
+      // Not executable, wrong arch, wedged (timed out), or a stale entry -- try
+      // the next candidate.
     }
   }
 
