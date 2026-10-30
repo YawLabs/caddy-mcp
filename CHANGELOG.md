@@ -7,7 +7,33 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed
+- **The oam floor is now 0.19.1** (`OAM_MIN` in `bin/caddy-mcp.mjs`), the latest
+  oam release, re-verified through the launcher on the published build: MCP
+  initialize, `tools/list` and `tools/call` under `CADDY_MCP_SANDBOX=1` with a
+  snapshot directory, plus the port-scoped `--allow-net` grant. 0.19.0, its
+  `-dev` builds and 0.18.x are now below the floor and passed over.
+- **Persisted snapshots are owner-only.** With `CADDY_MCP_SNAPSHOT_DIR` set, a
+  directory the server creates is `0700` and each snapshot file `0600` (POSIX;
+  Windows ignores the mode). Snapshots can carry ACME EAB keys and upstream
+  credentials, and were written with the default umask.
+
 ### Fixed
+- **`CADDY_MCP_SANDBOX` accepts `1` or `true` in any case, trimmed.** It used to
+  be an exact `=== "1"`, so cmd.exe's `set CADDY_MCP_SANDBOX=1 && ...` (which
+  exports `"1 "`) or `true` ran WITHOUT the sandbox and said nothing. Any other
+  non-empty value still leaves it off, now with one stderr warning.
+  `CADDY_MCP_RUNTIME` is trimmed too, in the launcher and in
+  `scripts/runtime.mjs`, so `"node "` means `node`.
+- **`CADDY_MAX_RETRIES` is parsed strictly**: trimmed, digits only, else the
+  default of 2. `""` used to mean 0 retries, and `0x2` or `1e1` were read as
+  numbers.
+- **`scripts/check-oam-floor.mjs` runs from a junctioned or symlinked
+  checkout.** Its main-module test compared `process.argv[1]` (as typed) with
+  the module URL (which Node realpaths), so through a link the check never ran
+  and the script exited 0 in silence. Both sides are realpath'd now.
+  `CADDY_MCP_ALLOW_STALE_OAM` takes `1` or `true` (any case, trimmed) and says so
+  when given anything else.
 - **The `caddy-mcp` launcher accepts a binary as oam only when its `--version`
   output carries oam's own `oam x.y.z` banner.** Any `x.y.z` used to count, so an
   `OAM_BIN` (or an `oam.exe` on disk) that was really another program -- node

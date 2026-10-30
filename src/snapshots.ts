@@ -93,16 +93,20 @@ function persist(snap: Snapshot): void {
   const dir = snapshotDir();
   if (!dir) return;
   try {
-    mkdirSync(dir, { recursive: true });
+    // Owner-only: the files are whole Caddy configs and can carry ACME EAB keys
+    // and upstream credentials (see the header). `mode` applies only to what this
+    // call creates -- an existing directory keeps its permissions, so an operator
+    // who placed it deliberately keeps that choice -- and is ignored on Windows,
+    // where the directory's ACL decides.
+    mkdirSync(dir, { recursive: true, mode: 0o700 });
     // The trigger is embedded in the filename, so keep it filename-safe. It is
     // always one of our own literals today ("caddy_load", "manual",
     // "caddy_revert"); the sanitize keeps that true if a caller passes another.
     const safeTrigger = snap.trigger.replace(/[^\w-]/g, "_");
-    writeFileSync(
-      join(dir, `snapshot-${snap.timestamp}-${safeTrigger}.json`),
-      JSON.stringify(snap.config, null, 2),
-      "utf-8",
-    );
+    writeFileSync(join(dir, `snapshot-${snap.timestamp}-${safeTrigger}.json`), JSON.stringify(snap.config, null, 2), {
+      encoding: "utf-8",
+      mode: 0o600,
+    });
     const files = readdirSync(dir)
       .filter((n) => SNAPSHOT_FILE_RE.test(n))
       .sort()

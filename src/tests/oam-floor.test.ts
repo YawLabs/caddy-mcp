@@ -1,5 +1,5 @@
 import { spawnSync } from "node:child_process";
-import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { mkdirSync, mkdtempSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -129,5 +129,27 @@ describe("check-oam-floor catches drift", () => {
     const r = runChecker(root);
     expect(r.code, r.out).not.toBe(0);
     expect(r.out).toMatch(/OAM_MIN/);
+  });
+});
+
+describe("check-oam-floor runs from a junctioned or symlinked checkout", () => {
+  // Node realpaths the main module's URL but not process.argv[1], so the old
+  // `resolve(argv[1]) === resolve(fileURLToPath(import.meta.url))` guard was
+  // false through a link: main() never ran and the script exited 0 with no
+  // output -- a silence that reads as a pass.
+  it("still runs the check when invoked through a linked directory", () => {
+    const tmp = mkdtempSync(join(tmpdir(), "caddy-mcp-floor-link-"));
+    dirs.push(tmp);
+    const link = join(tmp, "scripts-link");
+    // "junction" on Windows needs no privilege; POSIX ignores the type.
+    symlinkSync(join(REPO_ROOT, "scripts"), link, "junction");
+    const root = fixture({ launcher: "// somebody renamed the constant\n" });
+    const r = spawnSync(process.execPath, [join(link, "check-oam-floor.mjs"), "--offline", "--root", root], {
+      encoding: "utf8",
+      timeout: 60_000,
+    });
+    const out = `${r.stdout ?? ""}${r.stderr ?? ""}`;
+    expect(r.status, out).not.toBe(0);
+    expect(out).toMatch(/OAM_MIN/);
   });
 });

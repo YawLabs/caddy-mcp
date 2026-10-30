@@ -68,7 +68,7 @@
  * real oam 0.8.2 host, the MCP handshake never answered. Piping the streams
  * explicitly completes it, to both oam and Node. The sandbox spawn from a
  * supported oam host pipes too -- one rule for every oam host, verified with a
- * real handshake on 0.18.0 (first measured on 0.15.2). A Node host keeps
+ * real handshake on 0.19.1 (first measured on 0.15.2). A Node host keeps
  * `inherit`, which hands over the same fds untouched.
  *
  * The sandbox asks for a spawn; it does not guarantee one. Discovery can still
@@ -90,7 +90,7 @@
  * http://localhost:2019 -- byte-identical to DEFAULT_URL in src/api.ts, see
  * sandboxFlags). For a TCP endpoint the grant is "host:port" -- the port taken
  * from the URL, or the scheme's default (80/443) when it names none. Since oam
- * 0.18.0, the floor, a port-scoped `--allow-net` entry admits `fetch` to that
+ * 0.18.0 (re-measured on 0.19.1) a port-scoped `--allow-net` entry admits `fetch` to that
  * port exactly as it admits a socket, and the resource fetch presents is
  * "host:port" (an IPv6 literal bracketed, "[::1]:2019"). Up to 0.17.1 a
  * port-scoped entry admitted no HTTP request at all, which is why this grant
@@ -118,7 +118,7 @@
  * "unauthenticated". The env list is derived from the shipped bundle.
  *
  * MINIMUM OAM VERSION
- * The latest oam release, 0.18.0 -- bump OAM_MIN when oam ships a newer one.
+ * The latest oam release, 0.19.1 -- bump OAM_MIN when oam ships a newer one.
  * Only the current oam is used and verified; an older one is passed over. The
  * floor is not cosmetic: before 0.9.0 `child_process.execFile` ran its
  * arguments through a SHELL, `exec` accepted `timeout` and ignored it,
@@ -138,7 +138,9 @@
  *   CADDY_MCP_SANDBOX=1      run the spawned oam under --permission; under
  *                            auto a discovery miss still runs unsandboxed
  *   OAM_BIN=/path/to/oam     use this oam when it is usable, before discovery
- * The runtime value is case-insensitive; anything else behaves like `auto`.
+ * The runtime value is trimmed and case-insensitive; anything else behaves like
+ * `auto`. CADDY_MCP_SANDBOX also takes `true` (any case, trimmed); any other
+ * non-empty value leaves the sandbox off and says so on stderr.
  */
 
 import { execFileSync, spawn } from "node:child_process";
@@ -148,7 +150,7 @@ import { delimiter, join } from "node:path";
 import { fileURLToPath } from "node:url";
 
 /** Oldest oam this server is served on. See MINIMUM OAM VERSION above. */
-const OAM_MIN = [0, 18, 0];
+const OAM_MIN = [0, 19, 1];
 
 /**
  * Bound on each `oam --version` probe. A healthy oam answers in milliseconds;
@@ -250,7 +252,7 @@ function parseVersion(text) {
 
 /**
  * `oam --version` output -> [major, minor, patch], or null unless it carries
- * oam's own banner ("oam 0.18.0" at the start of a line). Any x.y.z is NOT
+ * oam's own banner ("oam 0.19.1" at the start of a line). Any x.y.z is NOT
  * enough: an OAM_BIN (or an oam.exe on disk) that is really another program --
  * node prints "v22.22.2" -- would clear the floor, and the launcher would then
  * spawn `<it> [flags] run dist/index.js`, which dies with no fallback because
@@ -340,14 +342,42 @@ function runtimePlan({ mode, hostOam, sandbox }) {
  * not after it. `oam run --permission file.js` is rejected outright, which is a
  * good failure but only because it is loud -- ordering here is load-bearing.
  *
- * Net grants (oam 0.18.0): an entry without a port admits every port on that
- * host; "host:port" is exact, for sockets and HTTP requests alike.
+ * Net grants (re-measured on oam 0.19.1): an entry without a port admits every
+ * port on that host; "host:port" is exact, for sockets and HTTP requests alike.
+ * Since 0.19.1 repeated grants of one category accumulate (oam #363) -- two
+ * --allow-net entries both admit -- but this list never repeats a flag, so that
+ * changes nothing here; it would matter only if one were split in two.
  * A denied environment variable is ABSENT from process.env rather than throwing,
  * so the env list below is derived from what the bundle actually reads; trimming
  * it produces silent misbehaviour, not a clear denial.
  */
+/**
+ * An on/off opt-in value -> "on", "off" (unset or empty) or "invalid".
+ *
+ * Trimmed and case-insensitive, because the strict `=== "1"` this replaced
+ * read cmd.exe's `set CADDY_MCP_SANDBOX=1 && ...` (which keeps the space before
+ * `&&`) and a natural "true" as OFF -- for the sandbox, a security opt-in,
+ * that is fail-open with no word said. "invalid" is still off; the caller
+ * warns. Pure, so the test can extract it like runtimePlan.
+ */
+function parseOptIn(raw) {
+  const value = (raw ?? "").trim();
+  if (value === "") return "off";
+  return /^(1|true)$/i.test(value) ? "on" : "invalid";
+}
+
+let warnedSandboxValue = false;
+
 function sandboxFlags() {
-  if (process.env.CADDY_MCP_SANDBOX !== "1") return [];
+  const sandbox = parseOptIn(process.env.CADDY_MCP_SANDBOX);
+  if (sandbox === "invalid" && !warnedSandboxValue) {
+    // Once: sandboxFlags() is read twice per launch (the plan, then the spawn).
+    warnedSandboxValue = true;
+    process.stderr.write(
+      `caddy-mcp: CADDY_MCP_SANDBOX=${JSON.stringify(process.env.CADDY_MCP_SANDBOX)} is not 1 or true; running WITHOUT the sandbox.\n`,
+    );
+  }
+  if (sandbox !== "on") return [];
 
   // Derived, not hardcoded: the only endpoint this server may reach is the one
   // it was configured to reach. A DSN we cannot parse falls back to a bare grant
@@ -379,8 +409,8 @@ function sandboxFlags() {
   // guards against, reached by a different route.
   //
   // Omitting the flag DENIES the category (oam reads an absent --allow-net as
-  // false, a bare one as "*"). Re-verified against oam 0.18.0 -- bare grant lets
-  // an unrelated host through, omitted grant denies it. What denial costs is
+  // false, a bare one as "*"). Re-verified against oam 0.19.1 -- bare grant lets
+  // an unrelated port through, omitted grant denies it. What denial costs is
   // NOT yet measured: oam 0.18.0 added Unix domain sockets, and api.ts's
   // node:http `socketPath` dial rides on them, so a granted socket may now work
   // there (it would need `--allow-net=<absolute path>` plus --allow-fs-read and
@@ -411,7 +441,7 @@ function sandboxFlags() {
   if (!isUnixDsn) {
     try {
       const u = new URL(dsn);
-      // HOST:PORT. Since oam 0.18.0 the resource `fetch` presents is "host:port"
+      // HOST:PORT. Since oam 0.18.0 (re-measured on 0.19.1) the resource `fetch` presents is "host:port"
       // and a port-scoped entry admits it, so the grant names exactly the
       // endpoint api.ts dials. `u.port` is "" when the URL names the scheme's
       // default port, so fill that in: 443 for https, 80 otherwise (api.ts only
@@ -836,7 +866,7 @@ async function fallBack(hostOam) {
   await handOffToNode(`this process is oam ${hostOam}, older than ${OAM_MIN.join(".")}, and no newer oam was found`);
 }
 
-const mode = (process.env.CADDY_MCP_RUNTIME ?? "auto").toLowerCase();
+const mode = (process.env.CADDY_MCP_RUNTIME ?? "auto").trim().toLowerCase();
 const hostOam = process.versions.oam;
 
 // The sandbox is read off the grant list rather than CADDY_MCP_SANDBOX, so

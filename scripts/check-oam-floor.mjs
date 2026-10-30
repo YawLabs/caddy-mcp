@@ -27,12 +27,12 @@
  *
  * Exit 1 on drift, always -- an inconsistent repo is a bug with no upside.
  * Exit 1 when the floor is behind the latest release, UNLESS
- * CADDY_MCP_ALLOW_STALE_OAM=1, which is the deliberate, visible way to ship a
+ * CADDY_MCP_ALLOW_STALE_OAM=1 (or true), which is the deliberate, visible way to ship a
  * release anyway. Exit 0 when the network is unavailable: a checker that turns an
  * offline machine into a failed release would just get switched off.
  */
 
-import { readFileSync } from "node:fs";
+import { readFileSync, realpathSync } from "node:fs";
 import { dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 
@@ -183,6 +183,18 @@ async function fetchLatestOam() {
   return { version, tag: body.tag_name };
 }
 
+/**
+ * CADDY_MCP_ALLOW_STALE_OAM, trimmed, as 1 or true in any case. Any other
+ * non-empty value does NOT override -- it fails closed, and says why, so a
+ * "yes" is not mistaken for a deliberate override that silently did nothing.
+ */
+function allowStaleOam() {
+  const raw = (process.env.CADDY_MCP_ALLOW_STALE_OAM ?? "").trim();
+  if (/^(1|true)$/i.test(raw)) return true;
+  if (raw) console.error(`  CADDY_MCP_ALLOW_STALE_OAM=${JSON.stringify(raw)} is not 1 or true -- not overriding.`);
+  return false;
+}
+
 async function main() {
   const floor = readFloor(REPO_ROOT);
   console.log(`oam floor (OAM_MIN in ${LAUNCHER}): ${floor.join(".")}`);
@@ -213,8 +225,8 @@ async function main() {
         console.error(`STALE: oam ${latest.tag} is published and the floor is ${floor.join(".")}.`);
         console.error("  The policy is one verified release at a time, so bump OAM_MIN, re-verify on it");
         console.error("  (full MCP handshake plus the CADDY_MCP_SANDBOX=1 grants), and update the docs and fixtures.");
-        if (process.env.CADDY_MCP_ALLOW_STALE_OAM === "1") {
-          console.error("  CADDY_MCP_ALLOW_STALE_OAM=1 is set -- continuing anyway.");
+        if (allowStaleOam()) {
+          console.error("  CADDY_MCP_ALLOW_STALE_OAM is set -- continuing anyway.");
         } else {
           console.error("  Set CADDY_MCP_ALLOW_STALE_OAM=1 to release on the old floor deliberately.");
           failed = true;
@@ -236,7 +248,28 @@ async function main() {
   process.exit(failed ? 1 : 0);
 }
 
+/**
+ * True when `argv1` (process.argv[1]) names the module at `moduleUrl`. Node
+ * realpaths the main module's URL (unless --preserve-symlinks-main) but leaves
+ * argv[1] as typed, so from a junctioned or symlinked checkout a raw compare of
+ * the two was false: main() never ran and the script exited 0 in silence, which
+ * reads as a pass. Both sides are realpath'd, so the answer holds with or
+ * without --preserve-symlinks-main. Same idiom as yaw-mcp's
+ * scripts/verify-oam-floor.mjs.
+ */
+export function isMainModule(argv1, moduleUrl) {
+  if (!argv1) return false;
+  const real = (p) => {
+    try {
+      return realpathSync(p);
+    } catch {
+      return resolve(p);
+    }
+  };
+  return real(argv1) === real(fileURLToPath(moduleUrl));
+}
+
 // Only run when invoked directly, so the helpers above stay importable.
-if (process.argv[1] && resolve(process.argv[1]) === resolve(fileURLToPath(import.meta.url))) {
+if (isMainModule(process.argv[1], import.meta.url)) {
   await main();
 }

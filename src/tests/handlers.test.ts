@@ -4803,6 +4803,23 @@ describe("tool handler behavior", () => {
       expect(restarted.getSnapshot(1)?.config).toEqual({ apps: { http: {} } });
     });
 
+    // Snapshots can hold ACME EAB keys and upstream credentials, so what persist()
+    // creates is owner-only. POSIX modes only: Windows ignores `mode` and the
+    // directory's ACL decides there.
+    it.skipIf(process.platform === "win32")("creates the directory 0700 and each file 0600", async () => {
+      const { readdirSync, statSync } = await import("node:fs");
+      const { join } = await import("node:path");
+      const dir = join(tmp as string, "nested");
+      process.env.CADDY_MCP_SNAPSHOT_DIR = dir;
+      const snapshots = await import("../snapshots.js");
+      snapshots.clearSnapshots();
+      snapshots.saveSnapshot({ apps: { tls: {} } }, "caddy_load");
+      expect(statSync(dir).mode & 0o777).toBe(0o700);
+      const files = readdirSync(dir).filter((f) => f.endsWith(".json"));
+      expect(files).toHaveLength(1);
+      expect(statSync(join(dir, files[0] as string)).mode & 0o777).toBe(0o600);
+    });
+
     it("prunes persisted files beyond the 10-deep ring", async () => {
       const { readdirSync } = await import("node:fs");
       const snapshots = await import("../snapshots.js");

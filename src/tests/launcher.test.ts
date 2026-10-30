@@ -127,6 +127,16 @@ describe.skipIf(!existsSync(DIST_CLI))("launcher: runtime selection", () => {
     expect(res.stdout.trim()).toMatch(/^caddy-mcp \d+\.\d+\.\d+/);
   }, 30000);
 
+  it("trims CADDY_MCP_RUNTIME, so 'node ' still means node", async () => {
+    // cmd.exe's `set CADDY_MCP_RUNTIME=node && ...` exports "node ". Read as
+    // `auto`, it would go looking for oam -- and the missing OAM_BIN below would
+    // be reported. Read as `node`, discovery never runs.
+    const res = await runLauncher(["--version"], isolated({ CADDY_MCP_RUNTIME: "node ", OAM_BIN: MISSING_OAM }));
+    expect(res.code, res.stderr).toBe(0);
+    expect(res.stdout.trim()).toMatch(/^caddy-mcp \d+\.\d+\.\d+/);
+    expect(res.stderr).not.toContain("OAM_BIN");
+  }, 30000);
+
   it("auto names an OAM_BIN that points at nothing, then falls back to Node", async () => {
     // A bad override must not be fatal in auto mode, or a stale OAM_BIN in a
     // host config would break every launch. It must not be SILENT either: a
@@ -144,7 +154,7 @@ describe.skipIf(!existsSync(DIST_CLI))("launcher: runtime selection", () => {
     const res = await runLauncher(["--version"], isolated({ CADDY_MCP_RUNTIME: "oam", OAM_BIN: MISSING_OAM }));
     expect(res.code).toBe(1);
     expect(res.stdout).toBe("");
-    expect(res.stderr).toContain("no usable oam (0.18.0 or newer) was found");
+    expect(res.stderr).toContain("no usable oam (0.19.1 or newer) was found");
     expect(res.stderr).toContain("does not exist");
     // The remedy names the cause that was seen: a wrong OAM_BIN, not an install.
     expect(res.stderr).toContain("Point OAM_BIN at an existing oam binary, or unset it.");
@@ -238,11 +248,11 @@ describe("launcher: runtimePlan()", () => {
     // asking what it was already running on. `auto` and `oam` both have to take
     // the shortcut -- `oam` demands oam, and the host already is one.
     //
-    // 0.18.0 pins the floor as inclusive (it IS the supported release), and
-    // 0.100.0 pins a numeric compare: it sorts BEFORE 0.18.0 as a string, so a
+    // 0.19.1 pins the floor as inclusive (it IS the supported release), and
+    // 0.100.0 pins a numeric compare: it sorts BEFORE 0.19.1 as a string, so a
     // compare over the raw text would treat a newer oam as too old.
     for (const mode of ["auto", "oam"]) {
-      for (const hostOam of ["0.18.0", "0.19.0", "0.100.0", "1.0.0", "0.19.0-dev"]) {
+      for (const hostOam of ["0.19.1", "0.20.0", "0.100.0", "1.0.0", "0.20.0-dev"]) {
         expect(runtimePlan({ mode, hostOam, sandbox: false }), `mode=${mode} hostOam=${hostOam}`).toBe("in-process");
       }
     }
@@ -253,7 +263,7 @@ describe("launcher: runtimePlan()", () => {
     // Serving in-process here would silently drop the sandbox the user asked
     // for -- a security downgrade that no other symptom would reveal.
     for (const mode of ["auto", "oam"]) {
-      for (const hostOam of [undefined, "0.18.0", "1.0.0", "0.17.0", "0.9.0"]) {
+      for (const hostOam of [undefined, "0.19.1", "1.0.0", "0.19.0", "0.9.0"]) {
         expect(runtimePlan({ mode, hostOam, sandbox: true }), `mode=${mode} hostOam=${hostOam}`).toBe("discover");
       }
     }
@@ -264,8 +274,20 @@ describe("launcher: runtimePlan()", () => {
     // older than 0.9.0 cannot even hand stdio to a child with 'inherit', and
     // anything older than the latest release is not what the server is verified
     // on. "discover" is where it looks for a newer oam, then hands off to Node.
+    // 0.19.0, its -dev builds and 0.18.x were the floor or above it once; since
+    // the move to 0.19.1 they are below it.
     for (const mode of ["auto", "oam"]) {
-      for (const hostOam of ["0.17.0", "0.15.2", "0.9.0", "0.8.2", "0.0.1"]) {
+      for (const hostOam of [
+        "0.19.0",
+        "0.19.0-dev",
+        "0.18.9",
+        "0.18.0",
+        "0.17.0",
+        "0.15.2",
+        "0.9.0",
+        "0.8.2",
+        "0.0.1",
+      ]) {
         expect(runtimePlan({ mode, hostOam, sandbox: false }), `mode=${mode} hostOam=${hostOam}`).toBe("discover");
       }
     }
@@ -285,11 +307,33 @@ describe("launcher: runtimePlan()", () => {
     // The sandbox changes nothing here: node mode ignores it entirely.
     for (const sandbox of [false, true]) {
       expect(runtimePlan({ mode: "node", hostOam: undefined, sandbox }), `sandbox=${sandbox}`).toBe("in-process");
-      for (const hostOam of ["0.8.2", "0.18.0", "1.0.0", "dev"]) {
+      for (const hostOam of ["0.8.2", "0.19.1", "1.0.0", "dev"]) {
         expect(runtimePlan({ mode: "node", hostOam, sandbox }), `hostOam=${hostOam} sandbox=${sandbox}`).toBe(
           "handoff-node",
         );
       }
+    }
+  });
+});
+
+describe("launcher: parseOptIn()", () => {
+  const parseOptIn = new Function(
+    `${extract([/function parseOptIn\(raw\) \{[\s\S]*?\n\}/])}\nreturn parseOptIn;`,
+  )() as (raw: string | undefined) => "on" | "off" | "invalid";
+
+  it("reads 1 and true, trimmed and in any case, as on", () => {
+    // "1 " is what cmd.exe's `set CADDY_MCP_SANDBOX=1 && ...` exports. The strict
+    // `=== "1"` this replaced read it -- and "TRUE" -- as OFF, which for the
+    // sandbox is fail-open.
+    for (const raw of ["1", "1 ", " 1", "true", "TRUE", "True ", "\ttrue\n"]) {
+      expect(parseOptIn(raw), JSON.stringify(raw)).toBe("on");
+    }
+  });
+
+  it("reads unset and empty as off, and anything else as invalid (still off; the caller warns)", () => {
+    for (const raw of [undefined, "", "   "]) expect(parseOptIn(raw), JSON.stringify(raw)).toBe("off");
+    for (const raw of ["0", "yes", "on", "false", "11", "1 1"]) {
+      expect(parseOptIn(raw), JSON.stringify(raw)).toBe("invalid");
     }
   });
 });
@@ -299,25 +343,25 @@ describe("launcher: pickNewest()", () => {
   const at = (path: string, version: number[] | null): Candidate => ({ path, version });
 
   it("pins the floor to the latest oam release", () => {
-    expect(floor).toEqual([0, 18, 0]);
+    expect(floor).toEqual([0, 19, 1]);
   });
 
   it("takes the newest usable oam, not the first one found", () => {
     // The bug: discovery stopped at the first binary that existed, so an older
     // copy in an earlier location (the installed dir is searched before PATH)
     // hid a newer one later.
-    const chosen = pickNewest([at("installed", [0, 18, 0]), at("path-a", [0, 19, 0]), at("path-b", [0, 18, 9])]);
+    const chosen = pickNewest([at("installed", [0, 19, 1]), at("path-a", [0, 20, 0]), at("path-b", [0, 19, 9])]);
     expect(chosen?.path).toBe("path-a");
   });
 
   it("compares numerically and keeps search order on a tie", () => {
     expect(pickNewest([at("a", [0, 19, 0]), at("b", [0, 100, 0])])?.path).toBe("b");
-    expect(pickNewest([at("first", [0, 18, 0]), at("second", [0, 18, 0])])?.path).toBe("first");
+    expect(pickNewest([at("first", [0, 19, 1]), at("second", [0, 19, 1])])?.path).toBe("first");
   });
 
   it("skips binaries below the floor or with no readable version", () => {
-    expect(pickNewest([at("old", [0, 9, 0]), at("broken", null), at("good", [0, 18, 0])])?.path).toBe("good");
-    expect(pickNewest([at("old", [0, 17, 0]), at("broken", null)])).toBeNull();
+    expect(pickNewest([at("old", [0, 9, 0]), at("broken", null), at("good", [0, 19, 1])])?.path).toBe("good");
+    expect(pickNewest([at("old", [0, 19, 0]), at("broken", null)])).toBeNull();
     expect(pickNewest([])).toBeNull();
   });
 });
@@ -337,7 +381,7 @@ describe("launcher: pickNewest()", () => {
  * fakes below are not. In-process, `--version` reaches dist/index.js and
  * prints `caddy-mcp <version>` with exit 0. On the discovery path, OAM_BIN is
  * that pinned Node, the preload makes the launcher's `--version` probe of it
- * read "oam 0.18.0" (the real `node --version` has no oam banner and would be
+ * read "oam 0.19.1" (the real `node --version` has no oam banner and would be
  * passed over, see "launcher: a non-oam OAM_BIN"), and the launcher spawns
  * `node [flags] run <entry>` -- which has no `run` subcommand, prints no
  * version and exits non-zero. A usable OAM_BIN is taken before discovery runs,
@@ -371,7 +415,7 @@ function runOnHost(
     'import { syncBuiltinESMExports as poseSync } from "node:module";',
     "const poseReal = poseCp.execFileSync;",
     "poseCp.execFileSync = function (cmd, args, opts) {",
-    `  if (cmd === ${JSON.stringify(process.execPath)} && args?.[0] === "--version") return "oam 0.18.0\\n";`,
+    `  if (cmd === ${JSON.stringify(process.execPath)} && args?.[0] === "--version") return "oam 0.19.1\\n";`,
     "  return poseReal.call(this, cmd, args, opts);",
     "};",
     "poseSync();",
@@ -417,7 +461,7 @@ describe.skipIf(!existsSync(DIST_CLI))("launcher: on an oam host", () => {
     async () => {
       const envs: Record<string, string>[] = [{}, { CADDY_MCP_RUNTIME: "oam" }];
       for (const extraEnv of envs) {
-        const run = await runOnHost("0.18.0", extraEnv);
+        const run = await runOnHost("0.19.1", extraEnv);
         expect(servedVersion(run), `${JSON.stringify(extraEnv)} -> ${JSON.stringify(run)}`).toBe(true);
         expect(run.stderr).toMatch(IN_PROCESS_MARKER);
       }
@@ -428,7 +472,7 @@ describe.skipIf(!existsSync(DIST_CLI))("launcher: on an oam host", () => {
   it(
     "still spawns under CADDY_MCP_SANDBOX=1, so --permission is not dropped",
     async () => {
-      const run = await runOnHost("0.18.0", { CADDY_MCP_SANDBOX: "1" });
+      const run = await runOnHost("0.19.1", { CADDY_MCP_SANDBOX: "1" });
       expect(servedVersion(run), `the sandbox must force a spawn, got ${JSON.stringify(run)}`).toBe(false);
       expect(run.code).not.toBe(0);
       expect(run.stderr).toMatch(HANDED_OFF_MARKER);
@@ -442,8 +486,8 @@ describe.skipIf(!existsSync(DIST_CLI))("launcher: on an oam host", () => {
   it(
     "still discovers when the host oam is below the floor",
     async () => {
-      // 0.17.0: the release just below the floor.
-      const run = await runOnHost("0.17.0");
+      // 0.19.0: the release just below the floor.
+      const run = await runOnHost("0.19.0");
       expect(servedVersion(run), `a below-floor host must not shortcut, got ${JSON.stringify(run)}`).toBe(false);
       expect(run.code).not.toBe(0);
       expect(run.stderr).toMatch(HANDED_OFF_MARKER);
@@ -466,7 +510,7 @@ describe.skipIf(!existsSync(DIST_CLI))("launcher: with no usable oam", () => {
       const run = await runOnHost("0.9.0", isolated({ OAM_BIN: MISSING_OAM }));
       expect(servedVersion(run), JSON.stringify(run)).toBe(true);
       expect(run.stderr).toMatch(
-        /this process is oam 0\.9\.0, older than 0\.18\.0, and no newer oam was found; running on .*node/,
+        /this process is oam 0\.9\.0, older than 0\.19\.1, and no newer oam was found; running on .*node/,
       );
       // Served by the child, not in the launcher process.
       expect(run.stderr).toMatch(HANDED_OFF_MARKER);
@@ -496,7 +540,7 @@ describe.skipIf(!existsSync(DIST_CLI))("launcher: with no usable oam", () => {
       // test spawns it with, because the Node running the LAUNCHER here would
       // refuse it the same way. --no-warnings is a Node flag and must survive.
       const run = await runOnHost(
-        "0.18.0",
+        "0.19.1",
         isolated({ CADDY_MCP_RUNTIME: "node", OAM_BIN: MISSING_OAM }),
         `process.env.NODE_OPTIONS = "--permission --allow-net=localhost:2019 --allow-fs-read=/tmp --no-warnings";`,
       );
@@ -511,7 +555,7 @@ describe.skipIf(!existsSync(DIST_CLI))("launcher: with no usable oam", () => {
     "hands CADDY_MCP_RUNTIME=node off to Node even on a supported oam host, sandbox or not",
     async () => {
       for (const sandbox of [undefined, "1"]) {
-        const run = await runOnHost("0.18.0", isolated({ CADDY_MCP_RUNTIME: "node", CADDY_MCP_SANDBOX: sandbox }));
+        const run = await runOnHost("0.19.1", isolated({ CADDY_MCP_RUNTIME: "node", CADDY_MCP_SANDBOX: sandbox }));
         expect(servedVersion(run), `sandbox=${sandbox} -> ${JSON.stringify(run)}`).toBe(true);
         expect(run.stderr).toMatch(HANDED_OFF_MARKER);
       }
@@ -526,11 +570,11 @@ describe.skipIf(!existsSync(DIST_CLI))("launcher: with no usable oam", () => {
       // reason a supported oam host spawns at all, and the host IS a supported
       // oam, so a miss serves on it -- unsandboxed, as the header documents --
       // rather than moving to Node.
-      const run = await runOnHost("0.18.0", isolated({ CADDY_MCP_SANDBOX: "1", OAM_BIN: MISSING_OAM }));
+      const run = await runOnHost("0.19.1", isolated({ CADDY_MCP_SANDBOX: "1", OAM_BIN: MISSING_OAM }));
       expect(servedVersion(run), JSON.stringify(run)).toBe(true);
       expect(run.stderr).toMatch(IN_PROCESS_MARKER);
       expect(run.stderr).toMatch(
-        /^caddy-mcp: OAM_BIN=.*does not exist; serving in this process \(oam 0\.18\.0\) instead\.$/m,
+        /^caddy-mcp: OAM_BIN=.*does not exist; serving in this process \(oam 0\.19\.1\) instead\.$/m,
       );
     },
     TIMEOUT_MS,
@@ -551,12 +595,12 @@ describe.skipIf(!existsSync(DIST_CLI))("launcher: with no usable oam", () => {
     "refuses a sandbox miss under CADDY_MCP_RUNTIME=oam, even on a supported oam host",
     async () => {
       const run = await runOnHost(
-        "0.18.0",
+        "0.19.1",
         isolated({ CADDY_MCP_SANDBOX: "1", CADDY_MCP_RUNTIME: "oam", OAM_BIN: MISSING_OAM }),
       );
       expect(run.code, JSON.stringify(run)).toBe(1);
       expect(run.stdout).toBe("");
-      expect(run.stderr).toContain("no usable oam (0.18.0 or newer) was found");
+      expect(run.stderr).toContain("no usable oam (0.19.1 or newer) was found");
     },
     TIMEOUT_MS,
   );
@@ -584,7 +628,7 @@ describe.skipIf(!existsSync(DIST_CLI))("launcher: a non-oam OAM_BIN", () => {
     const res = await runLauncher(["--version"], isolated({ OAM_BIN: process.execPath, CADDY_MCP_RUNTIME: "oam" }));
     expect(res.code).toBe(1);
     expect(res.stdout).toBe("");
-    expect(res.stderr).toContain("no usable oam (0.18.0 or newer) was found");
+    expect(res.stderr).toContain("no usable oam (0.19.1 or newer) was found");
     expect(res.stderr).toContain("Check that it is an executable oam binary for this platform.");
     expect(res.stderr).not.toContain("MODULE_NOT_FOUND");
   }, 30000);
@@ -638,7 +682,7 @@ describe.skipIf(!existsSync(DIST_CLI))("launcher: failed spawn on an oam host", 
       expect(servedVersion(run), `the Node fallback must still serve, got ${JSON.stringify(run)}`).toBe(true);
       expect(run.stderr).toMatch(/^caddy-mcp: failed to launch oam at .*; using Node instead\.$/m);
       expect(run.stderr).toMatch(
-        /this process is oam 0\.9\.0, older than 0\.18\.0, and no newer oam was found; running on /,
+        /this process is oam 0\.9\.0, older than 0\.19\.1, and no newer oam was found; running on /,
       );
       expect(run.stderr).toMatch(HANDED_OFF_MARKER);
     },
@@ -649,13 +693,13 @@ describe.skipIf(!existsSync(DIST_CLI))("launcher: failed spawn on an oam host", 
     "still serves a sandbox request in-process on a supported host",
     async () => {
       const run = await runOnHost(
-        "0.18.0",
+        "0.19.1",
         isolated({ OAM_BIN: process.execPath, CADDY_MCP_SANDBOX: "1" }),
         FAIL_FIRST_SPAWN,
       );
       expect(servedVersion(run), `the in-process fallback must still serve, got ${JSON.stringify(run)}`).toBe(true);
       expect(run.stderr).toMatch(
-        /^caddy-mcp: failed to launch oam at .*; serving in this process \(oam 0\.18\.0\) instead\.$/m,
+        /^caddy-mcp: failed to launch oam at .*; serving in this process \(oam 0\.19\.1\) instead\.$/m,
       );
       expect(run.stderr).toMatch(IN_PROCESS_MARKER);
     },
@@ -683,7 +727,7 @@ describe.skipIf(!existsSync(DIST_CLI))("launcher: failed spawn on an oam host", 
  * Answering `--version` is MANDATORY for any stand-in oam.
  *
  * Before spawning, the launcher runs a synchronous `execFileSync(oam,
- * ["--version"])` and requires >= OAM_MIN (0.18.0). A fake that ignores the
+ * ["--version"])` and requires >= OAM_MIN (0.19.1). A fake that ignores the
  * probe does not merely fail the gate -- if it wedges, the launcher waits out
  * the probe's 5s bound, and if it answers unparseably the launcher passes it
  * over and falls back to Node, so the test would measure the fallback path
@@ -694,7 +738,7 @@ describe.skipIf(!existsSync(DIST_CLI))("launcher: failed spawn on an oam host", 
  * `shell: true`, the same constraint that keeps the launcher's own discovery to
  * `.exe`.
  */
-const VERSION_PROBE = ['if [ "$1" = "--version" ]; then echo "oam 0.18.0"; exit 0; fi'];
+const VERSION_PROBE = ['if [ "$1" = "--version" ]; then echo "oam 0.19.1"; exit 0; fi'];
 
 /** Write an executable stand-in oam into `dir` (a fresh temp dir by default); returns its path. */
 function writeFake(body: string, dir = mkdtempSync(join(tmpdir(), "caddy-mcp-fake-oam-"))): string {
@@ -747,10 +791,10 @@ describe.skipIf(isWin || !existsSync(DIST_CLI))("launcher: signal handling", () 
     // Isolated: a real oam elsewhere on the box would otherwise satisfy `oam`.
     const res = await runLauncher(["--version"], isolated({ CADDY_MCP_RUNTIME: "oam", OAM_BIN: writeFake(TOO_OLD) }));
     expect(res.code).toBe(1);
-    expect(res.stderr).toContain("is oam 0.8.9, older than 0.18.0");
+    expect(res.stderr).toContain("is oam 0.8.9, older than 0.19.1");
     // An outdated oam is fixed in place; sending this user to the website
     // would make them reinstall what `oam self-update` does for them.
-    expect(res.stderr).toContain("Run `oam self-update` to get oam 0.18.0 or newer.");
+    expect(res.stderr).toContain("Run `oam self-update` to get oam 0.19.1 or newer.");
     expect(res.stderr).not.toContain("https://oamjs.org");
   }, 30000);
 
@@ -854,6 +898,26 @@ describe.skipIf(isWin || !existsSync(DIST_CLI))("launcher: sandbox grants", () =
     // is rejected outright.
     expect(argv.indexOf("--permission")).toBe(0);
     expect(argv[argv.indexOf("run") + 1]).toBe(DIST_CLI);
+  }, 30000);
+
+  it("takes '1 ' and 'TRUE' as the sandbox opt-in", async () => {
+    for (const value of ["1 ", "TRUE"]) {
+      const argv = await argvFor({ CADDY_MCP_SANDBOX: value });
+      expect(argv.indexOf("--permission"), `CADDY_MCP_SANDBOX=${JSON.stringify(value)}`).toBe(0);
+    }
+  }, 30000);
+
+  it("warns once and runs unsandboxed on any other value", async () => {
+    const res = await runLauncher([], {
+      OAM_BIN: writeFake(ECHO_ARGV),
+      CADDY_MCP_RUNTIME: "oam",
+      CADDY_MCP_SANDBOX: "yes",
+      CADDY_ADMIN_URL: undefined,
+      CADDY_MCP_SNAPSHOT_DIR: undefined,
+    });
+    expect(res.code, res.stderr).toBe(0);
+    expect(res.stderr).not.toContain("ARGV: --permission");
+    expect(res.stderr.match(/CADDY_MCP_SANDBOX="yes" is not 1 or true; running WITHOUT the sandbox/g)).toHaveLength(1);
   }, 30000);
 
   it("derives the grant from CADDY_ADMIN_URL, host and port", async () => {
@@ -1027,7 +1091,7 @@ describe.skipIf(isWin || !existsSync(DIST_CLI))("launcher: discovery", () => {
     // The bug: the installed location is searched first, and discovery stopped
     // at the first binary that existed, so a stale installed copy hid a newer
     // one on PATH.
-    const env = withInstalledAndPath(fake("0.18.0", "installed"), fake("0.19.0", "path"), {
+    const env = withInstalledAndPath(fake("0.19.1", "installed"), fake("0.20.0", "path"), {
       CADDY_MCP_RUNTIME: "oam",
     });
     const res = await runLauncher([], env);
@@ -1040,14 +1104,14 @@ describe.skipIf(isWin || !existsSync(DIST_CLI))("launcher: discovery", () => {
     // OAM_INSTALL_DIR is the installer's target. An oam installed there and never
     // put on PATH used to be invisible to discovery.
     const installDir = mkdtempSync(join(tmpdir(), "caddy-mcp-install-dir-"));
-    writeFake(fake("0.18.0", "install-dir"), installDir);
+    writeFake(fake("0.19.1", "install-dir"), installDir);
     const res = await runLauncher([], isolated({ CADDY_MCP_RUNTIME: "oam", OAM_INSTALL_DIR: installDir }));
     expect(res.code, res.stderr).toBe(0);
     expect(res.stderr).toContain("CHILD: install-dir");
   }, 30000);
 
   it("keeps the installed copy on a tie", async () => {
-    const env = withInstalledAndPath(fake("0.18.0", "installed"), fake("0.18.0", "path"), {
+    const env = withInstalledAndPath(fake("0.19.1", "installed"), fake("0.19.1", "path"), {
       CADDY_MCP_RUNTIME: "oam",
     });
     const res = await runLauncher([], env);
@@ -1057,7 +1121,7 @@ describe.skipIf(isWin || !existsSync(DIST_CLI))("launcher: discovery", () => {
   }, 30000);
 
   it("passes over a below-floor oam, installed or OAM_BIN, and says so", async () => {
-    const env = withInstalledAndPath(fake("0.17.0", "installed"), fake("0.18.0", "path"), {
+    const env = withInstalledAndPath(fake("0.19.0", "installed"), fake("0.19.1", "path"), {
       OAM_BIN: writeFake(fake("0.8.9", "override")),
     });
     const res = await runLauncher([], env);
@@ -1066,7 +1130,7 @@ describe.skipIf(isWin || !existsSync(DIST_CLI))("launcher: discovery", () => {
     expect(res.stderr).not.toMatch(/CHILD: (installed|override)/);
     // The OAM_BIN note names the binary that was used instead.
     expect(res.stderr).toMatch(
-      /^caddy-mcp: OAM_BIN=.* is oam 0\.8\.9, older than 0\.18\.0; using .*oam \(oam 0\.18\.0\)\.$/m,
+      /^caddy-mcp: OAM_BIN=.* is oam 0\.8\.9, older than 0\.19\.1; using .*oam \(oam 0\.19\.1\)\.$/m,
     );
   }, 30000);
 });
@@ -1107,7 +1171,7 @@ describe.skipIf(isWin || !existsSync(DIST_CLI))("launcher: version gate fallback
     // Naming the version found is the point of the notice: a silent downgrade is
     // how someone keeps running an oam they meant to update.
     expect(res.stderr).toContain("0.8.9");
-    expect(res.stderr).toContain("older than 0.18.0");
+    expect(res.stderr).toContain("older than 0.19.1");
     expect(res.stderr).toContain("using Node instead");
   }, 30000);
 
@@ -1119,7 +1183,7 @@ describe.skipIf(isWin || !existsSync(DIST_CLI))("launcher: version gate fallback
     expect(res.code, res.stderr).toBe(0);
     expect(res.stdout.trim()).toMatch(/^caddy-mcp \d+\.\d+\.\d+/);
     // The other half of the split: this diagnostic must NOT claim a version it
-    // never read, because "older than 0.18.0" would send the operator to
+    // never read, because "older than 0.19.1" would send the operator to
     // self-update a binary that never ran.
     expect(res.stderr).toContain("could not be run, or did not report a version");
     expect(res.stderr).not.toContain("older than");

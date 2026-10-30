@@ -110,6 +110,12 @@ describe("scripts/runtime.mjs: CADDY_MCP_RUNTIME=node skips discovery", () => {
     expect(probeWith("NODE")).toBeNull();
   });
 
+  it("returns null without probing for a padded 'node ' too", () => {
+    // cmd.exe's `set CADDY_MCP_RUNTIME=node && ...` keeps the space; the
+    // launcher trims it, so this must as well.
+    expect(probeWith("node ")).toBeNull();
+  });
+
   it("throws under require: true for a non-lowercase 'node' too", () => {
     expect(probeWith("Node", POSE_AS_OAM, "findOam({ require: true })")).toEqual({
       error: expect.stringContaining("CADDY_MCP_RUNTIME=node conflicts"),

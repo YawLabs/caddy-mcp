@@ -134,7 +134,7 @@ export function findOam({ require = false } = {}) {
   // Case-insensitive, matching the launcher's own read of the same variable
   // (bin/caddy-mcp.mjs lowercases it): `=NODE` must force the Node path here
   // too, or the typecheck silently uses oam the launcher would have refused.
-  if ((process.env.CADDY_MCP_RUNTIME ?? "").toLowerCase() === "node") {
+  if ((process.env.CADDY_MCP_RUNTIME ?? "").trim().toLowerCase() === "node") {
     if (require) {
       throw new Error("CADDY_MCP_RUNTIME=node conflicts with an explicit request for the oam runtime.");
     }

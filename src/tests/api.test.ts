@@ -317,6 +317,28 @@ describe("api", () => {
       expect(calls).toBe(3);
     });
 
+    it.each([
+      ["empty", "", 3],
+      ["whitespace-only", "   ", 3],
+      ["hex", "0x2", 3],
+      ["exponent", "1e1", 3],
+      ["negative", "-1", 3],
+      ["fractional", "1.5", 3],
+      ["padded", " 1 ", 2],
+      ["padded zero", "0 ", 1],
+    ])("parses CADDY_MAX_RETRIES=%s strictly (trimmed digits, else 2)", async (_label, value, expected) => {
+      process.env.CADDY_MAX_RETRIES = value;
+      const api = await import("../api.js");
+      let calls = 0;
+      globalThis.fetch = vi.fn(async () => {
+        calls++;
+        return new Response("down", { status: 503 });
+      }) as any;
+
+      await api.configGet();
+      expect(calls).toBe(expected);
+    });
+
     // POST against /config/<path> and /id/<id> is non-idempotent: it appends
     // to arrays or creates new keys. A retry after a server-side
     // success-but-lost-response would silently duplicate the write. Skip the
@@ -1972,7 +1994,7 @@ describe("api", () => {
     // branch, so these writes were replayed up to 1 + CADDY_MAX_RETRIES times and
     // the caller got the bare runtime text. History: oam up to 0.17.x worded its
     // timeouts this way (observed under 0.16.2 with the old classifier). No
-    // runtime the launcher serves on does now -- oam 0.18.0, the floor, uses
+    // runtime the launcher serves on does now -- oam 0.18.0 and later, the floor among them, use
     // Node's wording -- so this pins the name-based rule, not any one runtime.
     describe("with a TimeoutError worded 'timed out'", () => {
       const timedOutError = () => new DOMException("The operation timed out", "TimeoutError");

@@ -264,11 +264,12 @@ function getUnixSocketPath(): string | undefined {
 
 let warnedRetryClamp = false;
 function getMaxRetries(): number {
-  const raw = process.env.CADDY_MAX_RETRIES;
-  if (raw === undefined) return 2;
-  const n = Number(raw);
-  if (!Number.isFinite(n) || n < 0) return 2;
-  const floored = Math.floor(n);
+  // Trimmed, then digits only. `Number(raw)` read "" (an exported-but-empty
+  // variable) as 0 retries and "0x2" / "1e1" as numbers; anything that is not a
+  // plain non-negative integer is the default instead.
+  const raw = process.env.CADDY_MAX_RETRIES?.trim();
+  if (!raw || !/^\d+$/.test(raw)) return 2;
+  const floored = Number(raw);
   // Warn once per process when the user-supplied value exceeds the hard cap.
   // getMaxRetries runs on every request, so an unconditional warn would
   // spam stderr; a per-process flag keeps the signal noticeable but quiet.
@@ -782,8 +783,8 @@ function isConnectionRefused(err: unknown): boolean {
  * due to timeout"; oam's up to 0.17.x -- the runtime bin/caddy-mcp.mjs
  * preferred when one was installed -- rejected with DOMException TimeoutError
  * "The operation timed out", which contains neither "abort" nor "timeout".
- * (oam 0.18.0, the launcher's floor now, uses Node's wording; measured on the
- * published build.) Matching on the text alone missed that, so under oam a
+ * (oam 0.18.0 switched to Node's wording, measured on the published build;
+ * 0.19.1, the launcher's floor now, still uses it.) Matching on the text alone missed that, so under oam a
  * timed-out config change was never recognised as one: rule 3 of shouldRetry
  * did not fire, the write was replayed up to 1 + CADDY_MAX_RETRIES times (into
  * the false 404 / 412 rule 3 exists to prevent), and the caller got the bare
@@ -840,7 +841,8 @@ function sendViaUnixSocket(
     // req.destroy -- but oam's node:http ignores `signal`: a request under
     // AbortSignal.timeout(200) had still not aborted after 3 s on oam 0.16.2
     // (Node: 203 ms), which left this transport with no deadline at all there.
-    // Re-measured on oam 0.18.0: still not aborted after 3 s.
+    // Re-measured on oam 0.18.0 and again on 0.19.1: still not aborted after
+    // 3 s (Node: 211 ms).
     // Once the timer has fired, every rejection that follows is reported as the
     // deadline itself: destroying a request whose response has already started
     // also fails the response with a generic "aborted", and the catch must see
@@ -927,7 +929,7 @@ async function sendViaFetch(
  * import of undici is needed.
  *
  * On oam the hook finds nothing: oam's fetch pool is its own, the symbol is
- * undefined after a fetch (measured on 0.18.0), and oam's builtin `undici`
+ * undefined after a fetch (measured on 0.18.0 and 0.19.1), and oam's builtin `undici`
  * Agent emits no connect/disconnect events even when installed as the global
  * dispatcher. settleAdminRestart therefore cannot count sockets there and
  * falls back to a fixed wait instead -- see its comment. On a Node that moves
@@ -1020,6 +1022,11 @@ function originOf(origin: unknown): string | undefined {
  * restarted). With the fixed wait the same probe ran 1,800 changes with no
  * failure and no accept timeout. The cost is 250 ms per config change on oam,
  * where Node usually waits well under a millisecond.
+ *
+ * Those numbers are from oam 0.18.0; the probe has NOT been re-run on 0.19.1,
+ * the floor now. 0.19.1's pool fix (oam #312) does not make the wait
+ * redundant: it still leaves the first request or two after a restart to the
+ * closing origin socket, which is the window this wait covers. So it stays.
  */
 function settleAdminRestart(origin: string | undefined): Promise<void> {
   if (!origin) return Promise.resolve();
