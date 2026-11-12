@@ -68,7 +68,7 @@
  * real oam 0.8.2 host, the MCP handshake never answered. Piping the streams
  * explicitly completes it, to both oam and Node. The sandbox spawn from a
  * supported oam host pipes too -- one rule for every oam host, verified with a
- * real handshake on 0.19.1 (first measured on 0.15.2). A Node host keeps
+ * real handshake on 0.19.5 (first measured on 0.15.2). A Node host keeps
  * `inherit`, which hands over the same fds untouched.
  *
  * The sandbox asks for a spawn; it does not guarantee one. Discovery can still
@@ -90,7 +90,7 @@
  * http://localhost:2019 -- byte-identical to DEFAULT_URL in src/api.ts, see
  * sandboxFlags). For a TCP endpoint the grant is "host:port" -- the port taken
  * from the URL, or the scheme's default (80/443) when it names none. Since oam
- * 0.18.0 (re-measured on 0.19.1) a port-scoped `--allow-net` entry admits `fetch` to that
+ * 0.18.0 (fetch re-measured on 0.19.5) a port-scoped `--allow-net` entry admits `fetch` to that
  * port exactly as it admits a socket, and the resource fetch presents is
  * "host:port" (an IPv6 literal bracketed, "[::1]:2019"). Up to 0.17.1 a
  * port-scoped entry admitted no HTTP request at all, which is why this grant
@@ -118,7 +118,7 @@
  * "unauthenticated". The env list is derived from the shipped bundle.
  *
  * MINIMUM OAM VERSION
- * The latest oam release, 0.19.1 -- bump OAM_MIN when oam ships a newer one.
+ * The latest oam release, 0.19.5 -- bump OAM_MIN when oam ships a newer one.
  * Only the current oam is used and verified; an older one is passed over. The
  * floor is not cosmetic: before 0.9.0 `child_process.execFile` ran its
  * arguments through a SHELL, `exec` accepted `timeout` and ignored it,
@@ -150,7 +150,7 @@ import { delimiter, join } from "node:path";
 import { fileURLToPath } from "node:url";
 
 /** Oldest oam this server is served on. See MINIMUM OAM VERSION above. */
-const OAM_MIN = [0, 19, 1];
+const OAM_MIN = [0, 19, 5];
 
 /**
  * Bound on each `oam --version` probe. A healthy oam answers in milliseconds;
@@ -252,7 +252,7 @@ function parseVersion(text) {
 
 /**
  * `oam --version` output -> [major, minor, patch], or null unless it carries
- * oam's own banner ("oam 0.19.1" at the start of a line). Any x.y.z is NOT
+ * oam's own banner ("oam 0.19.5" at the start of a line). Any x.y.z is NOT
  * enough: an OAM_BIN (or an oam.exe on disk) that is really another program --
  * node prints "v22.22.2" -- would clear the floor, and the launcher would then
  * spawn `<it> [flags] run dist/index.js`, which dies with no fallback because
@@ -338,15 +338,19 @@ function runtimePlan({ mode, hostOam, sandbox }) {
 /**
  * The `--permission` grant list, or [] when the sandbox is not requested.
  *
- * These are oam's PROCESS-level flags: they belong before the `run` subcommand,
- * not after it. `oam run --permission file.js` is rejected outright, which is a
- * good failure but only because it is loud -- ordering here is load-bearing.
+ * These are oam's PROCESS-level flags, and before the `run` subcommand is their
+ * canonical position. Since 0.19.4 (oam #473, per its release notes) oam also
+ * lifts them from right after `run`. Measured on 0.19.5: `oam run --permission
+ * file.js` sandboxes; `oam run file.js --permission` is rejected ("unexpected
+ * argument"); and after `--` the flag reaches the script as a plain argument,
+ * so the server would run unsandboxed -- the front stays.
  *
- * Net grants (re-measured on oam 0.19.1): an entry without a port admits every
+ * Net grants (re-measured on oam 0.19.5): an entry without a port admits every
  * port on that host; "host:port" is exact, for sockets and HTTP requests alike.
- * Since 0.19.1 repeated grants of one category accumulate (oam #363) -- two
- * --allow-net entries both admit -- but this list never repeats a flag, so that
- * changes nothing here; it would matter only if one were split in two.
+ * Since 0.19.1 repeated grants of one category accumulate (oam #363,
+ * re-measured on 0.19.5) -- two --allow-net entries both admit -- but this list
+ * never repeats a flag, so that changes nothing here; it would matter only if
+ * one were split in two.
  * A denied environment variable is ABSENT from process.env rather than throwing,
  * so the env list below is derived from what the bundle actually reads; trimming
  * it produces silent misbehaviour, not a clear denial.
@@ -409,7 +413,7 @@ function sandboxFlags() {
   // guards against, reached by a different route.
   //
   // Omitting the flag DENIES the category (oam reads an absent --allow-net as
-  // false, a bare one as "*"). Re-verified against oam 0.19.1 -- bare grant lets
+  // false, a bare one as "*"). Re-verified against oam 0.19.5 -- bare grant lets
   // an unrelated port through, omitted grant denies it. What denial costs is
   // NOT yet measured: oam 0.18.0 added Unix domain sockets, and api.ts's
   // node:http `socketPath` dial rides on them, so a granted socket may now work
@@ -441,7 +445,7 @@ function sandboxFlags() {
   if (!isUnixDsn) {
     try {
       const u = new URL(dsn);
-      // HOST:PORT. Since oam 0.18.0 (re-measured on 0.19.1) the resource `fetch` presents is "host:port"
+      // HOST:PORT. Since oam 0.18.0 (re-measured on 0.19.5) the resource `fetch` presents is "host:port"
       // and a port-scoped entry admits it, so the grant names exactly the
       // endpoint api.ts dials. `u.port` is "" when the URL names the scheme's
       // default port, so fill that in: 443 for https, 80 otherwise (api.ts only

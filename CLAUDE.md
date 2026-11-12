@@ -33,7 +33,7 @@ The split is deliberate — **auto-detect for tools, explicit for artifacts**:
 | `npm run build:binary:oam` | **oam compile** | — (single carrier; no oam is a hard error) |
 | `npm test` | vitest (Node) | — |
 | `npm start` | Node | — |
-| `bin` entry (`bin/caddy-mcp.mjs`) | newest oam at or above 0.19.1, else Node | `CADDY_MCP_RUNTIME=node` / `=oam`, `OAM_BIN`; see the launcher header |
+| `bin` entry (`bin/caddy-mcp.mjs`) | newest oam at or above 0.19.5, else Node | `CADDY_MCP_RUNTIME=node` / `=oam`, `OAM_BIN`; see the launcher header |
 
 **Why the binary does NOT auto-detect a fallback carrier.** It is a release
 artifact. If a carrier were chosen by what happens to be installed, the same git
@@ -44,7 +44,7 @@ a quiet downgrade. (The repo used to carry a second carrier -- Node SEA + postje
 error is a type error under either checker.
 
 **oam ships signed releases** (a signed release manifest, Authenticode on Windows,
-codesigned on macOS); 0.19.1 is the floor this server is verified on, and
+codesigned on macOS); 0.19.5 is the floor this server is verified on, and
 `scripts/check-oam-floor.mjs` keeps the floor consistent and current. Anyone without
 oam still gets the Node path for the dev loop (`npm test`, `npm start`) and the `bin`
 launcher's fallback; the release binary itself is oam-only.
@@ -64,7 +64,7 @@ Two deliberate non-changes:
   `dist/index.js`. An earlier note here called it *slower* than Node (853 ms vs
   701 ms); that timed an oam inside `target/release` mid-rebuild. Against an
   installed oam it is faster (184 ms vs 213 ms, see `scripts/build-binary-oam.mjs`).
-  The launcher never serves on an oam older than 0.19.1.
+  The launcher never serves on an oam older than 0.19.5.
 - **Tests stay on vitest.** oam ships its own runner (`import 'oam:test'`), but the
   suite leans on `vi.mock` for module-level api mocking; porting it would trade a
   working 310-test suite for a rewrite and would break the Node-only path.

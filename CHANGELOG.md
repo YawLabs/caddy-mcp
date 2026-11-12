@@ -7,6 +7,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed
+- **The oam floor is now 0.19.5** (`OAM_MIN` in `bin/caddy-mcp.mjs`), the latest
+  oam release, re-verified through the launcher on the built server against a
+  throwaway Caddy: MCP initialize, `tools/list` and `tools/call`
+  (`caddy_list_servers`, `caddy_load`, `caddy_status`) on auto, under
+  `CADDY_MCP_SANDBOX=1` from both a Node and an oam host (including the default
+  `localhost:2019` grant), and under the sandbox with a snapshot directory
+  (`caddy_revert` list and apply), plus the port-scoped, bare and repeated
+  `--allow-net` grants. 0.19.1 through 0.19.4 are now below the floor and
+  passed over. The sandbox flags still go before `run`. oam 0.19.4 (#473) also
+  honours a flag right after `run` (measured on 0.19.5), so the launcher's note
+  no longer says it is rejected.
+
 ### Security
 - **Dependency updates clear every open Dependabot alert and `npm audit`.**
   Runtime: `zod` 4.6.7 (memory exhaustion on oversized constrained
