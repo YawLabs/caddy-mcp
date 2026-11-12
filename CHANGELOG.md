@@ -7,6 +7,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Security
+- **Dependency updates clear every open Dependabot alert and `npm audit`.**
+  Runtime: `zod` 4.6.7 (memory exhaustion on oversized constrained
+  collections), `body-parser` 2.4.0 (DoS via trailing bytes after a compressed
+  body), `@hono/node-server` 2.1.7 and `hono` 4.13.18 (`serveStatic` double
+  path decode), `fast-uri` 3.1.9 (four normalization / scheme / host
+  advisories), `ip-address` 10.7.6 (quadratic zone-id match) and `qs` 6.17.1
+  (`stringify` DoS). `@modelcontextprotocol/sdk` moves to 1.32.2, the release
+  that accepts `@hono/node-server` 2.x. The server uses stdio only and never
+  reaches the HTTP paths these live on, but they ship in the install tree.
+  Dev only: `vitest` 4.1.12 (`@vitest/mocker` mock-registration injection) and
+  `vite` 8.3.8 (`server.fs` bypasses and `launch-editor` advisories).
+
 ## [2.6.1] — 2026-10-30
 
 ### Changed
