@@ -33,6 +33,7 @@
     "typecheck": "node scripts/typecheck.mjs",
     "typecheck:tsc": "tsc --noEmit",
     "check:oam-floor": "node scripts/check-oam-floor.mjs",
+    "check:yaw-mcp-floor": "node scripts/check-yaw-mcp-floor.mjs",
     "build:binary:oam": "node scripts/build-binary-oam.mjs",
     "test:ci": "npm run build && npm test",
     "prepublishOnly": "npm run build",

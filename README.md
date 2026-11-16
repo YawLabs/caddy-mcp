@@ -2,7 +2,7 @@
 
 [![Add to Yaw MCP](https://yaw.sh/yaw-mcp-button.svg)](https://yaw.sh/mcp/install?name=Caddy&command=npx&args=-y%2C%40yawlabs%2Fcaddy-mcp&description=Manage%20Caddy%20web%20servers%20-%20config%2C%20routes%2C%20TLS%2C%20PKI&source=https%3A%2F%2Fgithub.com%2FYawLabs%2Fcaddy-mcp)
 
-One click adds this to your local Yaw MCP config so it's available in every Yaw Terminal session. Or install manually below.
+One click adds this to your local Yaw MCP config so it's available in every Yaw Terminal session. Tested with Yaw MCP 1.1.13 or newer. Or install manually below.
 
 [![npm version](https://img.shields.io/npm/v/@yawlabs/caddy-mcp)](https://www.npmjs.com/package/@yawlabs/caddy-mcp)
 [![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](https://opensource.org/licenses/MIT)

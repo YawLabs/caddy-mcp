@@ -319,6 +319,21 @@ if [ -f scripts/check-oam-floor.mjs ]; then
   node scripts/check-oam-floor.mjs || fail "oam floor check failed -- see above. Set CADDY_MCP_ALLOW_STALE_OAM=1 to release on the old floor deliberately."
 fi
 
+# --- Yaw MCP floor: consistent, and a warning when stale ----------------------
+# Drift (YAW_MCP_MIN vs the README claim and any @yawlabs/mcp-compliance
+# devDependency) fails the release, and `npm test` already ran that half
+# (src/tests/yaw-mcp-floor.test.ts). A newer @yawlabs/mcp on npm is only a
+# WARNING -- nothing at runtime reads this floor -- so it prints and the release
+# continues. Offline it says so and passes.
+echo ""
+YAW_FLOOR_OUT=$(node scripts/check-yaw-mcp-floor.mjs 2>&1) || { echo "$YAW_FLOOR_OUT"; fail "Yaw MCP floor drift -- see above."; }
+echo "$YAW_FLOOR_OUT"
+if echo "$YAW_FLOOR_OUT" | grep -q "WARNING"; then
+  warn "Yaw MCP floor is behind the latest @yawlabs/mcp -- continuing"
+else
+  info "Yaw MCP floor has no drift"
+fi
+
 # --- Live-Caddy admin-API semantics gate -------------------------------------
 # The 9 tests in src/tests/integration.test.ts are the ONLY thing pinning the
 # Caddy contracts this server is built on: PUT at an array index INSERTS (it
