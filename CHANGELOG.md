@@ -7,6 +7,23 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed
+- **The oam floor is now 0.20.2** (`OAM_MIN` in `bin/caddy-mcp.mjs`), the latest
+  oam release, re-verified through the launcher on the built server against a
+  throwaway Caddy v2.11.4: MCP initialize, `tools/list` and `tools/call`
+  (`caddy_load`, `caddy_list_servers`, `caddy_status`) on auto, under
+  `CADDY_MCP_RUNTIME=oam`, under `CADDY_MCP_SANDBOX=1` from both a Node and an
+  oam host (on the default `localhost:2019` grant), and under the sandbox with
+  a snapshot directory (`caddy_revert` save and list), plus the port-scoped,
+  bare, omitted and repeated `--allow-net` grants and the `--permission`
+  placement. 0.19.5, 0.20.0 and 0.20.1 are now below the floor and passed over.
+  Nothing else in the launcher or the server changed: oam 0.20.0 to 0.20.2
+  fix areas this server does not use (RSA / Diffie-Hellman, N-API, `cluster`,
+  heap caps, `os.networkInterfaces`), and the repo carried no workaround for
+  them. The launcher's two spawns already pass `windowsHide: true`. oam's
+  `node:http` still ignores `signal` on 0.20.2 (re-measured), so the
+  unix-socket transport keeps its own deadline timer.
+
 ## [2.6.2] — 2026-11-11
 
 ### Changed
