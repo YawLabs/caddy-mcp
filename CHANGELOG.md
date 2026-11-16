@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [2.6.3] — 2026-11-15
+
 ### Changed
 - **The oam floor is now 0.20.2** (`OAM_MIN` in `bin/caddy-mcp.mjs`), the latest
   oam release, re-verified through the launcher on the built server against a
