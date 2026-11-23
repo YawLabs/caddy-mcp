@@ -140,7 +140,9 @@ function stripPort(host: string): string {
 
 /** Parse a "from" string like "api.example.com" or "example.com/api/*" into match object */
 export function parseFrom(from: string): { host?: string[]; path?: string[] } {
-  const cleaned = from.replace(/^https?:\/\//, "");
+  // Case-insensitive: URL schemes are (RFC 3986), so "HTTPS://example.com" must
+  // not leave "HTTPS:" behind as the host matcher.
+  const cleaned = from.replace(/^https?:\/\//i, "");
   const match: { host?: string[]; path?: string[] } = {};
   const slashIdx = cleaned.indexOf("/");
   if (slashIdx > 0) {
@@ -163,9 +165,12 @@ export function parseFrom(from: string): { host?: string[]; path?: string[] } {
   return match;
 }
 
+/** An http:// or https:// scheme in any case: URL schemes are case-insensitive (RFC 3986). */
+const UPSTREAM_SCHEME = /^https?:\/\//i;
+
 /** Strip scheme and trailing slashes from an upstream address. */
 function cleanUpstreamAddr(addr: string): string {
-  return addr.replace(/^https?:\/\//, "").replace(/\/+$/, "");
+  return addr.replace(UPSTREAM_SCHEME, "").replace(/\/+$/, "");
 }
 
 /**
@@ -214,9 +219,6 @@ interface UpstreamPlan {
  * handler with caddy_add_route -- keeps that decision with the caller.
  */
 function planUpstreams(to: string[]): UpstreamPlan | { error: string } {
-  if (to.length === 0) {
-    return { error: `"to" must list at least one upstream address (e.g. ["localhost:3000"]).` };
-  }
   const dials: string[] = [];
   let secure = 0;
   let plain = 0;
@@ -224,16 +226,32 @@ function planUpstreams(to: string[]): UpstreamPlan | { error: string } {
     // Trim for the same reason `from` is trimmed: surrounding whitespace would
     // otherwise become part of the dial address.
     const trimmed = raw.trim();
-    // Case-sensitive, matching cleanUpstreamAddr's strip -- a scheme this test
-    // recognizes must be one the strip also removes, or the "scheme" would
-    // survive into the dial address.
-    const isTls = trimmed.startsWith("https://");
+    // Both tests share UPSTREAM_SCHEME's case-insensitivity with
+    // cleanUpstreamAddr's strip -- a scheme recognized here must be one the
+    // strip also removes, or the "scheme" would survive into the dial address
+    // ("HTTPS://backend" used to be written verbatim, with no TLS transport).
+    const hasScheme = UPSTREAM_SCHEME.test(trimmed);
+    const isTls = /^https:\/\//i.test(trimmed);
     const dial = cleanUpstreamAddr(trimmed);
     if (dial.length === 0) {
       return {
         error:
           `upstream ${JSON.stringify(raw)} has no address to dial. Each "to" entry needs a host ` +
           `and port (e.g. "localhost:3000", "https://backend.example.com:8443").`,
+      };
+    }
+    // A dial is a socket address: it cannot carry a URL path, query or
+    // fragment, and "https://backend.example.com/api" would otherwise become
+    // the dial "backend.example.com/api:443". Checked only on the URL form: a
+    // schemeless entry may be a Caddy network address, whose "/" is the network
+    // separator ("unix//run/app.sock", "tcp/localhost:3000").
+    if (hasScheme && /[/?#]/.test(dial)) {
+      return {
+        error:
+          `upstream ${JSON.stringify(raw)} carries a path, query or fragment. Caddy's reverse_proxy dials ` +
+          `a host and port only and cannot send requests to a sub-path; give "to" just the host and port ` +
+          `(e.g. "https://backend.example.com"), and rewrite the request path with caddy_add_route -- a ` +
+          `"rewrite" handler (uri / strip_path_prefix) before the reverse_proxy, or Caddyfile handle_path.`,
       };
     }
     if (isTls) secure++;
@@ -425,7 +443,7 @@ export function registerRouteTools(server: McpServer) {
         .array(z.string().min(1))
         .min(1)
         .describe(
-          "Upstream addresses, at least one (e.g., ['localhost:3000', 'localhost:3001']). An 'https://' prefix dials the upstream over TLS (port 443 unless one is given); http:// and bare addresses are dialed in the clear. Do not mix https:// and non-https entries in one call.",
+          "Upstream addresses, at least one (e.g., ['localhost:3000', 'localhost:3001']). An 'https://' prefix dials the upstream over TLS (port 443 unless one is given); http:// and bare addresses are dialed in the clear. Do not mix https:// and non-https entries in one call. An http(s):// entry with a path, query or fragment is refused: a dial is host and port only, so rewrite the path with a separate handler instead.",
         ),
       server: z
         .string()
@@ -501,10 +519,10 @@ export function registerRouteTools(server: McpServer) {
         //                         to share this id.
         //   404 / unknown-id   -> POST the route body (with @id embedded) under
         //                         the real config path so the @id registers;
-        //                         subsequent calls then hit the PUT happy path.
+        //                         subsequent calls then hit the PATCH happy path.
         //   any other error    -> surface verbatim (don't speculatively write).
         // The GET costs one extra round-trip on the replace path but eliminates
-        // the speculative-PUT clobber risk and removes the need to body-match
+        // the speculative-write clobber risk and removes the need to body-match
         // failure modes on a write.
         const existing = await api.configByIdGet(id);
         if (existing.ok) {
@@ -530,8 +548,8 @@ export function registerRouteTools(server: McpServer) {
           //   "indexing config: duplicate ID '<id>' found at .../routes/0 and .../routes/1"
           // Verified against Caddy 2.11.4: PUT -> 400 duplicate ID (config
           // rolled back), PATCH -> 200 with the route replaced in place.
-          const putRes = await api.configByIdSet(id, route, "PATCH");
-          if (putRes.ok) {
+          const patchRes = await api.configByIdSet(id, route, "PATCH");
+          if (patchRes.ok) {
             return {
               content: [
                 {
@@ -541,13 +559,13 @@ export function registerRouteTools(server: McpServer) {
               ],
             };
           }
-          // PUT failures surface verbatim. A 404 / parent-missing body here
+          // PATCH failures surface verbatim. A 404 / parent-missing body here
           // does NOT reliably mean "server gone" -- the more common cause is
           // a concurrent caddy_remove_route deleting the @id between the GET
-          // above and the PUT. Translating to serverNotFoundError would
+          // above and the PATCH. Translating to serverNotFoundError would
           // mislead the caller about which thing is missing, so leave the
           // raw body in place for them to read.
-          return formatResult(putRes);
+          return formatResult(patchRes);
         }
         // GET failed. Only treat tight unknown-id markers as "first-create";
         // any other GET failure surfaces verbatim so we don't follow a real
@@ -678,9 +696,18 @@ export function registerRouteTools(server: McpServer) {
         }
         const route = rawRoute as CaddyRoute;
 
-        const idVal = typeof route["@id"] === "string" ? route["@id"] : undefined;
+        // A numeric @id is as real as a string one: Caddy indexes both (its
+        // config indexer formats a JSON number with %v, so 7 answers at /id/7),
+        // so it is shown -- unquoted, as the JSON carries it -- rather than
+        // hidden. Any other type Caddy rejects at load, so it cannot appear here.
+        const rawId = route["@id"];
+        const id =
+          typeof rawId === "string" && rawId
+            ? ` @id="${rawId}"`
+            : typeof rawId === "number" && Number.isFinite(rawId)
+              ? ` @id=${rawId}`
+              : "";
         const groupVal = typeof route.group === "string" ? route.group : undefined;
-        const id = idVal ? ` @id="${idVal}"` : "";
         const group = groupVal ? ` group="${groupVal}"` : "";
 
         const matchList: unknown[] = Array.isArray(route.match) ? route.match : [];
@@ -901,6 +928,11 @@ export function registerRouteTools(server: McpServer) {
       }
       // Read first to bounds-check the index and give a clear error if out of range.
       const readRes = await api.configGet(`apps/http/servers/${srv}/routes`);
+      // A traversal failure means the server (or a parent above it) does not
+      // exist; say so with the create-it recipe, as caddy_list_routes and
+      // caddy_add_route do, instead of passing Caddy's raw
+      // "invalid traversal path" through.
+      if (api.isMissingConfigPath(readRes)) return serverNotFoundError(srv, "caddy_remove_route");
       if (!readRes.ok) return formatResult(readRes);
       const routes = readRes.data;
       if (routes === undefined || routes === null) {

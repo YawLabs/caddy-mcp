@@ -71,11 +71,12 @@ const LINT_TIMEOUT_MS = 10 * 60_000;
  * `$schema` pins the version the CONFIG is validated against; it is not the
  * binary the repo installs, and the two drift apart the moment a `^`/`~` range
  * resolves forward while the hand-written schema URL stays where it was. They
- * had already drifted here: `$schema` says 2.4.11 while the lockfile installs
- * 2.4.16, so on this host the gate was checking the tree with a version the
- * repo does not use anywhere else -- and any finding the two versions disagree
- * about was invisible. Sourcing it from the lockfile makes "lint clean" mean
- * clean under the binary every other host runs.
+ * had already drifted here once: `$schema` said 2.4.11 while the lockfile
+ * installed 2.4.16, so on this host the gate was checking the tree with a
+ * version the repo did not use anywhere else -- and any finding the two
+ * versions disagreed about was invisible. biome.json has since been re-pinned
+ * to match, but nothing keeps the two in step, so the lockfile stays the
+ * source: "lint clean" then means clean under the binary every other host runs.
  */
 function installedBiomeVersion() {
   const lockPath = join(repoRoot, "package-lock.json");

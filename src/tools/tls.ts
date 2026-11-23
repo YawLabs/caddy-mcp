@@ -337,6 +337,11 @@ async function setIssuerField(field: keyof IssuerFields, value: string, label: s
   const patchRes = await api.configPatch(`apps/tls/automation/policies/0/issuers/0/${field}`, value);
   const ok = { content: [{ type: "text" as const, text: `${label} set to: ${value}` }] };
   if (patchRes.ok) return ok;
+  // A deadline that fired is not "the key is missing": Caddy may still be applying
+  // this PATCH (see `outcomeUnknown` in api.ts). The fallback would follow it with a
+  // GET and a second full-reload write, which is the replay a timed-out config change
+  // must never get, so return the outcome-unknown error as is.
+  if (patchRes.outcomeUnknown) return formatResult(patchRes);
   const outcome = await safeFallback(label, patchRes, { [field]: value });
   return outcome.kind === "ok" ? ok : outcome.result;
 }
@@ -352,9 +357,10 @@ export function registerTlsTools(server: McpServer) {
       "'set_acme_ca' sets the ACME CA URL, 'set_acme_profile' sets the ACME profile (Caddy 2.10+), " +
       "'ech_status' reads the Encrypted ClientHello config at apps/tls/encrypted_client_hello (Caddy 2.10+, read-only here). " +
       "Works on both fresh and existing Caddy instances, including one with no config at all: the set_* actions " +
-      "create apps/tls, and any missing parents, when it is not set. Writes target policies[0].issuers[0] only, and only " +
-      "when that issuer's module is 'acme' -- on a multi-policy TLS config, or one whose first issuer is " +
-      "'internal' (Caddy's local CA), edit the intended issuer with caddy_config_set instead.",
+      "create apps/tls, and any missing parents, when it is not set. Writes target policies[0].issuers[0] only. When that " +
+      "issuer already carries the field, it is overwritten in place, whatever the issuer's module; when it does not, the " +
+      "field is merged in only if that issuer's module is 'acme', and refused otherwise. On a multi-policy TLS config, or " +
+      "one whose first issuer is 'internal' (Caddy's local CA), edit the intended issuer with caddy_config_set instead.",
     {
       action: z
         .enum(["status", "set_email", "set_acme_ca", "set_acme_profile", "ech_status"])
@@ -374,7 +380,12 @@ export function registerTlsTools(server: McpServer) {
             "creates -- keeps retrying and issues no certificate at all.",
         ),
     },
-    { readOnlyHint: false, destructiveHint: false, idempotentHint: true, openWorldHint: false },
+    // destructiveHint is TRUE for the same reason as caddy_config_set's: a host
+    // gates on the hint before it sees the action, so the worst case decides.
+    // set_email / set_acme_ca / set_acme_profile OVERWRITE an existing value,
+    // and the fallback writes the whole of apps/tls back -- not the "only
+    // additive updates" destructiveHint:false promises.
+    { readOnlyHint: false, destructiveHint: true, idempotentHint: true, openWorldHint: false },
     async ({ action, email, ca, profile }) => {
       if (action === "status") {
         const tlsRes = await api.configGet("apps/tls");

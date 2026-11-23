@@ -17,6 +17,7 @@ git checkout -b your-branch-name
 
 # 4. Make your changes, then verify everything passes
 npm run lint:fix
+npm run typecheck
 npm run build
 npm test
 ```
@@ -25,10 +26,11 @@ npm test
 
 1. **One PR per change.** Keep PRs focused — a bug fix, a new feature, or a refactor, not all three.
 2. **Branch from `main`** (or `master` if that's the default branch).
-3. **Run `npm run lint:fix`** before committing — merges to `main` require a clean lint/build/test locally.
-4. **Run `npm test`** and confirm all tests pass.
-5. **Write a clear PR title and description** — explain *what* changed and *why*.
-6. **All PRs require approval** from a maintainer before merging.
+3. **Run `npm run lint:fix`** before committing — merges to `main` require a clean lint/typecheck/build/test locally.
+4. **Run `npm run typecheck`** — the test runner (vitest) does not type-check, so a type error passes `npm test`; the release script refuses to ship one.
+5. **Run `npm test`** and confirm all tests pass.
+6. **Write a clear PR title and description** — explain *what* changed and *why*.
+7. **All PRs require approval** from a maintainer before merging.
 
 ## Development Workflow
 
@@ -38,6 +40,7 @@ npm test
 | `npm run build` | Compile TypeScript |
 | `npm run dev` | Run in development mode |
 | `npm test` | Run the test suite |
+| `npm run typecheck` | Type-check without emitting (vitest does not) |
 | `npm run lint` | Check for lint errors |
 | `npm run lint:fix` | Auto-fix lint and formatting |
 
@@ -53,7 +56,7 @@ npm test
 If you're an AI agent (Claude Code, Copilot, Cursor, etc.) submitting a PR:
 
 1. **Fork the repo** and work on a branch — direct pushes to the default branch are blocked.
-2. **Always run `npm run lint:fix && npm run build && npm test`** before committing. Do not skip this.
+2. **Always run `npm run lint:fix && npm run typecheck && npm run build && npm test`** before committing. Do not skip this.
 3. **Do not add unrelated changes** — no drive-by refactors, no extra comments, no unrelated formatting fixes.
 4. **PR description must explain the change clearly** — what problem does it solve, how does it work, how was it tested.
 5. **One logical change per PR.** If you're fixing a bug and adding a feature, that's two PRs.

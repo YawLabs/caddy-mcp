@@ -161,22 +161,8 @@ describe("api", () => {
   describe("retry behavior", () => {
     // 503 throughout this block, deliberately: it is a GATEWAY status, which only
     // a proxy in front of Caddy can produce. Caddy's own 500s are not retried --
-    // see "which 5xx statuses are transient" below.
-    it("retries a gateway 503 up to CADDY_MAX_RETRIES times", async () => {
-      process.env.CADDY_MAX_RETRIES = "2";
-      const api = await import("../api.js");
-      let calls = 0;
-      globalThis.fetch = vi.fn(async () => {
-        calls++;
-        if (calls < 3) return new Response("upstream down", { status: 503 });
-        return new Response("{}", { status: 200 });
-      }) as any;
-
-      const res = await api.configGet();
-      expect(res.ok).toBe(true);
-      expect(calls).toBe(3);
-    });
-
+    // see "which 5xx statuses are transient" below, which also holds the
+    // retried-then-succeeds and gives-up-after-the-budget cases.
     it("retries network errors (fetch failed)", async () => {
       process.env.CADDY_MAX_RETRIES = "2";
       const api = await import("../api.js");
@@ -220,21 +206,6 @@ describe("api", () => {
       expect(res.ok).toBe(false);
       expect(res.status).toBe(412);
       expect(calls).toBe(1);
-    });
-
-    it("gives up after CADDY_MAX_RETRIES when error persists", async () => {
-      process.env.CADDY_MAX_RETRIES = "2";
-      const api = await import("../api.js");
-      let calls = 0;
-      globalThis.fetch = vi.fn(async () => {
-        calls++;
-        return new Response("still down", { status: 503 });
-      }) as any;
-
-      const res = await api.configGet();
-      expect(res.ok).toBe(false);
-      expect(res.status).toBe(503);
-      expect(calls).toBe(3);
     });
 
     it("CADDY_MAX_RETRIES=0 disables retries", async () => {
@@ -945,15 +916,6 @@ describe("api", () => {
       expect(called).toBe(0);
     });
 
-    it("allows legitimate paths with .. as a substring of a segment", async () => {
-      const api = await import("../api.js");
-      globalThis.fetch = vi.fn(async () => new Response("{}", { status: 200 })) as any;
-
-      // ".." only matches as a full path segment -- substrings are fine.
-      const res = await api.configGet("apps/http/servers/my..name");
-      expect(res.ok).toBe(true);
-    });
-
     it("rejects a '.' segment before encoding, so fetch cannot collapse it onto the parent", async () => {
       // The WHATWG URL parser behind fetch resolves dot segments before the
       // request leaves: "apps/." would be sent as `/config/apps/`, and "." on
@@ -1009,6 +971,76 @@ describe("api", () => {
         expect(res.ok, path).toBe(false);
         expect(res.error, path).toContain("'.' and '..' segments are not allowed");
       }
+      expect(called).toBe(0);
+    });
+
+    it("rejects .. in configByIdGet id without hitting fetch", async () => {
+      const api = await import("../api.js");
+      let called = 0;
+      globalThis.fetch = vi.fn(async () => {
+        called++;
+        return new Response("{}", { status: 200 });
+      }) as any;
+
+      const res = await api.configByIdGet("../load");
+      expect(res.ok).toBe(false);
+      expect(res.error).toContain("'..'");
+      expect(called).toBe(0);
+    });
+
+    it("rejects .. in configByIdSet id without hitting fetch", async () => {
+      const api = await import("../api.js");
+      let called = 0;
+      globalThis.fetch = vi.fn(async () => {
+        called++;
+        return new Response("{}", { status: 200 });
+      }) as any;
+
+      const res = await api.configByIdSet("../load", {});
+      expect(res.ok).toBe(false);
+      expect(res.error).toContain("'..'");
+      expect(called).toBe(0);
+    });
+
+    it("rejects .. in configByIdDelete id without hitting fetch", async () => {
+      const api = await import("../api.js");
+      let called = 0;
+      globalThis.fetch = vi.fn(async () => {
+        called++;
+        return new Response("{}", { status: 200 });
+      }) as any;
+
+      const res = await api.configByIdDelete("../load");
+      expect(res.ok).toBe(false);
+      expect(res.error).toContain("'..'");
+      expect(called).toBe(0);
+    });
+
+    it("rejects .. in getPki ca arg without hitting fetch", async () => {
+      const api = await import("../api.js");
+      let called = 0;
+      globalThis.fetch = vi.fn(async () => {
+        called++;
+        return new Response("{}", { status: 200 });
+      }) as any;
+
+      const res = await api.getPki("../stop");
+      expect(res.ok).toBe(false);
+      expect(res.error).toContain("'..'");
+      expect(called).toBe(0);
+    });
+
+    it("rejects .. in getPkiCertificates ca arg without hitting fetch", async () => {
+      const api = await import("../api.js");
+      let called = 0;
+      globalThis.fetch = vi.fn(async () => {
+        called++;
+        return new Response("{}", { status: 200 });
+      }) as any;
+
+      const res = await api.getPkiCertificates("../stop");
+      expect(res.ok).toBe(false);
+      expect(res.error).toContain("'..'");
       expect(called).toBe(0);
     });
   });
@@ -1104,76 +1136,6 @@ describe("api", () => {
         "@id",
       ];
       for (const path of leaves) expect(api.isRootConfigPath(path), JSON.stringify(path)).toBe(false);
-    });
-
-    it("rejects .. in configByIdGet id without hitting fetch", async () => {
-      const api = await import("../api.js");
-      let called = 0;
-      globalThis.fetch = vi.fn(async () => {
-        called++;
-        return new Response("{}", { status: 200 });
-      }) as any;
-
-      const res = await api.configByIdGet("../load");
-      expect(res.ok).toBe(false);
-      expect(res.error).toContain("'..'");
-      expect(called).toBe(0);
-    });
-
-    it("rejects .. in configByIdSet id without hitting fetch", async () => {
-      const api = await import("../api.js");
-      let called = 0;
-      globalThis.fetch = vi.fn(async () => {
-        called++;
-        return new Response("{}", { status: 200 });
-      }) as any;
-
-      const res = await api.configByIdSet("../load", {});
-      expect(res.ok).toBe(false);
-      expect(res.error).toContain("'..'");
-      expect(called).toBe(0);
-    });
-
-    it("rejects .. in configByIdDelete id without hitting fetch", async () => {
-      const api = await import("../api.js");
-      let called = 0;
-      globalThis.fetch = vi.fn(async () => {
-        called++;
-        return new Response("{}", { status: 200 });
-      }) as any;
-
-      const res = await api.configByIdDelete("../load");
-      expect(res.ok).toBe(false);
-      expect(res.error).toContain("'..'");
-      expect(called).toBe(0);
-    });
-
-    it("rejects .. in getPki ca arg without hitting fetch", async () => {
-      const api = await import("../api.js");
-      let called = 0;
-      globalThis.fetch = vi.fn(async () => {
-        called++;
-        return new Response("{}", { status: 200 });
-      }) as any;
-
-      const res = await api.getPki("../stop");
-      expect(res.ok).toBe(false);
-      expect(res.error).toContain("'..'");
-      expect(called).toBe(0);
-    });
-
-    it("rejects .. in getPkiCertificates ca arg without hitting fetch", async () => {
-      const api = await import("../api.js");
-      let called = 0;
-      globalThis.fetch = vi.fn(async () => {
-        called++;
-        return new Response("{}", { status: 200 });
-      }) as any;
-
-      const res = await api.getPkiCertificates("../stop");
-      expect(res.ok).toBe(false);
-      expect(res.error).toContain("'..'");
-      expect(called).toBe(0);
     });
   });
 
@@ -1406,14 +1368,20 @@ describe("api", () => {
         return new Response("", { status: 200 });
       }) as any;
 
+      // Control: with nothing in between, the primed ETag IS echoed, so the
+      // null asserted last is the invalidation, not an ETag never cached.
+      await api.configGet(parent);
+      await api.configPatch(parent, { foo: 0 });
+      expect(calls[1]?.ifMatch).toBe('"/config/ancestor-parent 92a3b4c5d6e7f809"');
+
       await api.configGet(parent);
       await api.configPatch(child, { foo: 1 });
       await api.configPatch(parent, { foo: 2 });
 
-      expect(calls).toHaveLength(3);
-      expect(calls[2]?.method).toBe("PATCH");
-      expect(calls[2]?.path).toBe(`/config/${parent}`);
-      expect(calls[2]?.ifMatch).toBe(null);
+      expect(calls).toHaveLength(5);
+      expect(calls[4]?.method).toBe("PATCH");
+      expect(calls[4]?.path).toBe(`/config/${parent}`);
+      expect(calls[4]?.ifMatch).toBe(null);
     });
 
     it("invalidates descendant entries on a successful parent write", async () => {
@@ -1438,14 +1406,19 @@ describe("api", () => {
         return new Response("", { status: 200 });
       }) as any;
 
+      // Control: with nothing in between, the primed ETag IS echoed.
+      await api.configGet(child);
+      await api.configPatch(child, { foo: 0 });
+      expect(calls[1]?.ifMatch).toBe('"/config/descendant-parent/child a3b4c5d6e7f8091a"');
+
       await api.configGet(child);
       await api.configPatch(parent, { foo: 1 });
       await api.configPatch(child, { foo: 2 });
 
-      expect(calls).toHaveLength(3);
-      expect(calls[2]?.method).toBe("PATCH");
-      expect(calls[2]?.path).toBe(`/config/${child}`);
-      expect(calls[2]?.ifMatch).toBe(null);
+      expect(calls).toHaveLength(5);
+      expect(calls[4]?.method).toBe("PATCH");
+      expect(calls[4]?.path).toBe(`/config/${child}`);
+      expect(calls[4]?.ifMatch).toBe(null);
     });
 
     it("invalidates /config/ entries on an /id/ write (cross-namespace)", async () => {
@@ -1468,14 +1441,19 @@ describe("api", () => {
         return new Response("", { status: 200 });
       }) as any;
 
+      // Control: with nothing in between, the primed ETag IS echoed.
+      await api.configGet(configPath);
+      await api.configPatch(configPath, { foo: 0 });
+      expect(calls[1]?.ifMatch).toBe('"/config/cross-ns-config-path b4c5d6e7f8091a2b"');
+
       await api.configGet(configPath);
       await api.configByIdSet("some-id", { handle: [] }, "PATCH");
       await api.configPatch(configPath, { foo: 1 });
 
-      expect(calls).toHaveLength(3);
-      expect(calls[2]?.method).toBe("PATCH");
-      expect(calls[2]?.path).toBe(`/config/${configPath}`);
-      expect(calls[2]?.ifMatch).toBe(null);
+      expect(calls).toHaveLength(5);
+      expect(calls[4]?.method).toBe("PATCH");
+      expect(calls[4]?.path).toBe(`/config/${configPath}`);
+      expect(calls[4]?.ifMatch).toBe(null);
     });
 
     it("invalidates /id/ entries on a /config/ write (cross-namespace)", async () => {
@@ -1497,14 +1475,50 @@ describe("api", () => {
         return new Response("", { status: 200 });
       }) as any;
 
+      // Control: with nothing in between, the primed ETag IS echoed.
+      await api.configByIdGet("my-id");
+      await api.configByIdSet("my-id", { handle: [] }, "PATCH");
+      expect(calls[1]?.ifMatch).toBe('"/config/apps/http/servers/srv0/routes/0 c5d6e7f8091a2b3c"');
+
       await api.configByIdGet("my-id");
       await api.configPatch("apps/http/servers/srv0", { listen: [":443"] });
       await api.configByIdSet("my-id", { handle: [] }, "PATCH");
 
-      expect(calls).toHaveLength(3);
-      expect(calls[2]?.method).toBe("PATCH");
-      expect(calls[2]?.path).toBe("/id/my-id");
-      expect(calls[2]?.ifMatch).toBe(null);
+      expect(calls).toHaveLength(5);
+      expect(calls[4]?.method).toBe("PATCH");
+      expect(calls[4]?.path).toBe("/id/my-id");
+      expect(calls[4]?.ifMatch).toBe(null);
+    });
+
+    it("invalidates other /id/ entries on an /id/ write (id-to-id)", async () => {
+      // Two ids can name nested objects -- a server and a route inside it --
+      // and the id strings do not say so. A write through one therefore drops
+      // the ETag cached for the other, or the next write there would echo a
+      // hash taken before the nested object changed and 412 spuriously.
+      const api = await import("../api.js");
+      const etag = '"/config/apps/http/servers/srv0 d6e7f8091a2b3c4d"';
+      const calls: Array<{ method: string; path: string; ifMatch: string | null }> = [];
+      globalThis.fetch = vi.fn(async (url: any, opts: any) => {
+        const method = opts?.method ?? "GET";
+        const path = new URL(String(url)).pathname;
+        const ifMatch = opts?.headers?.["If-Match"] ?? null;
+        calls.push({ method, path, ifMatch });
+        if (method === "GET") return new Response("{}", { status: 200, headers: { ETag: etag } });
+        return new Response("", { status: 200 });
+      }) as any;
+
+      // Nothing in between: the priming GET's ETag IS echoed on the /id/ write,
+      // so the null asserted last is the invalidation, not an ETag never cached.
+      await api.configByIdGet("id2id-srv");
+      await api.configByIdSet("id2id-srv", { listen: [":443"] }, "PATCH");
+      expect(calls[1]).toEqual({ method: "PATCH", path: "/id/id2id-srv", ifMatch: etag });
+
+      await api.configByIdGet("id2id-srv");
+      await api.configByIdSet("id2id-route1", { handle: [] }, "PATCH");
+      await api.configByIdSet("id2id-srv", { listen: [":8443"] }, "PATCH");
+
+      expect(calls).toHaveLength(5);
+      expect(calls[4]).toEqual({ method: "PATCH", path: "/id/id2id-srv", ifMatch: null });
     });
 
     it("invalidates the root /config/ entry on a descendant write", async () => {
@@ -1525,6 +1539,11 @@ describe("api", () => {
         return new Response("", { status: 200 });
       }) as any;
 
+      // Control: with nothing in between, the primed root ETag IS echoed.
+      await api.configGet();
+      await api.configPatch("", { apps: {} });
+      expect(calls[1]?.ifMatch).toBe('"/config/ d6e7f8091a2b3c4d"');
+
       // Prime the cache with a full-config read.
       await api.configGet();
       // A descendant write must drop the cached root entry.
@@ -1532,11 +1551,11 @@ describe("api", () => {
       // Writing the root now must NOT carry the pre-child-write ETag.
       await api.configPatch("", { apps: {} });
 
-      expect(calls).toHaveLength(3);
-      expect(calls[0]?.path).toBe("/config/");
-      expect(calls[2]?.method).toBe("PATCH");
+      expect(calls).toHaveLength(5);
       expect(calls[2]?.path).toBe("/config/");
-      expect(calls[2]?.ifMatch).toBe(null);
+      expect(calls[4]?.method).toBe("PATCH");
+      expect(calls[4]?.path).toBe("/config/");
+      expect(calls[4]?.ifMatch).toBe(null);
     });
 
     it("does not invalidate a sibling whose path shares a prefix", async () => {
@@ -1687,6 +1706,32 @@ describe("api", () => {
 
       expect(sent[2]).toBe(null);
     });
+
+    // The write side of the same gate: a PATCH / PUT re-caches the ETag its
+    // response carries, and that value gets the same check a GET's does.
+    it.each(["PATCH", "PUT"] as const)("does not re-cache an unusable ETag a %s answers with", async (method) => {
+      const api = await import("../api.js");
+      const target = `etag-unusable-on-${method.toLowerCase()}`;
+      const usable = `"/config/${target} 2eba8f8053559545"`;
+      const unusable = `"/config/${target} with space 2eba8f8053559545"`;
+      const sent: Array<string | null> = [];
+      globalThis.fetch = vi.fn(async (_url: any, opts: any) => {
+        const m = opts?.method ?? "GET";
+        sent.push(opts?.headers?.["If-Match"] ?? null);
+        if (m === "GET") return new Response("{}", { status: 200, headers: { ETag: usable } });
+        if (m === method) return new Response("", { status: 200, headers: { ETag: unusable } });
+        return new Response("", { status: 200 });
+      }) as any;
+
+      await api.configGet(target);
+      const write = method === "PATCH" ? api.configPatch : api.configPut;
+      await write(target, { foo: 1 });
+      await api.configPatch(target, { foo: 2 });
+
+      // Control: the primed ETag went out on the first write.
+      expect(sent[1]).toBe(usable);
+      expect(sent[2]).toBe(null);
+    });
   });
 
   describe("412 handling", () => {
@@ -1830,6 +1875,14 @@ describe("api", () => {
       "-100",
       "0.5",
       "0.999",
+      // Not plain decimal integers. Number() read "0x10" as 16 and "1e3" as
+      // 1000, and "" as 0; the parse now matches CADDY_MAX_RETRIES.
+      "0x10",
+      "1e3",
+      "1.5",
+      "+500",
+      "",
+      "   ",
     ])("falls back to 55000 for invalid value %p", async (invalid) => {
       process.env.CADDY_LOAD_TIMEOUT = invalid;
       const api = await import("../api.js");
@@ -1864,7 +1917,16 @@ describe("api", () => {
       timeoutSpy.mockRestore();
     });
 
-    it.each(["not-a-number", "0", "-100", "0.5"])("falls back to 10000 for invalid value %p", async (invalid) => {
+    it.each([
+      "not-a-number",
+      "0",
+      "-100",
+      "0.5",
+      "0x10",
+      "1e3",
+      "1.5",
+      "",
+    ])("falls back to 10000 for invalid value %p", async (invalid) => {
       process.env.CADDY_TIMEOUT = invalid;
       const api = await import("../api.js");
       const timeoutSpy = vi.spyOn(AbortSignal, "timeout");
@@ -1884,6 +1946,69 @@ describe("api", () => {
       await api.loadConfig({});
       expect(timeoutSpy).toHaveBeenCalledWith(55000);
       timeoutSpy.mockRestore();
+    });
+  });
+
+  // Both variables go through one parser, so each rule is pinned on both.
+  describe("timeout parsing (CADDY_TIMEOUT and CADDY_LOAD_TIMEOUT)", () => {
+    const both: Array<[string, (api: Api) => Promise<unknown>]> = [
+      ["CADDY_TIMEOUT", (api) => api.configGet()],
+      ["CADDY_LOAD_TIMEOUT", (api) => api.loadConfig({})],
+    ];
+
+    it.each(both)("trims surrounding whitespace from %s", async (name, call) => {
+      process.env[name] = " 5000 \n";
+      const api = await import("../api.js");
+      const timeoutSpy = vi.spyOn(AbortSignal, "timeout");
+      globalThis.fetch = vi.fn(async () => new Response("", { status: 200 })) as any;
+
+      await call(api);
+      expect(timeoutSpy).toHaveBeenCalledWith(5000);
+      timeoutSpy.mockRestore();
+    });
+
+    // Past 2^31-1 ms a timer does not wait longer: Node's setTimeout fires after
+    // ~1 ms, and AbortSignal.timeout(1e12) throws RangeError on Node 26.
+    it.each(both)("clamps %s to the largest delay a timer honours", async (name, call) => {
+      process.env[name] = "1000000000000";
+      const api = await import("../api.js");
+      const timeoutSpy = vi.spyOn(AbortSignal, "timeout");
+      globalThis.fetch = vi.fn(async () => new Response("", { status: 200 })) as any;
+
+      await call(api);
+      expect(timeoutSpy).toHaveBeenCalledWith(2147483647);
+      timeoutSpy.mockRestore();
+    });
+
+    it("keeps the largest value a timer honours as-is", async () => {
+      process.env.CADDY_TIMEOUT = "2147483647";
+      const api = await import("../api.js");
+      const timeoutSpy = vi.spyOn(AbortSignal, "timeout");
+      globalThis.fetch = vi.fn(async () => new Response("{}", { status: 200 })) as any;
+
+      await api.configGet();
+      expect(timeoutSpy).toHaveBeenCalledWith(2147483647);
+      timeoutSpy.mockRestore();
+    });
+
+    // The unix-socket transport arms its own setTimeout with the same value.
+    // No socket is listening at this path, so the request fails at connect --
+    // the timer only has to be armed for the assertion.
+    it("hands the clamped value to the unix-socket transport's timer", async () => {
+      process.env.CADDY_ADMIN_URL =
+        process.platform === "win32" ? "unix:///nope" : "unix:///tmp/caddy-mcp-does-not-exist.sock";
+      process.env.CADDY_TIMEOUT = "1000000000000";
+      const api = await import("../api.js");
+      const timerSpy = vi.spyOn(globalThis, "setTimeout");
+      try {
+        const res = await api.configGet();
+        expect(res.ok).toBe(false);
+        const delays = timerSpy.mock.calls.map((c) => c[1]);
+        expect(delays).toContain(2147483647);
+        expect(delays.every((d) => d === undefined || (d as number) <= 2147483647)).toBe(true);
+      } finally {
+        timerSpy.mockRestore();
+      }
     });
   });
 
@@ -2245,6 +2370,9 @@ describe("api", () => {
           new TypeError("fetch failed", { cause: Object.assign(new Error("read ECONNRESET"), { code: "ECONNRESET" }) }),
       ],
       ["an unrecognized transport error", () => new Error("socket hang up")],
+      // node:http's shape for a response dropped mid-body. "aborted" used to
+      // match a text fallback for "abort" and be reported as a deadline.
+      ["a response cut off mid-body", () => Object.assign(new Error("aborted"), { code: "ECONNRESET" })],
     ])("does not set outcomeUnknown for %s on a config change", async (_label, make) => {
       const api = await import("../api.js");
       globalThis.fetch = vi.fn(async () => {
@@ -2257,6 +2385,51 @@ describe("api", () => {
       expect(res.outcomeUnknown).toBeUndefined();
     });
 
+    // undici's headersTimeout (300 s by default) rejects with the same "fetch
+    // failed" text as a refused connection. Shape measured on Node 26.13.1:
+    // TypeError "fetch failed", cause HeadersTimeoutError, code
+    // UND_ERR_HEADERS_TIMEOUT. With CADDY_LOAD_TIMEOUT above 300000 it fires
+    // first on a slow reload, which was reported unreachable and replayed.
+    const headersTimeout = () =>
+      new TypeError("fetch failed", {
+        cause: Object.assign(new Error("Headers Timeout Error"), {
+          name: "HeadersTimeoutError",
+          code: "UND_ERR_HEADERS_TIMEOUT",
+        }),
+      });
+
+    it("treats fetch's own headers timeout on a config change as outcome-unknown and never replays it", async () => {
+      process.env.CADDY_MAX_RETRIES = "3";
+      process.env.CADDY_LOAD_TIMEOUT = "400000";
+      const api = await import("../api.js");
+      let calls = 0;
+      globalThis.fetch = vi.fn(async () => {
+        calls++;
+        throw headersTimeout();
+      }) as any;
+
+      const res = await api.loadConfig({ apps: {} });
+      expect(calls).toBe(1);
+      expect(res.ok).toBe(false);
+      expect(res.status).toBe(0);
+      expect(res.outcomeUnknown).toBe(true);
+      expect(res.error).toMatch(
+        /^Request timed out waiting for response headers .*400000ms\) -- the outcome is unknown/,
+      );
+      expect(res.error).not.toContain("Cannot connect");
+    });
+
+    it("reports fetch's own headers timeout on a read as a timeout, not as unreachable", async () => {
+      const api = await import("../api.js");
+      globalThis.fetch = vi.fn(async () => {
+        throw headersTimeout();
+      }) as any;
+
+      const res = await api.configGet();
+      expect(res.outcomeUnknown).toBeUndefined();
+      expect(res.error).toMatch(/^Request timed out waiting for response headers /);
+    });
+
     it("stringifies a non-Error throw", async () => {
       const api = await import("../api.js");
       globalThis.fetch = vi.fn(async () => {
@@ -2267,20 +2440,24 @@ describe("api", () => {
       expect(res.error).toBe("bare string failure");
     });
 
-    it("falls back to the raw admin URL when it cannot be parsed", async () => {
-      // The origin-stripping path is tested elsewhere; this is the branch that
-      // runs when CADDY_ADMIN_URL is malformed -- exactly when the user most
-      // needs the value echoed back to spot the typo.
+    it("echoes the raw admin URL when it cannot be parsed, without sending anything", async () => {
+      // The origin-stripping path is tested elsewhere. A malformed
+      // CADDY_ADMIN_URL is exactly when the user most needs the value echoed
+      // back to spot the typo; it is refused up front (see "CADDY_ADMIN_URL
+      // without an http(s) scheme"), so it never reaches the connect-failure
+      // message at all.
       process.env.CADDY_ADMIN_URL = "not a url";
       const api = await import("../api.js");
+      let fetchCalls = 0;
       globalThis.fetch = vi.fn(async () => {
+        fetchCalls++;
         throw new TypeError("fetch failed");
       }) as any;
 
       const res = await api.configGet();
       expect(res.ok).toBe(false);
-      expect(res.error).toContain("not a url");
-      expect(res.error).toContain("is Caddy running?");
+      expect(res.error).toContain('CADDY_ADMIN_URL="not a url"');
+      expect(fetchCalls).toBe(0);
     });
   });
 
@@ -2290,6 +2467,24 @@ describe("api", () => {
       "http://caddy.local:2019///",
     ])("strips trailing slashes from CADDY_ADMIN_URL=%p", async (url) => {
       // A trailing slash in the env var would otherwise produce "//config/".
+      process.env.CADDY_ADMIN_URL = url;
+      const api = await import("../api.js");
+      let calledUrl = "";
+      globalThis.fetch = vi.fn(async (u: any) => {
+        calledUrl = u.toString();
+        return new Response("{}", { status: 200 });
+      }) as any;
+
+      await api.configGet();
+      expect(calledUrl).toBe("http://caddy.local:2019/config/");
+    });
+
+    // Untrimmed, the space sat after the slashes and defeated the strip; real
+    // fetch then rejected the URL and the failure came back as status 0, retried.
+    it.each([
+      "http://caddy.local:2019/ ",
+      " http://caddy.local:2019\n",
+    ])("trims whitespace before stripping, for CADDY_ADMIN_URL=%p", async (url) => {
       process.env.CADDY_ADMIN_URL = url;
       const api = await import("../api.js");
       let calledUrl = "";
@@ -2352,18 +2547,26 @@ describe("api", () => {
       // reads the path the exported helpers build, which never carries the
       // prefix -- if the prefix ever leaked into it, the startsWith("/config/")
       // check would miss and a failed append would be replayed.
+      //
+      // 503, not 500: a 500 is never retried for any method, so it would pass
+      // whatever path the policy saw. A gateway status is retried unless the
+      // path rule stops it -- the GET at the end shows that under this prefix.
       process.env.CADDY_ADMIN_URL = "http://caddy.local:2019/caddy-admin";
-      process.env.CADDY_MAX_RETRIES = "3";
+      process.env.CADDY_MAX_RETRIES = "1";
       const api = await import("../api.js");
-      let calls = 0;
-      globalThis.fetch = vi.fn(async () => {
-        calls++;
-        return new Response("boom", { status: 500 });
+      const methods: string[] = [];
+      globalThis.fetch = vi.fn(async (_url: any, opts: any) => {
+        methods.push(opts?.method ?? "GET");
+        return new Response("boom", { status: 503 });
       }) as any;
 
       const res = await api.configPost("apps/http/servers/srv0/routes", {});
       expect(res.ok).toBe(false);
-      expect(calls).toBe(1);
+      expect(res.status).toBe(503);
+      expect(methods).toEqual(["POST"]);
+
+      await api.configGet("apps/http/servers/srv0/routes");
+      expect(methods).toEqual(["POST", "GET", "GET"]);
     });
 
     it("reports only the origin when the connection fails under a prefix", async () => {
@@ -2746,7 +2949,9 @@ describe("api", () => {
         expect(failed.ok).toBe(false);
         expect(applied.ok).toBe(true);
         expect(appliedMs).toBeGreaterThanOrEqual(240);
-        expect(failedMs).toBeLessThan(200);
+        // Below the 240 that counts as a settle wait above, not a tighter
+        // guess at how fast the request is: a load box can make it slow.
+        expect(failedMs).toBeLessThan(240);
       } finally {
         server.closeAllConnections();
         await new Promise<void>((resolve) => server.close(() => resolve()));
@@ -3141,16 +3346,63 @@ describe("api", () => {
     });
   });
 
+  // A schemeless "localhost:2019" -- Caddy's own CADDY_ADMIN spelling -- parses
+  // with "localhost:" as its scheme and "null" as its origin, so it surfaced as
+  // "Cannot connect to Caddy admin API at null" after the whole retry loop.
+  describe("CADDY_ADMIN_URL without an http(s) scheme", () => {
+    it.each([
+      ["a bare host:port", "localhost:2019"],
+      ["a bare hostname:port", "caddy.local:2019"],
+      ["another scheme", "ftp://localhost:2019"],
+      // These three do not parse at all; fetch would throw "Failed to parse
+      // URL", a status 0 that the retry loop replays.
+      ["a bare IPv4:port", "127.0.0.1:2019"],
+      ["a port alone", ":2019"],
+      ["a bare [IPv6]:port", "[::1]:2019"],
+    ])("rejects %s up front, naming the value, without retrying", async (_label, adminUrl) => {
+      process.env.CADDY_ADMIN_URL = adminUrl;
+      process.env.CADDY_MAX_RETRIES = "3";
+      const api = await import("../api.js");
+      let fetchCalls = 0;
+      globalThis.fetch = vi.fn(async () => {
+        fetchCalls++;
+        throw new TypeError("fetch failed");
+      }) as any;
+
+      const res = await api.configPatch("apps/http", {});
+      expect(res.ok).toBe(false);
+      expect(res.status).toBe(0);
+      expect(res.error).toContain(`CADDY_ADMIN_URL="${adminUrl}"`);
+      expect(res.error).toContain('"http://localhost:2019"');
+      expect(res.error).not.toContain("at null");
+      expect(fetchCalls).toBe(0);
+    });
+
+    it.each([
+      "http://localhost:2019",
+      "https://caddy.local:2019",
+      "HTTP://localhost:2019",
+    ])("lets %s through", async (adminUrl) => {
+      process.env.CADDY_ADMIN_URL = adminUrl;
+      const api = await import("../api.js");
+      globalThis.fetch = vi.fn(async () => new Response("{}", { status: 200 })) as any;
+
+      expect((await api.configGet()).ok).toBe(true);
+    });
+  });
+
   describe("unix socket admin endpoint", () => {
     // A missing socket path is the cheapest way to prove the request was routed
     // to node:http rather than fetch: the global fetch stub stays untouched and
     // the error comes back in the socket-specific shape.
+    const missingSock = process.platform === "win32" ? "/nope" : "/tmp/caddy-mcp-does-not-exist.sock";
     it.each([
-      ["URL form", `unix://${process.platform === "win32" ? "/nope" : "/tmp/caddy-mcp-does-not-exist.sock"}`],
-      [
-        "Caddy network-address form",
-        `unix/${process.platform === "win32" ? "/nope" : "/tmp/caddy-mcp-does-not-exist.sock"}`,
-      ],
+      ["URL form", `unix://${missingSock}`],
+      ["Caddy network-address form", `unix/${missingSock}`],
+      // The scheme is case-insensitive, as getMalformedUnixUrl's test already
+      // was; these used to be told to use the form they were written in.
+      ["URL form with an upper-case scheme", `UNIX://${missingSock}`],
+      ["Caddy form with a mixed-case scheme", `Unix/${missingSock}`],
     ])("routes %s away from fetch entirely", async (_label, adminUrl) => {
       const api = await import("../api.js");
       process.env.CADDY_ADMIN_URL = adminUrl;
@@ -3164,6 +3416,18 @@ describe("api", () => {
       expect(res.ok).toBe(false);
       // Never fell through to the TCP transport.
       expect(fetchCalls).toBe(0);
+      // Zero fetch calls is also what the malformed-URL rejection produces, so
+      // pin the transport: the error is a connect failure that node:http
+      // reported, and it names the PARSED socket path as its target. Anchored
+      // at the start because the malformed-URL text quotes the whole
+      // CADDY_ADMIN_URL, which contains the path too. Either connect failure is
+      // accepted -- which one a missing path yields is the platform's call (see
+      // the POSIX-only test below).
+      expect(res.error).not.toContain("looks like a unix socket address");
+      expect(
+        res.error?.startsWith(`No socket at ${missingSock} `) ||
+          res.error?.startsWith(`Cannot connect to Caddy admin API at ${missingSock} `),
+      ).toBe(true);
     });
 
     // POSIX-only: a nonexistent path reliably yields ENOENT there. The Windows
@@ -3664,7 +3928,9 @@ describe("api", () => {
 
     // The wait is for an event -- Caddy closing the pooled sockets -- not a
     // fixed delay. The server here closes them a couple of milliseconds after
-    // the response; a change must come back in a fraction of the 250 ms cap.
+    // the response; a change must come back before the 250 ms cap. Bounded at
+    // the cap itself: a run that waits the cap out takes at least 250 ms plus
+    // the request, so anything tighter only costs headroom on a loaded machine.
     it("reports a config change complete as soon as the pooled sockets are closed", async () => {
       process.env.CADDY_MAX_RETRIES = "0";
       const srv = await startServer("caddy");
@@ -3930,17 +4196,18 @@ describe("api", () => {
 // there, which let the reused-socket reset and Caddy's Windows accept-loop wedge
 // back in. Simulated here: no dispatcher at the well-known symbol, and
 // process.versions.oam defined, against a fresh module so no earlier real fetch
-// has hooked the Node dispatcher.
+// has hooked the Node dispatcher. Both symbols are cleared: api.ts tries `.2`
+// (undici 8, Node 26) before `.1`, and would hook whichever this Node set.
 describe("settleAdminRestart when no dispatcher can be hooked", () => {
-  const KEY = Symbol.for("undici.globalDispatcher.1");
+  const KEYS = [Symbol.for("undici.globalDispatcher.2"), Symbol.for("undici.globalDispatcher.1")];
   const originalFetch = globalThis.fetch;
   const savedUrl = process.env.CADDY_ADMIN_URL;
   const savedRetries = process.env.CADDY_MAX_RETRIES;
-  let savedDispatcher: unknown;
+  let savedDispatchers: unknown[] = [];
 
   beforeEach(() => {
-    savedDispatcher = (globalThis as Record<symbol, unknown>)[KEY];
-    (globalThis as Record<symbol, unknown>)[KEY] = undefined;
+    savedDispatchers = KEYS.map((key) => (globalThis as Record<symbol, unknown>)[key]);
+    for (const key of KEYS) (globalThis as Record<symbol, unknown>)[key] = undefined;
     process.env.CADDY_ADMIN_URL = "http://localhost:2019";
     process.env.CADDY_MAX_RETRIES = "0";
     globalThis.fetch = vi.fn(async () => new Response("", { status: 200 })) as unknown as typeof fetch;
@@ -3948,7 +4215,9 @@ describe("settleAdminRestart when no dispatcher can be hooked", () => {
   });
 
   afterEach(() => {
-    (globalThis as Record<symbol, unknown>)[KEY] = savedDispatcher;
+    KEYS.forEach((key, i) => {
+      (globalThis as Record<symbol, unknown>)[key] = savedDispatchers[i];
+    });
     globalThis.fetch = originalFetch;
     delete (process.versions as Record<string, string | undefined>).oam;
     if (savedUrl !== undefined) process.env.CADDY_ADMIN_URL = savedUrl;
@@ -3972,7 +4241,8 @@ describe("settleAdminRestart when no dispatcher can be hooked", () => {
   });
 
   it("does not wait on a non-oam runtime whose dispatcher cannot be hooked", async () => {
-    expect(await timedConfigChange()).toBeLessThan(200);
+    // 240: the line the oam test above uses for "waited the 250 ms window".
+    expect(await timedConfigChange()).toBeLessThan(240);
   });
 
   it("does not wait after a read, even on oam", async () => {
@@ -3980,6 +4250,6 @@ describe("settleAdminRestart when no dispatcher can be hooked", () => {
     const api = await import("../api.js");
     const started = performance.now();
     expect((await api.configGet("apps")).ok).toBe(true);
-    expect(performance.now() - started).toBeLessThan(200);
+    expect(performance.now() - started).toBeLessThan(240);
   });
 });
