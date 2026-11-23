@@ -62,6 +62,27 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
     is open.
 
 ### Changed
+- **The oam floor is now 0.21.1** (`OAM_MIN` in `bin/caddy-mcp.mjs`), the latest
+  oam release. It was re-verified through the launcher on the built server against
+  a throwaway Caddy v2.11.4:
+  - MCP initialize, `tools/list` (18 tools) and `tools/call` (`caddy_load`,
+    `caddy_list_servers`, `caddy_status`) from a Node host on auto, under
+    `CADDY_MCP_RUNTIME=oam` and under `CADDY_MCP_SANDBOX=1`.
+  - The same from an oam host, both in-process and through the sandboxed pipe
+    handoff.
+  - The sandbox with a snapshot directory: `caddy_revert` save, list and apply,
+    including rehydration in a second process.
+  - The port-scoped, bare, omitted and repeated `--allow-net` grants, and the
+    `--permission` placement.
+  - `oam check .` and the compiled binary.
+
+  0.20.2 and 0.21.0 are now below the floor and passed over. Nothing else in the
+  launcher or the server changed. oam 0.21.0 and 0.21.1 change nothing this server
+  uses. oam still ignores `signal` in `node:http`, so the unix-socket transport
+  keeps its own deadline timer, and it still sets no undici dispatcher symbol, so
+  the settle wait keeps its fixed fallback. The CLAUDE.md startup table is
+  re-measured: the compiled binary is now 71.31 MB and starts in about 440 ms,
+  slower than Node 26's ~300 ms.
 - Release tooling:
   - `release.sh` refuses to run off `main`, pre-flights `jq`, and re-reads
     `package.json` before the version bump.

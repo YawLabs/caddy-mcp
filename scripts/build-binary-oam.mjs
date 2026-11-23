@@ -16,13 +16,14 @@
 // import.meta.url, rather than reusing dist/index.js.
 //
 // Measured on windows-arm64 against this bundle (7-run averages, `--version`
-// to isolate startup):
+// to isolate startup), on oam 0.21.1 and Node 26.13.1:
 //
-//     node dist/index.js    730 ms   (needs node + node_modules)
-//     oam compiled binary   529 ms   57.53 MB
+//     node dist/index.js    ~300 ms   (needs node + node_modules)
+//     oam compiled binary   ~440 ms   71.31 MB
 //
-// oam precompiles the bundle to bytecode at compile time, which is where the
-// compiled binary's startup win comes from.
+// oam precompiles the bundle to bytecode at compile time. On oam 0.19/0.20 that
+// made the binary start faster than Node (529 ms vs 730 ms, 57.53 MB); on 0.21.1
+// against Node 26 it no longer does. The binary ships for being self-contained.
 //
 // This script ONLY reads node_modules (via esbuild's resolver) and writes to
 // build-tmp/ and bin/<platform>-<arch>/. It does NOT mutate package.json,
