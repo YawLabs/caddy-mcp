@@ -118,6 +118,28 @@ function unreadablePriorAdminNote(verb: "replaced" | "unloaded"): string {
   );
 }
 
+/**
+ * The one snapshot rule every whole-config change follows (caddy_load,
+ * caddy_revert apply, and the root branches of caddy_config_set /
+ * caddy_config_delete / caddy_config_by_id): push the config read just before
+ * the change, once the change has come back, and only when it may have applied
+ * -- a success, or a deadline that fired (`outcomeUnknown`). Caddy goes on
+ * applying a config change after the client hangs up and a timed-out change is
+ * never replayed, so that config is recorded nowhere else. A plain failure
+ * changed nothing server-side, and a snapshot for it would only push the
+ * operator's older rollback targets one slot deeper. Returns whether it kept one.
+ */
+function keepPriorConfig(res: ApiResponse, current: ApiResponse, trigger: string): boolean {
+  const kept = (res.ok || res.outcomeUnknown === true) && current.ok && isSnapshotableConfig(current.data);
+  if (kept) saveSnapshot(current.data, trigger);
+  return kept;
+}
+
+/** The opening of every "the change timed out, but the prior config was kept" error; `change` is "write", "load", ... */
+function keptAnywayLead(change: string, trigger: string): string {
+  return `The pre-${change} config was kept anyway, as snapshot [0] (trigger=${trigger})`;
+}
+
 /** Which Caddy verb each write mode sends: PATCH, POST or PUT. */
 type WriteMode = "overwrite" | "append" | "insert";
 
@@ -183,8 +205,7 @@ function rootWriteRefusal(target: string, narrower: string) {
 async function rootConfigWrite(mode: WriteMode, value: unknown, trigger: string) {
   const current = await api.configGet();
   const res = await writeAt(mode, "", value);
-  const kept = (res.ok || res.outcomeUnknown === true) && current.ok && isSnapshotableConfig(current.data);
-  if (kept) saveSnapshot(current.data, trigger);
+  const kept = keepPriorConfig(res, current, trigger);
   // Computed once, from the same evidence, for both the success message and
   // the timed-out one below -- so the two can never make different claims
   // about where the admin endpoint went.
@@ -196,7 +217,7 @@ async function rootConfigWrite(mode: WriteMode, value: unknown, trigger: string)
     // to hear it most when the next re-read fails.
     if (res.outcomeUnknown && (kept || adminNote)) {
       const snapshotPart = kept
-        ? `The pre-write config was kept anyway, as snapshot [0] (trigger=${trigger}): if this write did apply, ` +
+        ? `${keptAnywayLead("write", trigger)}: if this write did apply, ` +
           `caddy_revert { action: "apply", index: 0, confirm: true } restores what it replaced, as long as this server can ` +
           `still reach Caddy's admin endpoint.`
         : "";
@@ -272,14 +293,13 @@ async function rootConfigDelete(trigger: string) {
   // is not "nothing happened" -- Caddy goes on applying a config change it has
   // read after the client hangs up, and a timed-out change is never replayed,
   // so the config this delete may have unloaded is recorded nowhere else.
-  const kept = (res.ok || res.outcomeUnknown === true) && current.ok && isSnapshotableConfig(current.data);
-  if (kept) saveSnapshot(current.data, trigger);
+  const kept = keepPriorConfig(res, current, trigger);
   if (!res.ok) {
     if (res.outcomeUnknown && kept) {
       return formatResult({
         ...res,
         error:
-          `${res.error}\nThe pre-delete config was kept anyway, as snapshot [0] (trigger=${trigger}): if this delete ` +
+          `${res.error}\n${keptAnywayLead("delete", trigger)}: if this delete ` +
           `did apply, caddy_revert { action: "apply", index: 0, confirm: true } restores what it unloaded -- as long as this ` +
           `server can still reach Caddy's admin endpoint, which moves back to Caddy's default address when the deleted ` +
           `config set an admin.listen of its own. If the delete did not apply, that snapshot is simply the config read ` +
@@ -371,6 +391,16 @@ export function registerConfigTools(server: McpServer) {
     // repeated call appends a second copy.
     { readOnlyHint: false, destructiveHint: true, idempotentHint: false, openWorldHint: false },
     async ({ path, value, mode, confirm }) => {
+      // z.any() accepts an omitted value, which would go out as a bodiless
+      // write: Caddy's raw decode error at a leaf, and at the root (with
+      // confirm) a whole-config write that runs anyway. Same guard as
+      // caddy_config_by_id's 'set'.
+      if (value === undefined) {
+        return {
+          isError: true,
+          content: [{ type: "text" as const, text: "Error: value is required for caddy_config_set" }],
+        };
+      }
       // A root path is a different operation wearing the same tool. Caddy never
       // distinguishes the root from a leaf: PATCH and POST at `/config/` set
       // `rawCfg["config"]` to the body (admin.go:1279 and :1296 at v2.11.4) and
@@ -505,18 +535,35 @@ export function registerConfigTools(server: McpServer) {
       // the config read just before the load was sent.
       const current = await api.configGet();
       const res = await api.loadConfig(config, contentType);
-      const kept = (res.ok || res.outcomeUnknown === true) && current.ok && isSnapshotableConfig(current.data);
-      if (kept) saveSnapshot(current.data, "caddy_load");
+      const kept = keepPriorConfig(res, current, "caddy_load");
       if (res.outcomeUnknown && kept) {
         return formatResult({
           ...res,
           error:
-            `${res.error}\nThe pre-load config was kept anyway, as snapshot [0] (trigger=caddy_load): if this ` +
+            `${res.error}\n${keptAnywayLead("load", "caddy_load")}: if this ` +
             `load did apply, caddy_revert { action: "apply", index: 0, confirm: true } restores what it ` +
             `replaced. If it did not, that snapshot is simply the config read just before the load was sent.`,
         });
       }
-      return formatResult(res);
+      const result = formatResult(res);
+      // A load is the same whole-config replace as a root caddy_config_set, so
+      // it says where the admin endpoint went in the same words. JSON only: a
+      // Caddyfile is adapted inside Caddy, so this client never sees the
+      // admin.listen it produced, and judging the Caddyfile string as a config
+      // object would wrongly report that the new config "sets none". A JSON
+      // config passed as a string is parsed first for the same reason.
+      let loaded: unknown = config;
+      if (typeof config === "string") {
+        try {
+          loaded = JSON.parse(config);
+        } catch {
+          loaded = undefined;
+        }
+      }
+      const adminNote =
+        res.ok && contentType === "application/json" && loaded !== undefined ? rootWriteAdminNote(current, loaded) : "";
+      if (adminNote) result.content[0].text += `\n\n${adminNote.trim()}`;
+      return result;
     },
   );
 
@@ -600,15 +647,16 @@ export function registerConfigTools(server: McpServer) {
       // snapshot the user meant to apply, silently shifting the target by one.
       const current = await api.configGet();
       const res = await api.loadConfig(snap.config, "application/json");
+      // On a success this is the roll-forward snapshot. On a failure it is kept
+      // only when the load's deadline fired (`res.outcomeUnknown`): then the
+      // revert may have applied (see the same exception in caddy_load), and the
+      // config it replaced is recorded nowhere else.
+      const kept = keepPriorConfig(res, current, "caddy_revert");
       if (!res.ok) {
-        // Except when the load's deadline fired (`res.outcomeUnknown`): then the
-        // revert may have applied (see the same exception in caddy_load), and
-        // the config it replaced is recorded nowhere else. Keep it -- and since
-        // keeping it causes exactly the shift the deferral above avoids, SAY so,
-        // with the target's new index, rather than let a retried `apply` quietly
-        // load something else.
-        if (res.outcomeUnknown && current.ok && isSnapshotableConfig(current.data)) {
-          saveSnapshot(current.data, "caddy_revert");
+        // Keeping it causes exactly the shift the deferral above avoids, so SAY
+        // so, with the target's new index, rather than let a retried `apply`
+        // quietly load something else.
+        if (res.outcomeUnknown && kept) {
           // Located by identity, not computed as index + 1: the ring is capped,
           // so the target can have fallen off the end.
           const now = listSnapshots().indexOf(snap);
@@ -619,17 +667,13 @@ export function registerConfigTools(server: McpServer) {
           return formatResult({
             ...res,
             error:
-              `${res.error}\nThe pre-revert config was kept anyway, as snapshot [0] (trigger=caddy_revert), so ` +
+              `${res.error}\n${keptAnywayLead("revert", "caddy_revert")}, so ` +
               `this revert can still be rolled back if it did apply. That moved every older snapshot down one ` +
               `index: ${target}, so re-running apply with index ${index} would load a different snapshot. List ` +
               `the snapshots before retrying.`,
           });
         }
         return formatResult(res);
-      }
-      const capturedRollforward = current.ok && isSnapshotableConfig(current.data);
-      if (capturedRollforward) {
-        saveSnapshot(current.data, "caddy_revert");
       }
       const when = new Date(snap.timestamp).toISOString();
       // Say so when the safety net was skipped. The load is what decides success,
@@ -650,12 +694,19 @@ export function registerConfigTools(server: McpServer) {
       // "cannot be rolled back to what it replaced", not "cannot be undone": other
       // snapshots may still sit in the ring, so the operator is not out of options
       // -- what is gone is specifically the state this revert overwrote.
-      const note = capturedRollforward
+      const note = kept
         ? ""
         : ` Warning: ${skipped}, so no roll-forward snapshot was captured -- this revert cannot be rolled back to the config it replaced.`;
+      // A revert is a whole-config load, so it reports where the admin endpoint
+      // went exactly as caddy_load and a root caddy_config_set do: a snapshot
+      // taken under a different admin.listen moves the endpoint back to it.
+      const adminNote = rootWriteAdminNote(current, snap.config);
       return {
         content: [
-          { type: "text" as const, text: `Reverted to snapshot [${index}] (${when}, trigger=${snap.trigger}).${note}` },
+          {
+            type: "text" as const,
+            text: `Reverted to snapshot [${index}] (${when}, trigger=${snap.trigger}).${note}${adminNote}`,
+          },
         ],
       };
     },

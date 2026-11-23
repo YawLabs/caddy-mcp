@@ -3,9 +3,10 @@ import { dirname, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import { describe, expect, it } from "vitest";
 
-// Resolve via import.meta.url so this works regardless of process.cwd(). The
-// file lives one level below the repo root in both layouts -- src/ under vitest,
-// dist/ for the compiled node:test run -- so the same hop reaches the root.
+// Resolve via import.meta.url so this works regardless of process.cwd(). Only
+// vitest runs this file, from src/, one level below the repo root, so one hop
+// reaches the root. (It is never compiled: tsconfig.build.json excludes
+// src/**/*.test.ts.)
 const repoRoot = resolve(dirname(fileURLToPath(import.meta.url)), "..");
 
 function readJson(rel: string): Record<string, unknown> {

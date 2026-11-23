@@ -143,6 +143,83 @@ describe("scripts/runtime.mjs: a non-oam OAM_BIN", () => {
 });
 
 /**
+ * The release binary needs an oam at the launcher's floor; the typecheck does
+ * not. findOam's `min` skips older candidates, so discovery ORDER (installed
+ * locations before PATH) cannot let a stale copy compile the artifact.
+ */
+describe("scripts/runtime.mjs: the build's oam floor", () => {
+  it("still accepts an old oam when no floor is passed (the typecheck path)", () => {
+    expect(probeWith("", POSE_AS_OAM, "findOam({ require: true })")).toEqual({
+      cmd: process.execPath,
+      version: "oam 0.18.0",
+      fromBuildTree: false,
+    });
+  });
+
+  it("accepts an oam exactly at the floor", () => {
+    expect(probeWith("", POSE_AS_OAM, "findOam({ require: true, min: [0, 18, 0] })")).toEqual({
+      cmd: process.execPath,
+      version: "oam 0.18.0",
+      fromBuildTree: false,
+    });
+  });
+
+  it("fails hard when every oam found is below the floor", () => {
+    expect(probeWith("", POSE_AS_OAM, "findOam({ require: true, min: [0, 20, 2] })")).toEqual({
+      error: expect.stringMatching(/oam 0\.20\.2 or newer is required.*oam 0\.18\.0/),
+    });
+  });
+
+  it("skips a stale earlier candidate for a current one later in discovery order", () => {
+    // OAM_BIN (first) answers 0.18.0; a later PATH entry answers 0.20.2. The
+    // PATH file is never really run: the pose intercepts its --version probe,
+    // so an empty placeholder is enough on every platform.
+    const pathDir = mkTemp("caddy-mcp-rt-path-");
+    const pathOam = join(pathDir, process.platform === "win32" ? "oam.exe" : "oam");
+    writeFileSync(pathOam, "");
+    const pose = [
+      "--import",
+      `data:text/javascript,${encodeURIComponent(
+        [
+          'import poseCp from "node:child_process";',
+          'import { syncBuiltinESMExports as poseSync } from "node:module";',
+          "const poseReal = poseCp.execFileSync;",
+          "poseCp.execFileSync = function (cmd, args, opts) {",
+          `  if (cmd === ${JSON.stringify(process.execPath)} && args?.[0] === "--version") return "oam 0.18.0\\n";`,
+          `  if (cmd === ${JSON.stringify(pathOam)} && args?.[0] === "--version") return "oam 0.20.2\\n";`,
+          "  return poseReal.call(this, cmd, args, opts);",
+          "};",
+          "poseSync();",
+        ].join("\n"),
+      )}`,
+    ];
+    const out = probe(
+      `process.env.OAM_BIN = ${JSON.stringify(process.execPath)};
+process.env.CADDY_MCP_RUNTIME = "";
+process.env.HOME = ${JSON.stringify(mkTemp("caddy-mcp-rt-home-"))};
+process.env.USERPROFILE = process.env.HOME;
+process.env.LOCALAPPDATA = process.env.HOME;
+process.env.PATH = ${JSON.stringify(pathDir)};
+process.env.PATHEXT = ".EXE";
+let out;
+try { out = findOam({ require: true, min: [0, 20, 2] }); } catch (e) { out = { error: String(e?.message ?? e) }; }
+process.stdout.write(JSON.stringify(out));`,
+      pose,
+    );
+    expect(out).toEqual({ cmd: pathOam, version: "oam 0.20.2", fromBuildTree: false });
+  });
+
+  it("is what the binary build asks for, with the floor read from the launcher", () => {
+    const build = readFileSync(join(REPO_ROOT, "scripts", "build-binary-oam.mjs"), "utf-8");
+    expect(build).toMatch(/findOam\(\{ require: true, min: readFloor\(repoRoot\) \}\)/);
+    expect(build).toMatch(/import \{ readFloor \} from "\.\/check-oam-floor\.mjs";/);
+    // And the typecheck does not ask for a floor.
+    const typecheck = readFileSync(join(REPO_ROOT, "scripts", "typecheck.mjs"), "utf-8");
+    expect(typecheck).toMatch(/findOam\(\)/);
+  });
+});
+
+/**
  * A wedged oam on PATH must not hang `npm run typecheck` or the binary build:
  * the probe is bounded like the launcher's. Extracted from the real source (as
  * launcher.test.ts does for runtimePlan) rather than timed with a sleeping

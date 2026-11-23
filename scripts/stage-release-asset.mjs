@@ -18,6 +18,7 @@
 // Pure stdlib; writes only to dist-release/. Run after build-binary-oam.mjs:
 //   node scripts/stage-release-asset.mjs
 
+import { execFileSync } from "node:child_process";
 import { createHash } from "node:crypto";
 import { chmodSync, copyFileSync, mkdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { dirname, join, resolve } from "node:path";
@@ -38,6 +39,35 @@ const assetName = `${binName}-${platformArch}${ext}`;
 const outDir = join(repoRoot, "dist-release");
 const outAsset = join(outDir, assetName);
 const outSha = `${outAsset}.sha256`;
+
+// Refuse a stale binary. bin/<platform>-<arch>/ is not rebuilt by anything but
+// build-binary-oam.mjs, so a release that skips that step would otherwise stage
+// whatever an earlier build left there under the new version's hash (seen: a
+// 2.6.0 binary on disk while package.json said 2.6.3). `--version` is the only
+// safe probe -- every other argv starts the stdio server and waits on stdin --
+// and the timeout keeps a binary that ignores it from hanging the release.
+let reported;
+try {
+  reported = execFileSync(builtExe, ["--version"], {
+    encoding: "utf-8",
+    stdio: ["ignore", "pipe", "pipe"],
+    timeout: 30_000,
+    windowsHide: true,
+  });
+} catch (e) {
+  console.error(`stage-release-asset: could not run ${builtExe} --version: ${e?.message ?? e}`);
+  console.error("Build it first: node scripts/build-binary-oam.mjs");
+  process.exit(1);
+}
+const builtVersion = /(\d+\.\d+\.\d+\S*)\s*$/.exec(reported.trim())?.[1];
+if (builtVersion !== pkg.version) {
+  console.error(
+    `stage-release-asset: ${builtExe} reports ${builtVersion ?? JSON.stringify(reported.trim())}, ` +
+      `but package.json is ${pkg.version}. Refusing to stage a stale binary -- rebuild it with ` +
+      "node scripts/build-binary-oam.mjs.",
+  );
+  process.exit(1);
+}
 
 mkdirSync(outDir, { recursive: true });
 rmSync(outAsset, { force: true });

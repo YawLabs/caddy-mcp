@@ -312,6 +312,19 @@ function metricNameFromLine(line: string): string | undefined {
 }
 
 /**
+ * The metrics body as text. Caddy's /metrics is Prometheus text, which the api
+ * layer hands over as a string; but a proxy or a metrics module that answers in
+ * JSON arrives parsed, and String() of that renders "[object Object]" -- a
+ * success carrying no data. Render any non-string body as its JSON instead.
+ * Shared by the caddy_metrics tool and the caddy://metrics resource.
+ */
+export function metricsBodyText(data: unknown): string {
+  if (typeof data === "string") return data;
+  if (data === undefined) return "";
+  return JSON.stringify(data, null, 2);
+}
+
+/**
  * Apply the optional substring filter and max_lines truncation to raw Prometheus exposition text.
  *
  * Filter rule: a line is kept if the metric name on that line contains the filter substring.
@@ -415,7 +428,8 @@ export function registerOperationalTools(server: McpServer) {
 
   server.tool(
     "caddy_list_servers",
-    "List all configured HTTP servers with their names, listen addresses, route counts, and TLS status. Use this to discover server names before calling route tools.",
+    "List all configured HTTP servers with their names, listen addresses, route counts, and TLS status. Use this to discover server names before calling route tools. " +
+      "The TLS label assumes Caddy's default http_port 80 and https_port 443: on a config that sets a custom apps/http http_port or https_port it can be wrong, so use caddy_status, which reads them, for an accurate label.",
     {},
     { readOnlyHint: true, destructiveHint: false, idempotentHint: true, openWorldHint: false },
     async () => {
@@ -517,10 +531,18 @@ export function registerOperationalTools(server: McpServer) {
       const res = await api.getMetrics();
       if (!res.ok) return formatResult(res);
 
-      const raw = typeof res.data === "string" ? res.data : res.data !== undefined ? String(res.data) : "";
+      const raw = metricsBodyText(res.data);
+      // An empty body and a filter that matched nothing used to both answer a
+      // bare "OK", which reads as success with nothing to say. Name which one.
+      if (raw.trim() === "") {
+        return { content: [{ type: "text" as const, text: "Caddy returned an empty metrics body" }] };
+      }
       const limit = max_lines ?? METRICS_DEFAULT_MAX_LINES;
       const text = applyMetricsControls(raw, filter, limit);
-      return { content: [{ type: "text" as const, text: text || "OK" }] };
+      if (text.trim() === "") {
+        return { content: [{ type: "text" as const, text: `No metrics matched filter ${JSON.stringify(filter)}` }] };
+      }
+      return { content: [{ type: "text" as const, text }] };
     },
   );
 

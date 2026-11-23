@@ -47,21 +47,22 @@ const REPO_ROOT =
 const OAM_RELEASES_API = "https://api.github.com/repos/YawLabs/oam/releases/latest";
 const FETCH_TIMEOUT_MS = 10_000;
 
-/** Files that quote the floor, with the line-level rules applied below. */
 /** The launcher whose `OAM_MIN` is the source of truth. */
 const LAUNCHER = "bin/caddy-mcp.mjs";
 /** The test file that pins the floor (see findFloorAssertionMismatch). */
 const LAUNCHER_TEST = "src/tests/launcher.test.ts";
 
+/** Files that quote the floor, with the line-level rules applied below. */
 const SCANNED = [LAUNCHER, "README.md", "CLAUDE.md", LAUNCHER_TEST];
 
 /**
  * A line is making a claim ABOUT the floor when it carries one of these. Chosen
  * from how the floor is actually phrased in this repo rather than invented
  * (X.Y.Z standing for the floor): "X.Y.Z or newer", "older than X.Y.Z",
- * "oam X.Y.Z is the minimum", "the current X.Y.Z floor", and the constant itself.
+ * "at or above X.Y.Z", "oam X.Y.Z is the minimum", "the current X.Y.Z floor",
+ * and the constant itself.
  */
-const FLOOR_CLAIM = /or newer|older than|is the minimum|floor|OAM_MIN/i;
+const FLOOR_CLAIM = /or newer|older than|at or above|is the minimum|floor|OAM_MIN/i;
 
 /**
  * ...and it has to be about OAM. Without this the scan flags other dependencies'
@@ -70,6 +71,18 @@ const FLOOR_CLAIM = /or newer|older than|is the minimum|floor|OAM_MIN/i;
  * a checker gets switched off. Here the same applies to Node and Caddy versions.
  */
 const ABOUT_OAM = /\boam\b|OAM_MIN|OAM_BIN/i;
+
+/**
+ * Wrapped prose can put "oam" on one line and the claim on the next: CLAUDE.md's
+ * "**oam ships signed releases** (...," / "...; X.Y.Z is the floor this server is
+ * verified on". A neighbouring line may therefore supply the "oam", but only for
+ * a line that states the floor outright, "X.Y.Z is the floor". Anything looser
+ * flags lines that are not claims: letting a neighbour vouch for any "floor"
+ * caught the launcher's 'node prints "v22.22.2" -- would clear the floor', and
+ * for "or newer" it would catch "Node.js 20.0.0 or newer" beside an oam line in
+ * a requirements list.
+ */
+const STATES_FLOOR = /\d+\\?\.\d+\\?\.\d+ is the floor\b/i;
 
 /**
  * ...unless the line is talking about the PAST, in which case an old version on
@@ -127,7 +140,11 @@ export function findDrift(root, floor) {
     const lines = text.split("\n");
     for (let i = 0; i < lines.length; i++) {
       const raw = lines[i];
-      if (!FLOOR_CLAIM.test(raw) || !ABOUT_OAM.test(raw) || HISTORICAL.test(raw)) continue;
+      if (!FLOOR_CLAIM.test(raw) || HISTORICAL.test(raw)) continue;
+      const aboutOam =
+        ABOUT_OAM.test(raw) ||
+        (STATES_FLOOR.test(raw) && (ABOUT_OAM.test(lines[i - 1] ?? "") || ABOUT_OAM.test(lines[i + 1] ?? "")));
+      if (!aboutOam) continue;
       const line = raw.replaceAll("\\", "");
       // A HOST version beside the floor is not a floor claim: "this process is oam
       // 0.9.0, older than X.Y.Z" names the oam that was found AND the floor, and

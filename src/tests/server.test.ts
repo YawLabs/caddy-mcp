@@ -1,12 +1,13 @@
 import { execFileSync } from "node:child_process";
-import { existsSync } from "node:fs";
+import { existsSync, mkdirSync, mkdtempSync, readdirSync, rmSync, statSync, utimesSync, writeFileSync } from "node:fs";
 import { createRequire } from "node:module";
-import { dirname, join } from "node:path";
+import { tmpdir } from "node:os";
+import { dirname, join, relative } from "node:path";
 import { fileURLToPath } from "node:url";
 import { Client } from "@modelcontextprotocol/sdk/client/index.js";
 import { StdioClientTransport } from "@modelcontextprotocol/sdk/client/stdio.js";
 import { InMemoryTransport } from "@modelcontextprotocol/sdk/inMemory.js";
-import { afterEach, describe, expect, it, vi } from "vitest";
+import { afterAll, afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { createCaddyServer, version } from "../server.js";
 
 const require_ = createRequire(import.meta.url);
@@ -14,6 +15,69 @@ const pkg = require_("../../package.json") as { version: string };
 
 const REPO_ROOT = join(dirname(fileURLToPath(import.meta.url)), "..", "..");
 const DIST_CLI = join(REPO_ROOT, "dist", "index.js");
+
+/**
+ * Why the built-CLI tests below cannot run, or undefined when they can.
+ *
+ * `npm test` does not build, so dist/index.js is whatever the last build left.
+ * Run against a build older than the source, those tests exercise old code: a
+ * regression passes them and a fix fails them. So a dist older than the newest
+ * source file (src/tests excluded -- tests are not in the bundle) counts as
+ * absent. mtime is a proxy: an edit-and-revert also marks dist stale, which
+ * errs toward skipping, never toward testing old code.
+ */
+function builtCliSkipReason(distCli: string, srcDir: string): string | undefined {
+  if (!existsSync(distCli)) return "dist/index.js is not built";
+  const builtAt = statSync(distCli).mtimeMs;
+  const testsDir = join(srcDir, "tests");
+  let newest: { path: string; mtimeMs: number } | undefined;
+  const walk = (dir: string) => {
+    for (const entry of readdirSync(dir, { withFileTypes: true })) {
+      const path = join(dir, entry.name);
+      if (entry.isDirectory()) {
+        if (path !== testsDir) walk(path);
+      } else if (entry.isFile()) {
+        const { mtimeMs } = statSync(path);
+        if (!newest || mtimeMs > newest.mtimeMs) newest = { path, mtimeMs };
+      }
+    }
+  };
+  walk(srcDir);
+  if (newest && newest.mtimeMs > builtAt) {
+    return `dist/index.js is older than ${relative(dirname(srcDir), newest.path).replace(/\\/g, "/")} -- run npm run build`;
+  }
+  return undefined;
+}
+
+const BUILT_CLI_SKIP = builtCliSkipReason(DIST_CLI, join(REPO_ROOT, "src"));
+if (BUILT_CLI_SKIP) console.warn(`[server.test] skipping the built-CLI tests: ${BUILT_CLI_SKIP}`);
+/** Appended to the built-CLI describe names, so a skip says why in the report. */
+const BUILT_CLI_NOTE = BUILT_CLI_SKIP ? ` (skipped: ${BUILT_CLI_SKIP})` : "";
+
+// Pin the two variables that decide where these tests reach. Exported in a developer
+// shell, CADDY_ADMIN_URL as a unix:// or path-prefixed URL would send the
+// fetch-mocked GHSA tests down the socket transport (a live Caddy) or to other
+// paths, and CADDY_MCP_SNAPSHOT_DIR would have them write and prune a real
+// directory. The spawned-CLI tests are unaffected: they pass their own env.
+// Top-level beforeEach, not beforeAll: it runs before every nested hook, so a
+// describe that sets one deliberately still wins, and one that restores the
+// ambient value in its own afterEach is re-pinned before the next test.
+const AMBIENT_ENV = {
+  CADDY_ADMIN_URL: process.env.CADDY_ADMIN_URL,
+  CADDY_MCP_SNAPSHOT_DIR: process.env.CADDY_MCP_SNAPSHOT_DIR,
+};
+
+beforeEach(() => {
+  delete process.env.CADDY_ADMIN_URL;
+  delete process.env.CADDY_MCP_SNAPSHOT_DIR;
+});
+
+afterAll(() => {
+  for (const [name, value] of Object.entries(AMBIENT_ENV)) {
+    if (value !== undefined) process.env[name] = value;
+    else delete process.env[name];
+  }
+});
 
 /**
  * Connect the real server to a real MCP client over an in-memory transport.
@@ -186,6 +250,50 @@ describe("GHSA-6859-g3p8-jc93 over the real protocol", () => {
   });
 });
 
+describe("built-CLI staleness gate", () => {
+  let root: string;
+  // Fixed instants, set with utimes, so the order does not depend on how fast
+  // the files are written.
+  const OLD = new Date("2026-01-01T00:00:00Z");
+  const NEW = new Date("2026-01-02T00:00:00Z");
+
+  beforeEach(() => {
+    root = mkdtempSync(join(tmpdir(), "caddy-mcp-dist-"));
+    mkdirSync(join(root, "src", "tools"), { recursive: true });
+    mkdirSync(join(root, "src", "tests"), { recursive: true });
+    mkdirSync(join(root, "dist"));
+    for (const f of ["src/api.ts", "src/tools/routes.ts", "src/tests/x.test.ts", "dist/index.js"]) {
+      writeFileSync(join(root, f), "");
+      utimesSync(join(root, f), OLD, OLD);
+    }
+  });
+
+  afterEach(() => {
+    rmSync(root, { recursive: true, force: true });
+  });
+
+  const reason = () => builtCliSkipReason(join(root, "dist", "index.js"), join(root, "src"));
+
+  it("runs against a build no older than the source", () => {
+    expect(reason()).toBeUndefined();
+  });
+
+  it("skips when there is no build", () => {
+    rmSync(join(root, "dist", "index.js"));
+    expect(reason()).toBe("dist/index.js is not built");
+  });
+
+  it("skips, naming the file, when a nested source file is newer than the build", () => {
+    utimesSync(join(root, "src", "tools", "routes.ts"), NEW, NEW);
+    expect(reason()).toBe("dist/index.js is older than src/tools/routes.ts -- run npm run build");
+  });
+
+  it("ignores a newer file under src/tests, which is not in the bundle", () => {
+    utimesSync(join(root, "src", "tests", "x.test.ts"), NEW, NEW);
+    expect(reason()).toBeUndefined();
+  });
+});
+
 describe("version resolution", () => {
   it("resolves the package version at import time", () => {
     // Covers the createRequire(import.meta.url) branch of resolveVersion --
@@ -206,11 +314,16 @@ describe("version resolution", () => {
     await client.close();
   });
 
-  // Runs only after a build. `npm test` alone skips it; `npm run test:ci`
-  // (build + test) covers it. This is the branch resolveVersion's own comment
-  // warns about -- the bundled CLI must print a version instead of crashing on
-  // ERR_INVALID_ARG_VALUE, and only a real subprocess against real output proves it.
-  describe.skipIf(!existsSync(DIST_CLI))("built CLI", () => {
+  // Runs only against a build at least as new as src/ (see builtCliSkipReason).
+  // `npm test` alone runs it only if one is lying around; `npm run test:ci`
+  // (build + test) always covers it. dist/ is tsup's ESM output, so this is still the
+  // createRequire(import.meta.url) branch of resolveVersion, now resolving
+  // ../package.json from the bundled file's location -- only a real subprocess
+  // against real output proves that path holds. It is NOT the CJS `__VERSION__`
+  // branch resolveVersion's own comment warns about (ERR_INVALID_ARG_VALUE):
+  // that one exists only in the oam binary (scripts/build-binary-oam.mjs) and
+  // nothing here runs it.
+  describe.skipIf(BUILT_CLI_SKIP !== undefined)(`built CLI${BUILT_CLI_NOTE}`, () => {
     it("prints the version and exits 0 for --version", () => {
       const out = execFileSync(process.execPath, [DIST_CLI, "--version"], { encoding: "utf8" });
       expect(out.trim()).toBe(`caddy-mcp ${pkg.version}`);
@@ -229,7 +342,7 @@ describe("version resolution", () => {
  * `startServer()` -- the stdio transport wiring that is the actual production
  * entry point, and the one path a mocked transport would misrepresent.
  */
-describe.skipIf(!existsSync(DIST_CLI))("built CLI over stdio", () => {
+describe.skipIf(BUILT_CLI_SKIP !== undefined)(`built CLI over stdio${BUILT_CLI_NOTE}`, () => {
   it("completes an MCP handshake and serves tools/list from a spawned process", async () => {
     const transport = new StdioClientTransport({ command: process.execPath, args: [DIST_CLI] });
     const client = new Client({ name: "caddy-mcp-e2e", version: "0.0.0" }, { capabilities: {} });

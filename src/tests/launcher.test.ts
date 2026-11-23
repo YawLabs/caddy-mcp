@@ -11,10 +11,10 @@ import { describe, expect, it } from "vitest";
  * Tests for bin/caddy-mcp.mjs -- the published `caddy-mcp` entry point.
  *
  * This is the most user-visible file in the package: every install runs it, and
- * a break here means "the server does not start" for everyone. It sits outside
- * both existing gates -- `npm run lint` scopes to `src/`, and nothing else
- * exercises `bin/` -- so a 200-line change to it previously landed with no
- * automated coverage at all.
+ * a break here means "the server does not start" for everyone. `npm run lint`
+ * covers `bin/` (alongside `src/` and `scripts/`), but lint only reads the
+ * file: this suite is the one gate that RUNS it. Before it existed, a 200-line
+ * change to the launcher landed with no automated coverage at all.
  *
  * `OAM_BIN` is the seam that makes this testable without installing oam: the
  * launcher uses the override, before any discovery, once it answers
@@ -162,6 +162,78 @@ describe.skipIf(!existsSync(DIST_CLI))("launcher: runtime selection", () => {
     // This diagnostic precedes process.exit and is written synchronously. If
     // that ever regressed to an async write, the exit would truncate it away.
     expect(res.stderr).toContain("CADDY_MCP_RUNTIME=node");
+  }, 30000);
+
+  it("notes, once, a sandbox net grant left open by a CADDY_ADMIN_URL with no host", async () => {
+    // "localhost:2019" parses with "localhost:" as its scheme and an empty
+    // hostname, so the grant stays the bare --allow-net (every host).
+    //
+    // "Once" needs the path that reads sandboxFlags() TWICE -- the plan, then the
+    // spawn argv -- which takes a chosen oam. Cross-platform without a bash
+    // fake: the preload makes OAM_BIN (the real Node) answer the version probe
+    // as oam 0.20.2, and makes the spawn itself fail, so the launcher falls back
+    // and serves in-process.
+    const preload = [
+      'import childProcess from "node:child_process";',
+      'import { syncBuiltinESMExports } from "node:module";',
+      "const realExecFileSync = childProcess.execFileSync;",
+      "const realSpawn = childProcess.spawn;",
+      "childProcess.execFileSync = function (cmd, args, opts) {",
+      '  if (cmd === process.env.OAM_BIN && args?.[0] === "--version") return "oam 0.20.2\\n";',
+      "  return realExecFileSync.call(this, cmd, args, opts);",
+      "};",
+      "childProcess.spawn = function (cmd, args, opts) {",
+      '  return realSpawn.call(this, cmd + ".does-not-exist", args, opts);',
+      "};",
+      "syncBuiltinESMExports();",
+    ].join("\n");
+    const res = await runLauncher(
+      ["--version"],
+      isolated({ CADDY_MCP_SANDBOX: "1", OAM_BIN: process.execPath, CADDY_ADMIN_URL: "localhost:2019" }),
+      undefined,
+      ["--import", `data:text/javascript,${encodeURIComponent(preload)}`],
+    );
+    // The spawn really was attempted, so sandboxFlags() ran for the argv too.
+    expect(res.stderr).toMatch(/^caddy-mcp: failed to launch oam at /m);
+    expect(res.code, res.stderr).toBe(0);
+    expect(
+      res.stderr.match(
+        /^caddy-mcp: CADDY_ADMIN_URL="localhost:2019" names no host, so the sandbox grants network access to EVERY host; write it as http:\/\/host:port/gm,
+      ),
+    ).toHaveLength(1);
+  }, 45000);
+
+  it("says nothing about the net grant when CADDY_ADMIN_URL names a host", async () => {
+    const res = await runLauncher(
+      ["--version"],
+      isolated({ CADDY_MCP_SANDBOX: "1", OAM_BIN: MISSING_OAM, CADDY_ADMIN_URL: "http://localhost:2019" }),
+    );
+    expect(res.code, res.stderr).toBe(0);
+    expect(res.stderr).not.toContain("names no host");
+  }, 30000);
+
+  it("reports a missing dist/index.js on the primary in-process path through the launcher's own reporter", async () => {
+    // A copy of the launcher with no dist/ beside it: the in-process import()
+    // rejects, and unreported at ESM top level that is a raw ERR_MODULE_NOT_FOUND
+    // stack trace instead of one caddy-mcp line.
+    const root = mkdtempSync(join(tmpdir(), "caddy-mcp-launcher-nodist-"));
+    mkdirSync(join(root, "bin"));
+    const copy = join(root, "bin", "caddy-mcp.mjs");
+    writeFileSync(copy, readFileSync(LAUNCHER));
+    const res = await new Promise<{ code: number | null; stderr: string }>((resolve) => {
+      const child = spawn(process.execPath, [copy, "--version"], {
+        env: { ...process.env, CADDY_MCP_RUNTIME: "node" },
+        stdio: ["ignore", "ignore", "pipe"],
+      });
+      let stderr = "";
+      child.stderr?.on("data", (d) => {
+        stderr += String(d);
+      });
+      child.on("close", (code) => resolve({ code, stderr }));
+    });
+    expect(res.code).toBe(1);
+    expect(res.stderr).toMatch(/^caddy-mcp: failed to start the server \(/m);
+    expect(res.stderr).not.toMatch(/^\s+at /m);
   }, 30000);
 
   it("speaks MCP over stdio through the launcher", async () => {
@@ -539,6 +611,27 @@ describe.skipIf(!existsSync(DIST_CLI))("launcher: with no usable oam", () => {
   );
 
   it(
+    "names the right remedy when CADDY_MCP_RUNTIME=node finds no Node on a current oam host",
+    async () => {
+      // The host oam is at the floor, so there is no "older than" reason to
+      // lead with and `oam self-update` would fix nothing: the message must
+      // still be a sentence, and must point at Node or the variable.
+      const noNode = mkdtempSync(join(tmpdir(), "caddy-mcp-launcher-nopath-"));
+      const run = await runOnHost(
+        "0.20.2",
+        isolated({ PATH: noNode, CADDY_MCP_RUNTIME: "node", OAM_BIN: MISSING_OAM }),
+      );
+      expect(run.code, JSON.stringify(run)).toBe(1);
+      expect(run.stdout.trim(), "nothing may be served").toBe("");
+      expect(run.stderr).toMatch(/^caddy-mcp: CADDY_MCP_RUNTIME=node, but no Node was found on PATH/m);
+      expect(run.stderr).toMatch(/Install Node, or unset CADDY_MCP_RUNTIME to serve on this oam \(0\.20\.2\)/);
+      expect(run.stderr).not.toContain("caddy-mcp: ,");
+      expect(run.stderr).not.toContain("self-update");
+    },
+    TIMEOUT_MS,
+  );
+
+  it(
     "strips oam's permission flags from NODE_OPTIONS before handing off to Node",
     async () => {
       // oam 0.18.0 reads --permission / --allow-* from NODE_OPTIONS and appends
@@ -785,26 +878,10 @@ describe.skipIf(isWin || !existsSync(DIST_CLI))("launcher: signal handling", () 
     "",
   ].join("\n");
 
-  /** An oam that satisfies discovery but is older than the launcher's floor. */
-  const TOO_OLD = ["#!/bin/bash", 'echo "oam 0.8.9"', "exit 0", ""].join("\n");
-
   /** A stand-in oam that either shuts down cleanly on a signal or ignores it. */
   function fakeOam(kind: "graceful" | "wedged"): string {
     return writeFake(kind === "graceful" ? GRACEFUL : WEDGED);
   }
-
-  it("rejects an oam older than the supported floor", async () => {
-    // The version gate is the first subprocess the launcher runs, and it has to
-    // tell "too old" apart from "unreadable" -- they have different remedies.
-    // Isolated: a real oam elsewhere on the box would otherwise satisfy `oam`.
-    const res = await runLauncher(["--version"], isolated({ CADDY_MCP_RUNTIME: "oam", OAM_BIN: writeFake(TOO_OLD) }));
-    expect(res.code).toBe(1);
-    expect(res.stderr).toContain("is oam 0.8.9, older than 0.20.2");
-    // An outdated oam is fixed in place; sending this user to the website
-    // would make them reinstall what `oam self-update` does for them.
-    expect(res.stderr).toContain("Run `oam self-update` to get oam 0.20.2 or newer.");
-    expect(res.stderr).not.toContain("https://oamjs.org");
-  }, 30000);
 
   /** Signal the launcher `count` times, starting once the child is up. */
   function runWithSignals(oam: string, count: number) {
@@ -1183,6 +1260,18 @@ describe.skipIf(isWin || !existsSync(DIST_CLI))("launcher: version gate fallback
     expect(res.stderr).toContain("0.8.9");
     expect(res.stderr).toContain("older than 0.20.2");
     expect(res.stderr).toContain("using Node instead");
+  }, 30000);
+
+  it("rejects an oam older than the supported floor under CADDY_MCP_RUNTIME=oam", async () => {
+    // The loud counterpart of the case above. The version gate has to tell "too
+    // old" apart from "unreadable" -- they have different remedies.
+    const res = await runLauncher(["--version"], isolated({ CADDY_MCP_RUNTIME: "oam", OAM_BIN: writeFake(TOO_OLD) }));
+    expect(res.code).toBe(1);
+    expect(res.stderr).toContain("is oam 0.8.9, older than 0.20.2");
+    // An outdated oam is fixed in place; sending this user to the website
+    // would make them reinstall what `oam self-update` does for them.
+    expect(res.stderr).toContain("Run `oam self-update` to get oam 0.20.2 or newer.");
+    expect(res.stderr).not.toContain("https://oamjs.org");
   }, 30000);
 
   it("falls back to Node when oam does not report a readable version", async () => {

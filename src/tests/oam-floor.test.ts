@@ -19,13 +19,14 @@ afterAll(() => {
 });
 
 /** A synthetic repo carrying only the files the checker reads. */
-function fixture(files: { launcher?: string; readme?: string; launcherTest?: string }): string {
+function fixture(files: { launcher?: string; readme?: string; claudeMd?: string; launcherTest?: string }): string {
   const root = mkdtempSync(join(tmpdir(), "caddy-mcp-floor-"));
   dirs.push(root);
   mkdirSync(join(root, "bin"), { recursive: true });
   mkdirSync(join(root, "src", "tests"), { recursive: true });
   writeFileSync(join(root, "bin", "caddy-mcp.mjs"), files.launcher ?? "const OAM_MIN = [0, 16, 3];\n");
   if (files.readme !== undefined) writeFileSync(join(root, "README.md"), files.readme);
+  if (files.claudeMd !== undefined) writeFileSync(join(root, "CLAUDE.md"), files.claudeMd);
   writeFileSync(
     join(root, "src", "tests", "launcher.test.ts"),
     files.launcherTest ?? "    expect(floor).toEqual([0, 16, 3]);\n",
@@ -106,6 +107,38 @@ describe("check-oam-floor catches drift", () => {
     const r = runChecker(root);
     expect(r.code, r.out).toBe(1);
     expect(r.out).toMatch(/README\.md:1 +says 0\.15\.2/);
+  });
+
+  it("flags every way CLAUDE.md phrases the floor", () => {
+    // The three shapes CLAUDE.md states the floor in. Only the last used to be
+    // caught: "at or above" was no floor keyword, and the wrapped sentence has
+    // its "oam" on the line before the version.
+    const root = fixture({
+      claudeMd:
+        "| `bin` entry (`bin/caddy-mcp.mjs`) | newest oam at or above 0.15.2, else Node |\n" +
+        "\n" +
+        "**oam ships signed releases** (a signed release manifest, Authenticode on Windows,\n" +
+        "codesigned on macOS); 0.15.2 is the floor this server is verified on, and\n" +
+        "`scripts/check-oam-floor.mjs` keeps the floor consistent and current.\n" +
+        "\n" +
+        "  The launcher never serves on an oam older than 0.15.2.\n",
+    });
+    const r = runChecker(root);
+    expect(r.code, r.out).toBe(1);
+    expect(r.out).toMatch(/3 floor claim\(s\)/);
+    expect(r.out).toMatch(/CLAUDE\.md:1 +says 0\.15\.2/);
+    expect(r.out).toMatch(/CLAUDE\.md:4 +says 0\.15\.2/);
+    expect(r.out).toMatch(/CLAUDE\.md:7 +says 0\.15\.2/);
+  });
+
+  it("does NOT let a neighbouring oam line vouch for another dependency's version", () => {
+    const root = fixture({
+      readme:
+        "- Node.js 20.0.0 or newer.\n- oam 0.16.3 or newer (optional).\n" +
+        'node prints "v22.22.2" -- would clear the floor, and the launcher would then\n',
+    });
+    const r = runChecker(root);
+    expect(r.code, r.out).toBe(0);
   });
 
   it("does NOT flag other dependencies' versions", () => {

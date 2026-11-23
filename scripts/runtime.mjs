@@ -65,6 +65,19 @@ function isOamBanner(text) {
   return /^oam\s+\d+\.\d+\.\d+/m.test(text);
 }
 
+/** [major, minor, patch] from a banner isOamBanner accepted. */
+function bannerVersion(text) {
+  const m = /^oam\s+(\d+)\.(\d+)\.(\d+)/m.exec(text);
+  return [Number(m[1]), Number(m[2]), Number(m[3])];
+}
+
+function atLeast(v, floor) {
+  for (let i = 0; i < 3; i++) {
+    if (v[i] !== floor[i]) return v[i] > floor[i];
+  }
+  return true;
+}
+
 /**
  * The per-user locations oamjs.org's installers write to. Both forms are
  * checked on Windows: the installer defaults to %LOCALAPPDATA%\oam\bin there,
@@ -92,7 +105,8 @@ function installedCandidates() {
  * probed with execFileSync before it is returned (see findOam below), so a shim
  * that cannot be run is dropped anyway and a wider walk only ever finds more.
  * The launcher also asks EVERY candidate for its version and takes the newest;
- * this returns the first that runs. Keep them separate.
+ * this returns the first that runs (and, when a `min` is passed, meets it).
+ * Keep them separate.
  */
 function pathCandidates() {
   const found = [];
@@ -109,7 +123,8 @@ function pathCandidates() {
 
 /**
  * True when a path sits inside a Cargo build output directory.
- * Those are the binaries a scanner re-examines on every exec.
+ * Those are the binaries a concurrent `cargo build` can replace mid-run, so a
+ * timing taken against one may span different bytes (see the header).
  */
 export function isBuildTreeBinary(p) {
   const n = p.replaceAll(sep, "/").toLowerCase();
@@ -129,8 +144,16 @@ export function isBuildTreeBinary(p) {
  * `require: true` makes absence an ERROR instead of a fallback. Used by the
  * binary build, where silently swapping runtimes would make the release
  * artifact depend on workstation state (see the note in build-binary-oam.mjs).
+ *
+ * `min` ([major, minor, patch]) skips any oam older than it, so the first
+ * candidate AT OR ABOVE the floor wins rather than the first that runs: a stale
+ * ~/.oam/bin copy must not outrank a current oam on PATH. The binary build
+ * passes the launcher's OAM_MIN, so the release artifact is never compiled by
+ * an oam the launcher would refuse to serve on; with `require` and no candidate
+ * at the floor, it throws. The typecheck passes no `min` -- it emits nothing,
+ * so any oam's checker will do.
  */
-export function findOam({ require = false } = {}) {
+export function findOam({ require = false, min } = {}) {
   // Case-insensitive, matching the launcher's own read of the same variable
   // (bin/caddy-mcp.mjs lowercases it): `=NODE` must force the Node path here
   // too, or the typecheck silently uses oam the launcher would have refused.
@@ -150,6 +173,7 @@ export function findOam({ require = false } = {}) {
   candidates.push(...installedCandidates());
   candidates.push(...pathCandidates());
 
+  const belowFloor = [];
   for (const cmd of candidates) {
     if (!existsSync(cmd)) continue;
     try {
@@ -163,6 +187,10 @@ export function findOam({ require = false } = {}) {
       });
       // Runs, but is not oam (node, some other tool on PATH): try the next one.
       if (!isOamBanner(out)) continue;
+      if (min && !atLeast(bannerVersion(out), min)) {
+        belowFloor.push(`${out.trim()} (${cmd})`);
+        continue;
+      }
       return { cmd, version: out.trim(), fromBuildTree: isBuildTreeBinary(cmd) };
     } catch {
       // Not executable, wrong arch, wedged (timed out), or a stale entry -- try
@@ -170,6 +198,12 @@ export function findOam({ require = false } = {}) {
     }
   }
 
+  if (require && belowFloor.length > 0) {
+    throw new Error(
+      `oam ${min.join(".")} or newer is required, but every oam found is older: ${belowFloor.join(", ")}. ` +
+        "Run `oam self-update`, or set $OAM_BIN to a current oam.",
+    );
+  }
   if (require) {
     throw new Error(
       "the oam runtime is required but no working oam was found. " +

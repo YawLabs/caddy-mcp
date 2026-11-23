@@ -1,7 +1,7 @@
 import type { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import type { ApiResponse } from "./api.js";
 import * as api from "./api.js";
-import { applyMetricsControls, METRICS_DEFAULT_MAX_LINES } from "./tools/operational.js";
+import { applyMetricsControls, METRICS_DEFAULT_MAX_LINES, metricsBodyText } from "./tools/operational.js";
 
 /**
  * Error body for a failed resource read. Mirrors the tool-side fallback in
@@ -74,13 +74,12 @@ export function registerResources(server: McpServer) {
           ],
         };
       }
-      const raw = typeof res.data === "string" ? res.data : res.data !== undefined ? String(res.data) : "";
       return {
         contents: [
           {
             uri: "caddy://metrics",
             mimeType: "text/plain",
-            text: applyMetricsControls(raw, undefined, METRICS_DEFAULT_MAX_LINES),
+            text: applyMetricsControls(metricsBodyText(res.data), undefined, METRICS_DEFAULT_MAX_LINES),
           },
         ],
       };
@@ -90,15 +89,24 @@ export function registerResources(server: McpServer) {
   server.resource(
     "caddy-servers",
     "caddy://servers",
-    { description: "Summary of all configured HTTP servers" },
+    {
+      description:
+        "Raw JSON config of every HTTP server: the object at apps/http/servers, keyed by server name ({} when none are configured). " +
+        "Use the caddy_list_servers tool for a one-line summary of each.",
+    },
     async () => {
       const res = await api.configGet<Record<string, unknown>>("apps/http/servers");
+      // A Caddy with no http app (or no config at all) answers this GET with 400
+      // "invalid traversal path", which is not a failure to read the servers but
+      // the fact that there are none -- the same reading caddy_list_servers gives it.
+      const none = api.isMissingConfigPath(res);
+      const asJson = res.ok || none;
       return {
         contents: [
           {
             uri: "caddy://servers",
-            mimeType: res.ok ? "application/json" : "text/plain",
-            text: res.ok ? JSON.stringify(res.data ?? {}, null, 2) : errorText(res),
+            mimeType: asJson ? "application/json" : "text/plain",
+            text: asJson ? JSON.stringify((res.ok ? res.data : undefined) ?? {}, null, 2) : errorText(res),
           },
         ],
       };

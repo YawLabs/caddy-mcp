@@ -1,4 +1,28 @@
-import { afterEach, describe, expect, it, vi } from "vitest";
+import { afterAll, afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+
+// Pin the two variables that decide where these tests reach. Exported in a developer
+// shell, CADDY_ADMIN_URL as a unix:// or path-prefixed URL would send the
+// fetch-mocked tests here down the socket transport or to other paths, and
+// CADDY_MCP_SNAPSHOT_DIR would have them write and prune a real directory.
+// Top-level beforeEach, not beforeAll: it runs before every nested hook, so a
+// describe that sets one deliberately still wins, and one that restores the
+// ambient value in its own afterEach is re-pinned before the next test.
+const AMBIENT_ENV = {
+  CADDY_ADMIN_URL: process.env.CADDY_ADMIN_URL,
+  CADDY_MCP_SNAPSHOT_DIR: process.env.CADDY_MCP_SNAPSHOT_DIR,
+};
+
+beforeEach(() => {
+  delete process.env.CADDY_ADMIN_URL;
+  delete process.env.CADDY_MCP_SNAPSHOT_DIR;
+});
+
+afterAll(() => {
+  for (const [name, value] of Object.entries(AMBIENT_ENV)) {
+    if (value !== undefined) process.env[name] = value;
+    else delete process.env[name];
+  }
+});
 
 describe("caddy-mcp tools", () => {
   it("registers exactly 18 tools", async () => {
@@ -49,6 +73,8 @@ describe("caddy-mcp tools", () => {
     registerTlsTools(mockServer as any);
     registerOperationalTools(mockServer as any);
 
+    // Count first: with nothing registered, the loop below would pass vacuously.
+    expect(registeredTools).toHaveLength(18);
     for (const name of registeredTools) {
       expect(name).toMatch(/^caddy_/);
     }
@@ -146,6 +172,8 @@ describe("caddy-mcp tools", () => {
     registerTlsTools(mockServer as any);
     registerOperationalTools(mockServer as any);
 
+    // Count first: with nothing registered, the loop below would pass vacuously.
+    expect(descriptions).toHaveLength(18);
     for (const desc of descriptions) {
       expect(desc).toBeTruthy();
       expect(typeof desc).toBe("string");
@@ -511,9 +539,9 @@ describe("caddy-mcp tools", () => {
     it("rejects an empty list and empty entries at the schema boundary", async () => {
       const schema = await getReverseProxySchema();
       // A reverse_proxy with no upstreams (or a "" upstream) is a route that
-      // 502s every request. The handler refuses these too -- see the runtime
-      // guards in handlers.test.ts -- but rejecting here means a real MCP call
-      // never reaches the handler with them.
+      // 502s every request. The schema is the only guard against an empty
+      // list; the handler still refuses entries that clean to an empty dial
+      // ("", "http://") -- see handlers.test.ts.
       expect(() => schema.to.parse([])).toThrow();
       expect(() => schema.to.parse([""])).toThrow();
       expect(() => schema.to.parse(["localhost:3000", ""])).toThrow();
@@ -595,6 +623,33 @@ describe("caddy-mcp tools", () => {
         destructiveHint: true,
         idempotentHint: false,
       });
+    });
+
+    it("caddy_tls advertises its set_* overwrites as destructive, and describes the module check truthfully", async () => {
+      // set_email / set_acme_ca / set_acme_profile overwrite an existing value
+      // and the fallback rewrites apps/tls whole: not "only additive updates".
+      const calls: any[] = [];
+      const mockServer = { tool: vi.fn((...args: any[]) => calls.push(args)), resource: vi.fn() };
+      const { registerTlsTools } = await import("../tools/tls.js");
+      registerTlsTools(mockServer as any);
+      const call = calls.find((c) => c[0] === "caddy_tls");
+      expect(call?.[3]).toMatchObject({ readOnlyHint: false, destructiveHint: true });
+      // The PATCH-first path overwrites an existing field without checking the
+      // module; the description used to promise every write was acme-only.
+      expect(call?.[1]).toContain("overwritten in place, whatever the issuer's module");
+      expect(call?.[1]).not.toContain("only when that issuer's module is 'acme'");
+    });
+
+    it("caddy_list_servers says its TLS label assumes the 80/443 defaults", async () => {
+      // It reads only apps/http/servers (deliberately), so a custom
+      // http_port / https_port can mislabel a server; the description says so.
+      const calls: any[] = [];
+      const mockServer = { tool: vi.fn((...args: any[]) => calls.push(args)), resource: vi.fn() };
+      const { registerOperationalTools } = await import("../tools/operational.js");
+      registerOperationalTools(mockServer as any);
+      const desc: string = calls.find((c) => c[0] === "caddy_list_servers")?.[1];
+      expect(desc).toContain("default http_port 80 and https_port 443");
+      expect(desc).toContain("caddy_status");
     });
   });
 
@@ -729,7 +784,7 @@ describe("caddy-mcp tools", () => {
       expect(result.content[0].text).toContain("subroute(0 routes)");
     });
 
-    it("handles non-string @id and group without crashing", async () => {
+    it("shows a numeric @id (Caddy resolves /id/42) and hides a non-string group", async () => {
       const handler = await getListRoutesHandler();
       globalThis.fetch = vi.fn(
         async () =>
@@ -743,6 +798,8 @@ describe("caddy-mcp tools", () => {
       ) as any;
       const result = await handler({ server: "srv0" });
       expect(result.isError).toBeFalsy();
+      // Unquoted: the JSON carries a number, and a string "42" would print as @id="42".
+      expect(result.content[0].text).toContain("Route 0: @id=42 ");
       expect(result.content[0].text).not.toContain('@id="42"');
       expect(result.content[0].text).not.toContain('group="true"');
     });

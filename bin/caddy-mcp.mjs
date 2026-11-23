@@ -144,7 +144,7 @@
  */
 
 import { execFileSync, spawn } from "node:child_process";
-import { existsSync, realpathSync } from "node:fs";
+import { existsSync, realpathSync, writeSync } from "node:fs";
 import { constants, homedir } from "node:os";
 import { delimiter, join } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -336,6 +336,24 @@ function runtimePlan({ mode, hostOam, sandbox }) {
 }
 
 /**
+ * An on/off opt-in value -> "on", "off" (unset or empty) or "invalid".
+ *
+ * Trimmed and case-insensitive, because the strict `=== "1"` this replaced
+ * read cmd.exe's `set CADDY_MCP_SANDBOX=1 && ...` (which keeps the space before
+ * `&&`) and a natural "true" as OFF -- for the sandbox, a security opt-in,
+ * that is fail-open with no word said. "invalid" is still off; the caller
+ * warns. Pure, so the test can extract it like runtimePlan.
+ */
+function parseOptIn(raw) {
+  const value = (raw ?? "").trim();
+  if (value === "") return "off";
+  return /^(1|true)$/i.test(value) ? "on" : "invalid";
+}
+
+let warnedSandboxValue = false;
+let warnedOpenNet = false;
+
+/**
  * The `--permission` grant list, or [] when the sandbox is not requested.
  *
  * These are oam's PROCESS-level flags, and before the `run` subcommand is their
@@ -355,23 +373,6 @@ function runtimePlan({ mode, hostOam, sandbox }) {
  * so the env list below is derived from what the bundle actually reads; trimming
  * it produces silent misbehaviour, not a clear denial.
  */
-/**
- * An on/off opt-in value -> "on", "off" (unset or empty) or "invalid".
- *
- * Trimmed and case-insensitive, because the strict `=== "1"` this replaced
- * read cmd.exe's `set CADDY_MCP_SANDBOX=1 && ...` (which keeps the space before
- * `&&`) and a natural "true" as OFF -- for the sandbox, a security opt-in,
- * that is fail-open with no word said. "invalid" is still off; the caller
- * warns. Pure, so the test can extract it like runtimePlan.
- */
-function parseOptIn(raw) {
-  const value = (raw ?? "").trim();
-  if (value === "") return "off";
-  return /^(1|true)$/i.test(value) ? "on" : "invalid";
-}
-
-let warnedSandboxValue = false;
-
 function sandboxFlags() {
   const sandbox = parseOptIn(process.env.CADDY_MCP_SANDBOX);
   if (sandbox === "invalid" && !warnedSandboxValue) {
@@ -427,8 +428,7 @@ function sandboxFlags() {
   //
   // getUnixSocketPath accepts only the two WELL-FORMED spellings; matching it
   // here would leave the malformed ones ("unix:/one-slash", "unix://relative",
-  // "unix://", or any uppercase spelling, which getUnixSocketPath rejects for
-  // case) falling through to the parse, where they yield an empty hostname and
+  // "unix://") falling through to the parse, where they yield an empty hostname and
   // the bare `--allow-net` -- fully open, for input that plainly meant a socket.
   //
   // Denying the category for those costs nothing: api.ts routes exactly this set
@@ -456,6 +456,17 @@ function sandboxFlags() {
       // Genuinely unparseable CADDY_ADMIN_URL (not the unix forms -- those are
       // handled above): leave the grant open. The server will fail on its own
       // connection error, which names the real problem.
+    }
+    // Still bare: the DSN yielded no host. The usual cause is a schemeless
+    // "localhost:2019", which parses with "localhost:" as its SCHEME and an
+    // empty hostname. The fallback stays (a wrong narrow grant fails at connect
+    // time), but a sandbox the operator switched on is now open to every host,
+    // so say so -- once, because sandboxFlags() runs twice per launch.
+    if (netFlag === "--allow-net" && !warnedOpenNet) {
+      warnedOpenNet = true;
+      process.stderr.write(
+        `caddy-mcp: CADDY_ADMIN_URL=${JSON.stringify(dsn)} names no host, so the sandbox grants network access to EVERY host; write it as http://host:port (e.g. http://localhost:2019).\n`,
+      );
     }
   }
 
@@ -515,8 +526,7 @@ function sandboxFlags() {
  * stderr turns out to be unusable give up quietly -- failing to print a
  * diagnostic is not worth crashing a stdio server over.
  */
-async function errSync(message) {
-  const { writeSync } = await import("node:fs");
+function errSync(message) {
   const buf = Buffer.from(message);
   let off = 0;
   for (let attempts = 0; off < buf.length && attempts < 1000; attempts++) {
@@ -683,12 +693,13 @@ async function runInProcess() {
   await import(SERVER_URL.href);
 }
 
-// ONE reporter for every failed in-process fallback. runInProcess() is a bare
-// import() that rejects when dist/index.js is missing, and at ESM top level an
-// unhandled rejection is an uncaught exception -- replacing this launcher's
-// diagnostic with a raw stack trace.
-const fallbackFailed = (e) => {
-  process.stderr.write(`caddy-mcp: fallback to Node failed (${e?.message ?? e})\n`);
+// ONE reporter for every failed server start -- the primary in-process path and
+// every fallback alike. runInProcess() is a bare import() that rejects when
+// dist/index.js is missing, and at ESM top level an unhandled rejection is an
+// uncaught exception -- replacing this launcher's diagnostic with a raw stack
+// trace.
+const startFailed = (e) => {
+  process.stderr.write(`caddy-mcp: failed to start the server (${e?.message ?? e})\n`);
   process.exitCode = 1;
 };
 
@@ -721,7 +732,7 @@ async function launchChild(cmd, args, onLaunchFailed) {
     // 'error' listener is registered AFTER this call, so it can never observe
     // one -- an uncaught throw here kills the launcher with a raw stack trace
     // instead of falling back.
-    await onLaunchFailed(err).catch(fallbackFailed);
+    await onLaunchFailed(err).catch(startFailed);
     return;
   }
 
@@ -747,7 +758,7 @@ async function launchChild(cmd, args, onLaunchFailed) {
   });
   child.on("error", (err) => {
     if (spawned) return;
-    onLaunchFailed(err).catch(fallbackFailed);
+    onLaunchFailed(err).catch(startFailed);
   });
   // A child that exits before reading everything closes its stdin; the
   // resulting EPIPE is not worth crashing over.
@@ -823,19 +834,27 @@ async function launchChild(cmd, args, onLaunchFailed) {
  * Hand the server to Node on PATH. Only reachable when THIS process is oam --
  * one below the floor with no newer oam, or any oam under
  * CADDY_MCP_RUNTIME=node -- so there is no in-process option left.
+ *
+ * An empty `reason` means the host oam is at or above the floor and only
+ * CADDY_MCP_RUNTIME=node sent us here. With no Node to hand off to, that case
+ * gets its own message: there is nothing to update, and the way out is to
+ * install Node or drop the variable.
  */
 async function handOffToNode(reason) {
   const node = findNodeOnPath();
   if (!node) {
-    await errSync(
-      `caddy-mcp: ${reason}, and no Node was found on PATH to run the server instead.\n` +
-        `Run \`oam self-update\` to get oam ${OAM_MIN.join(".")} or newer, or launch this command with node.\n`,
+    errSync(
+      reason
+        ? `caddy-mcp: ${reason}, and no Node was found on PATH to run the server instead.\n` +
+            `Run \`oam self-update\` to get oam ${OAM_MIN.join(".")} or newer, or launch this command with node.\n`
+        : "caddy-mcp: CADDY_MCP_RUNTIME=node, but no Node was found on PATH to run the server.\n" +
+            `Install Node, or unset CADDY_MCP_RUNTIME to serve on this oam (${process.versions.oam}).\n`,
     );
     process.exit(1);
   }
-  if (reason) await errSync(`caddy-mcp: ${reason}; running on ${node} instead.\n`);
+  if (reason) errSync(`caddy-mcp: ${reason}; running on ${node} instead.\n`);
   await launchChild(node, [SERVER_ENTRY, ...process.argv.slice(2)], async (err) => {
-    await errSync(`caddy-mcp: failed to launch Node at ${node} (${err?.message ?? err})\n`);
+    errSync(`caddy-mcp: failed to launch Node at ${node} (${err?.message ?? err})\n`);
     process.exit(1);
   });
 }
@@ -879,7 +898,7 @@ const hostOam = process.versions.oam;
 const plan = runtimePlan({ mode, hostOam, sandbox: sandboxFlags().length > 0 });
 
 if (plan === "in-process") {
-  await runInProcess();
+  await runInProcess().catch(startFailed);
 } else if (plan === "handoff-node") {
   const belowFloor = !atLeast(parseVersion(hostOam), OAM_MIN);
   await handOffToNode(belowFloor ? `this process is oam ${hostOam}, older than ${OAM_MIN.join(".")}` : "");
@@ -887,8 +906,7 @@ if (plan === "in-process") {
   const { chosen, overrideNote, skipped, passedOver, overrideMissing } = chooseOam();
 
   if (chosen) {
-    if (overrideNote)
-      await errSync(`caddy-mcp: ${overrideNote}; using ${chosen.path} (oam ${chosen.version.join(".")}).\n`);
+    if (overrideNote) errSync(`caddy-mcp: ${overrideNote}; using ${chosen.path} (oam ${chosen.version.join(".")}).\n`);
     // `--` separates oam's own flags from the script's argv, so `caddy-mcp
     // --version` and any host-supplied flags survive the hop unchanged. The
     // sandbox flags are process-level, so they go BEFORE `run`.
@@ -897,10 +915,10 @@ if (plan === "in-process") {
       [...sandboxFlags(), "run", SERVER_ENTRY, "--", ...process.argv.slice(2)],
       async (err) => {
         if (mode === "oam") {
-          await errSync(`caddy-mcp: failed to launch oam at ${chosen.path} (${err?.message ?? err})\n`);
+          errSync(`caddy-mcp: failed to launch oam at ${chosen.path} (${err?.message ?? err})\n`);
           process.exit(1);
         }
-        await errSync(
+        errSync(
           `caddy-mcp: failed to launch oam at ${chosen.path} (${err?.message ?? err}); ${fallbackTail(hostOam)}.\n`,
         );
         await fallBack(hostOam);
@@ -918,7 +936,7 @@ if (plan === "in-process") {
         : []),
     ];
     if (mode === "oam") {
-      await errSync(
+      errSync(
         `caddy-mcp: CADDY_MCP_RUNTIME=oam but no usable oam (${OAM_MIN.join(".")} or newer) was found.\n` +
           notes.map((note) => `  ${note}\n`).join("") +
           remedyFor({ passedOver, overrideMissing, shim }),
@@ -927,7 +945,7 @@ if (plan === "in-process") {
     }
     // auto: falling back is correct, but silence is how someone never learns
     // their OAM_BIN is wrong or their oam is too old to use.
-    if (notes.length > 0) await errSync(`caddy-mcp: ${notes.join("; ")}; ${fallbackTail(hostOam)}.\n`);
-    await fallBack(hostOam).catch(fallbackFailed);
+    if (notes.length > 0) errSync(`caddy-mcp: ${notes.join("; ")}; ${fallbackTail(hostOam)}.\n`);
+    await fallBack(hostOam).catch(startFailed);
   }
 }

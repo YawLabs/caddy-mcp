@@ -164,6 +164,15 @@ function isEchoableEtag(etag: string): boolean {
   return fields.length === 2 && fields.join(" ") === inner;
 }
 
+function isAncestorOf(ancestor: string, descendant: string): boolean {
+  // Strip a trailing slash before building the prefix. The root config key is
+  // "/config/", which already ends in "/" -- naively appending another would
+  // test against "/config//" and match nothing, leaving the root entry cached
+  // (and thus stale) after every descendant write.
+  const base = ancestor.endsWith("/") ? ancestor.slice(0, -1) : ancestor;
+  return descendant.startsWith(`${base}/`);
+}
+
 /**
  * Invalidate cached ETags whose paths can no longer be trusted after a
  * successful write to `path`. Without prefix-awareness, a sequence like
@@ -181,17 +190,15 @@ function isEchoableEtag(etag: string): boolean {
  *      which config sub-path the @id resolves to without an extra round-trip,
  *      so blow them all away (cheapest correct option). The reverse also holds:
  *      a write to `/config/...` invalidates any `/id/...` cached for paths that
- *      may resolve into that subtree.
+ *      may resolve into that subtree;
+ *   5. for writes to `/id/<id>`, every other `/id/...` entry as well, for the
+ *      same reason: two ids can name nested objects (a server and a route
+ *      inside it), and nothing in the id strings says so. Otherwise "GET
+ *      /id/srv / PATCH /id/route1 / PATCH /id/srv" echoes an ETag hashed
+ *      before the route changed and gets a spurious 412.
+ * Taken together: any config write clears every `/id/` entry, and an `/id/`
+ * write clears the whole cache.
  */
-function isAncestorOf(ancestor: string, descendant: string): boolean {
-  // Strip a trailing slash before building the prefix. The root config key is
-  // "/config/", which already ends in "/" -- naively appending another would
-  // test against "/config//" and match nothing, leaving the root entry cached
-  // (and thus stale) after every descendant write.
-  const base = ancestor.endsWith("/") ? ancestor.slice(0, -1) : ancestor;
-  return descendant.startsWith(`${base}/`);
-}
-
 function invalidateRelated(path: string): void {
   etagCache.delete(path);
   for (const key of Array.from(etagCache.keys())) {
@@ -203,9 +210,8 @@ function invalidateRelated(path: string): void {
   const isIdWrite = path.startsWith("/id/");
   const isConfigWrite = path.startsWith("/config/");
   if (isIdWrite || isConfigWrite) {
-    const otherNamespace = isIdWrite ? "/config/" : "/id/";
     for (const key of Array.from(etagCache.keys())) {
-      if (key.startsWith(otherNamespace)) etagCache.delete(key);
+      if (key.startsWith("/id/") || (isIdWrite && key.startsWith("/config/"))) etagCache.delete(key);
     }
   }
 }
@@ -235,7 +241,11 @@ function invalidateRelated(path: string): void {
  * the secret; see the characterization test in api.test.ts.
  */
 function getBaseUrl(): string {
-  return (process.env.CADDY_ADMIN_URL || DEFAULT_URL).replace(/\/+$/, "");
+  // Trimmed like getUnixSocketPath and getMalformedUnixUrl: a trailing space
+  // (an .env line, a quoted shell value) would otherwise sit after the slashes
+  // and defeat the strip, and fetch rejects "http://h:2019 /config/" as
+  // unparseable -- reported as an unreachable Caddy and retried.
+  return (process.env.CADDY_ADMIN_URL?.trim() || DEFAULT_URL).replace(/\/+$/, "");
 }
 
 /**
@@ -251,13 +261,18 @@ function getBaseUrl(): string {
  *   - URL form:   unix:///var/run/caddy-admin.sock
  *   - Caddy form: unix//var/run/caddy-admin.sock  (its network-address syntax,
  *                 `<network>/<address>`, as written in the admin config)
+ *
+ * The scheme matches case-insensitively, as URL schemes do and as
+ * getMalformedUnixUrl's test does; otherwise "UNIX:///run/caddy.sock" was
+ * reported as malformed and told to use the very form it already had. The
+ * path keeps its case -- it names a file.
  */
 function getUnixSocketPath(): string | undefined {
   const raw = (process.env.CADDY_ADMIN_URL || "").trim();
   if (!raw) return undefined;
-  const urlForm = /^unix:\/\/(\/.*)$/.exec(raw);
+  const urlForm = /^unix:\/\/(\/.*)$/i.exec(raw);
   if (urlForm) return urlForm[1];
-  const caddyForm = /^unix\/(\/.*)$/.exec(raw);
+  const caddyForm = /^unix\/(\/.*)$/i.exec(raw);
   if (caddyForm) return caddyForm[1];
   return undefined;
 }
@@ -712,6 +727,30 @@ function getMalformedUnixUrl(): string | undefined {
   return getUnixSocketPath() === undefined ? raw : undefined;
 }
 
+/**
+ * A TCP CADDY_ADMIN_URL that parses, but not as an http(s) URL -- else undefined.
+ *
+ * The case this exists for is a schemeless "localhost:2019", which is how
+ * Caddy's own CADDY_ADMIN variable spells the address. The URL parser reads
+ * "localhost:" as the scheme, so the origin is "null", fetch can never send
+ * it, and the operator saw "Cannot connect to Caddy admin API at null -- is
+ * Caddy running?" only after the whole retry loop. The other CADDY_ADMIN forms
+ * ("127.0.0.1:2019", ":2019", "[::1]:2019") do not parse at all; fetch then
+ * throws "Failed to parse URL", a status 0 that the retry loop replays, so a
+ * parse failure counts as non-http too.
+ */
+function getNonHttpBaseUrl(): string | undefined {
+  if (getUnixSocketPath() !== undefined) return undefined;
+  const base = getBaseUrl();
+  let protocol: string;
+  try {
+    protocol = new URL(base).protocol;
+  } catch {
+    return base;
+  }
+  return protocol === "http:" || protocol === "https:" ? undefined : base;
+}
+
 async function caddyRequest<T = any>(
   method: string,
   path: string,
@@ -731,6 +770,17 @@ async function caddyRequest<T = any>(
         `CADDY_ADMIN_URL="${malformed}" looks like a unix socket address but is not a recognized form. ` +
         `Use "unix:///absolute/path.sock" (URL form) or "unix//absolute/path.sock" (Caddy's own spelling). ` +
         `A single slash after "unix:", or a relative path, will not parse.`,
+    };
+  }
+  const nonHttp = getNonHttpBaseUrl();
+  if (nonHttp) {
+    return {
+      ok: false,
+      status: 0,
+      error:
+        `CADDY_ADMIN_URL="${nonHttp}" is not an http:// or https:// URL. Include the scheme, ` +
+        `e.g. "http://localhost:2019" -- a bare "host:port" parses with "host:" as the scheme -- ` +
+        `or use "unix:///absolute/path.sock" for a unix socket.`,
     };
   }
   const maxRetries = getMaxRetries();
@@ -795,12 +845,34 @@ function isConnectionRefused(err: unknown): boolean {
  *
  * Walks `cause` like isConnectionRefused. The caller still keeps the old
  * substring test as a fallback for a runtime whose error carries neither name.
+ *
+ * Also true for undici's own headers deadline (isHeadersTimeout): it is a
+ * deadline firing on a request that was sent, so it is just as ambiguous.
  */
 function isTimeoutError(err: unknown): boolean {
   let current: unknown = err;
   for (let depth = 0; depth < 5 && current !== null && typeof current === "object"; depth++) {
     const e = current as { name?: unknown; cause?: unknown };
     if (e.name === "TimeoutError" || e.name === "AbortError") return true;
+    current = e.cause;
+  }
+  return isHeadersTimeout(err);
+}
+
+/**
+ * Whether fetch gave up because undici's `headersTimeout` fired: no response
+ * headers within 300 s (undici's default, which Node's global fetch does not
+ * expose). The rejection is TypeError "fetch failed" -- the same text as a
+ * refused connection -- with a `cause` whose code is UND_ERR_HEADERS_TIMEOUT
+ * (measured on Node 26.13.1). The request was written, so with
+ * CADDY_LOAD_TIMEOUT above 300000 a slow reload hits this first, and reading
+ * it as "Cannot connect" let shouldRetry replay the change.
+ */
+function isHeadersTimeout(err: unknown): boolean {
+  let current: unknown = err;
+  for (let depth = 0; depth < 5 && current !== null && typeof current === "object"; depth++) {
+    const e = current as { code?: unknown; cause?: unknown };
+    if (e.code === "UND_ERR_HEADERS_TIMEOUT") return true;
     current = e.cause;
   }
   return false;
@@ -928,15 +1000,25 @@ async function sendViaFetch(
  * a well-known symbol (the same one Node's fetch reads on every call), so no
  * import of undici is needed.
  *
+ * WHICH symbol depends on the undici inside Node, so the newest is tried first.
+ * undici 8 (Node 26) moved the Agent to `undici.globalDispatcher.2` and left a
+ * `Dispatcher1Wrapper` at `.1` for older callers: it has an `on` method and
+ * never emits either event. Hooking it looked like success, counted no sockets,
+ * and turned the settle wait into a silent no-op -- on Node 26.13.1 (undici
+ * 8.12.4) a request right after a config change was written to the socket the
+ * server was closing and came back "Cannot connect". Before undici 8 only `.1`
+ * exists, and it is the Agent itself.
+ *
  * On oam the hook finds nothing: oam's fetch pool is its own, the symbol is
  * undefined after a fetch (measured on 0.18.0, 0.19.1, 0.19.5 and 0.20.2), and oam's builtin `undici`
  * Agent emits no connect/disconnect events even when installed as the global
  * dispatcher. settleAdminRestart therefore cannot count sockets there and
  * falls back to a fixed wait instead -- see its comment. On a Node that moves
- * the symbol the hook finds nothing too, and the settle is a no-op: the pre-fix
- * behavior, never anything worse.
+ * the symbol again the hook finds nothing (or, as above, a wrapper that stays
+ * silent), and the settle is a no-op: the pre-fix behavior, never anything
+ * worse.
  */
-const GLOBAL_DISPATCHER_KEY = Symbol.for("undici.globalDispatcher.1");
+const GLOBAL_DISPATCHER_KEYS = [Symbol.for("undici.globalDispatcher.2"), Symbol.for("undici.globalDispatcher.1")];
 interface DispatcherEvents {
   on(event: "connect" | "disconnect", listener: (origin: unknown) => void): unknown;
 }
@@ -946,8 +1028,10 @@ let dispatcherHooked = false;
 
 function hookGlobalDispatcher(): void {
   if (dispatcherHooked) return;
-  const dispatcher = (globalThis as Record<symbol, unknown>)[GLOBAL_DISPATCHER_KEY] as DispatcherEvents | undefined;
-  if (!dispatcher || typeof dispatcher.on !== "function") return;
+  const dispatcher = GLOBAL_DISPATCHER_KEYS.map(
+    (key) => (globalThis as Record<symbol, unknown>)[key] as DispatcherEvents | undefined,
+  ).find((candidate) => candidate && typeof candidate.on === "function");
+  if (!dispatcher) return;
   dispatcherHooked = true;
   dispatcher.on("connect", (origin) => {
     const key = originOf(origin);
@@ -1013,7 +1097,7 @@ function originOf(origin: unknown): string | undefined {
  * The wait is event-driven and short (the close arrives with the response);
  * ADMIN_RESTART_SETTLE_MS caps it for the cases where no close is coming.
  *
- * On oam there are no socket events to wait on (see GLOBAL_DISPATCHER_KEY), so
+ * On oam there are no socket events to wait on (see GLOBAL_DISPATCHER_KEYS), so
  * the wait is the fixed ADMIN_RESTART_SETTLE_MS instead. It used to be no wait
  * at all there, and the race came back: against Caddy 2.11.4 on Windows with
  * oam 0.18.0, about 2,100 back-to-back config changes produced one "Cannot
@@ -1283,7 +1367,10 @@ async function sendOnce<T = any>(
     //     returned ETag describes a different scope.
     if (isWrite && res.ok && isConfigPath) {
       invalidateRelated(path);
-      if ((method === "PATCH" || method === "PUT") && etag) {
+      // Same isEchoableEtag gate as the GET branch above, for the same reason: a
+      // write answered with an ETag Caddy cannot parse back would otherwise be
+      // cached and echoed, and every later write to the path would 400 / 412.
+      if ((method === "PATCH" || method === "PUT") && etag && isEchoableEtag(etag)) {
         setEtag(path, etag);
       }
     }
@@ -1351,13 +1438,17 @@ async function sendOnce<T = any>(
         error: `No socket at ${socketPath} — check the path in CADDY_ADMIN_URL and that Caddy's admin endpoint is configured to listen on it.`,
       };
     }
-    if (msg.includes("ECONNREFUSED") || msg.includes("fetch failed")) {
+    const headersTimeout = isHeadersTimeout(err);
+    // Not for undici's headers deadline: its rejection is also "fetch failed",
+    // but the connection was made and the request sent (see isHeadersTimeout).
+    if (!headersTimeout && (msg.includes("ECONNREFUSED") || msg.includes("fetch failed"))) {
       let target = socketPath ?? getBaseUrl();
       if (!socketPath) {
         try {
           target = new URL(target).origin;
         } catch {
-          // fall through — show raw value if unparseable
+          // Defensive only: caddyRequest refuses an unparseable base URL up
+          // front (getNonHttpBaseUrl), so this shows the raw value at worst.
         }
       }
       return {
@@ -1370,10 +1461,18 @@ async function sendOnce<T = any>(
     // substring test stays as a generic fallback for a runtime whose error
     // carries no standard name. "timed out" is part of that fallback: it is the
     // other common phrasing of a deadline, not one any runtime the launcher
-    // serves on still produces.
-    if (isTimeoutError(err) || msg.includes("abort") || msg.includes("timeout") || msg.includes("timed out")) {
+    // serves on still produces. "abort" is deliberately NOT: node:http fails a
+    // response cut off mid-body with Error "aborted" (code ECONNRESET), which
+    // is a dropped connection, not a deadline -- and a deadline that destroys
+    // the unix-socket request is already reported by name (sendViaUnixSocket).
+    if (isTimeoutError(err) || msg.includes("timeout") || msg.includes("timed out")) {
       transport.timedOut = true;
-      const timedOutMsg = `Request timed out after ${effectiveTimeout}ms`;
+      // undici's deadline is not ours: it fired at its own 300 s, before
+      // effectiveTimeout, so the message must not claim effectiveTimeout ran out.
+      const timedOutMsg = headersTimeout
+        ? `Request timed out waiting for response headers (fetch's built-in headers timeout, 300 s by ` +
+          `default; the configured timeout was ${effectiveTimeout}ms)`
+        : `Request timed out after ${effectiveTimeout}ms`;
       if (!isConfigChange(method, path)) return { ok: false, status: 0, error: timedOutMsg };
       // A deadline on a config change is not "it failed". Caddy applies the
       // change synchronously inside the request and does not notice the client
@@ -1441,28 +1540,29 @@ export function configDelete<T = any>(path: string): Promise<ApiResponse<T>> {
   return caddyRequest("DELETE", `/config/${encodePathSegments(normalized)}`);
 }
 
-function getRequestTimeout(): number {
-  const raw = process.env.CADDY_TIMEOUT;
-  if (raw === undefined) return TIMEOUT;
-  const n = Number(raw);
-  // Floor first, then bounds-check -- mirrors getLoadTimeout: "0.5" floors to 0
-  // and would produce an immediate-abort timeout.
-  if (!Number.isFinite(n)) return TIMEOUT;
-  const floored = Math.floor(n);
-  if (floored < 1) return TIMEOUT;
-  return floored;
-}
+/**
+ * The largest delay a timer honours: setTimeout and AbortSignal.timeout take a
+ * signed 32-bit millisecond count. Past it, Node's setTimeout fires after
+ * ~1 ms instead (TimeoutOverflowWarning), and AbortSignal.timeout(1e12) throws
+ * RangeError on Node 26 -- so a "very long" timeout would become no deadline
+ * at all, or a crash. Clamped rather than rejected: the operator asked for a
+ * long wait, and ~24.8 days is one.
+ */
+const MAX_TIMER_MS = 2147483647;
 
-function getLoadTimeout(): number {
-  const raw = process.env.CADDY_LOAD_TIMEOUT;
-  if (raw === undefined) return LOAD_TIMEOUT;
+/**
+ * A timeout from the environment, or `fallback`. Same parse as getMaxRetries:
+ * trimmed, then decimal digits only. `Number(raw)` read "0x10" as a 16 ms
+ * timeout and "1e3" as 1000, and "" (an exported-but-empty variable) as 0;
+ * anything that is not a plain positive integer is the default instead. 0 is
+ * the default too -- a zero deadline aborts every request immediately.
+ */
+function getTimeoutEnv(name: "CADDY_TIMEOUT" | "CADDY_LOAD_TIMEOUT", fallback: number): number {
+  const raw = process.env[name]?.trim();
+  if (!raw || !/^\d+$/.test(raw)) return fallback;
   const n = Number(raw);
-  // Reject anything that floors below 1ms -- "0.5" passes n>0 but Math.floor(0.5)=0
-  // would produce an immediate-abort timeout. Floor first, then bounds-check.
-  if (!Number.isFinite(n)) return LOAD_TIMEOUT;
-  const floored = Math.floor(n);
-  if (floored < 1) return LOAD_TIMEOUT;
-  return floored;
+  if (n < 1) return fallback;
+  return Math.min(n, MAX_TIMER_MS);
 }
 
 /**
@@ -1498,7 +1598,9 @@ function getLoadTimeout(): number {
  * Read per attempt, not cached: both values come from the environment.
  */
 function getTimeoutFor(method: string, path: string): number {
-  return isConfigChange(method, path) ? getLoadTimeout() : getRequestTimeout();
+  return isConfigChange(method, path)
+    ? getTimeoutEnv("CADDY_LOAD_TIMEOUT", LOAD_TIMEOUT)
+    : getTimeoutEnv("CADDY_TIMEOUT", TIMEOUT);
 }
 
 export async function loadConfig(config: unknown, contentType?: string): Promise<ApiResponse> {

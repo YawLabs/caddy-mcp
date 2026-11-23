@@ -23,7 +23,16 @@
 // gh auth). Without --push it writes the files and prints the git commands.
 
 import { execFileSync } from "node:child_process";
-import { mkdirSync, mkdtempSync, readdirSync, readFileSync, realpathSync, writeFileSync } from "node:fs";
+import {
+  mkdirSync,
+  mkdtempSync,
+  readdirSync,
+  readFileSync,
+  realpathSync,
+  rmSync,
+  statSync,
+  writeFileSync,
+} from "node:fs";
 import { homedir, tmpdir } from "node:os";
 import { dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -100,6 +109,76 @@ end
 `;
 }
 
+// Refuse a manifest repo whose ROOT is not an existing directory. The write
+// below creates missing directories, which is right for `bucket/` or `Formula/`
+// inside a real checkout and wrong for the checkout itself: on a machine without
+// ~/yaw/scoop-yaw it would build that path and drop a manifest into a directory
+// that is no repo at all.
+export function requireManifestRepo(dir) {
+  let isDir = false;
+  try {
+    isDir = statSync(dir).isDirectory();
+  } catch {
+    // missing (or unreadable) -- same answer as "not a directory"
+  }
+  if (!isDir) {
+    throw new Error(
+      `manifest repo ${dir}: no such file or directory -- check it out there, or point --scoop-dir / --homebrew-dir (YAW_SCOOP_DIR / YAW_HOMEBREW_DIR) at it`,
+    );
+  }
+}
+
+// Write one manifest into its sibling repo and, with `push`, commit and push it
+// (SSH gh_woods, like release.sh). Returns "written", "pushed", or "unchanged"
+// when the repo already had this exact manifest committed.
+//
+// The pull comes BEFORE the write: `git pull --rebase` refuses to start over a
+// modified tracked file, and after the write the manifest is exactly that.
+// --autostash covers unrelated dirt in the tree. The manifest's OWN leftover
+// change -- from a run without --push (the documented review-then-push flow), or
+// one that died between the write and the commit -- is discarded before the pull
+// instead: the write that follows replaces it anyway, and stashing it would
+// conflict with an origin that moved the manifest too (another machine's bump),
+// leaving a conflicted file and an orphaned "autostash" entry in `git stash list`.
+//
+// An unchanged manifest skips the commit, since `git commit` exits 1 on "nothing
+// to commit" and would stop a re-run before it reached the second repo. The push
+// still runs: a run that committed and then failed to push leaves exactly this
+// state, and pushing an up-to-date branch is a no-op.
+export function updateManifestRepo(dir, rel, content, { push = false, msg, stdio = "inherit" } = {}) {
+  requireManifestRepo(dir);
+  const env = { ...process.env, GIT_SSH_COMMAND: "ssh -i ~/.ssh/gh_woods -o IdentitiesOnly=yes" };
+  const git = (...a) => execFileSync("git", ["-C", dir, ...a], { stdio, env });
+  const path = join(dir, rel);
+  if (push) {
+    let inHead = true;
+    try {
+      execFileSync("git", ["-C", dir, "cat-file", "-e", `HEAD:${rel}`], { stdio: "ignore", env });
+    } catch {
+      inHead = false;
+    }
+    if (inHead) {
+      git("checkout", "HEAD", "--", rel);
+    } else {
+      // A manifest this repo has never committed: drop it from the index and the
+      // tree, or a pull that brings the same path in refuses to overwrite it.
+      git("rm", "-q", "--cached", "--ignore-unmatch", "--", rel);
+      rmSync(path, { force: true });
+    }
+    git("pull", "--rebase", "--autostash", "origin", "main");
+  }
+  mkdirSync(dirname(path), { recursive: true });
+  writeFileSync(path, content);
+  if (!push) return "written";
+  git("add", rel);
+  const changed =
+    execFileSync("git", ["-C", dir, "status", "--porcelain", "--", rel], { encoding: "utf-8", env }).trim() !== "";
+  // Only the manifest: the autostash can put back unrelated staged work.
+  if (changed) git("commit", "-m", msg, "--", rel);
+  git("push", "origin", "main");
+  return changed ? "pushed" : "unchanged";
+}
+
 // Only run the release side effects when executed as a script, so a test can
 // import the helpers without triggering `gh release download`. Compare real
 // paths, so a run through a symlink or junction to the script still counts as
@@ -126,10 +205,13 @@ function main() {
   // On a second machine, set the env vars or pass the flags -- the
   // personal defaults only exist on the original dev machine and will
   // produce a "no such file or directory" error rather than silently
-  // writing to a wrong location.
+  // writing to a wrong location (requireManifestRepo, checked for both
+  // repos before anything is downloaded, written or pushed).
   const scoopDir = resolve(expand(arg("scoop-dir", process.env.YAW_SCOOP_DIR ?? "~/yaw/scoop-yaw")));
   const homebrewDir = resolve(expand(arg("homebrew-dir", process.env.YAW_HOMEBREW_DIR ?? "~/yaw/homebrew-yaw")));
   const push = process.argv.includes("--push");
+  requireManifestRepo(scoopDir);
+  requireManifestRepo(homebrewDir);
 
   // --- everything below is derived from package.json (copy-paste generic) ------
   const pkgShort = pkg.name.split("/").pop(); // scoop install name + bucket file
@@ -160,13 +242,17 @@ function main() {
 
   // 1. Pull every .sha256 sidecar from the release into a temp dir, parse hashes.
   const shaDir = mkdtempSync(join(tmpdir(), `${cmd}-sha-`));
-  execFileSync("gh", ["release", "download", tag, "--repo", repoSlug, "-p", "*.sha256", "-D", shaDir], {
-    stdio: "inherit",
-  });
   const hashes = {};
-  for (const file of readdirSync(shaDir)) {
-    const [hex, name] = readFileSync(join(shaDir, file), "utf-8").trim().split(/\s+/);
-    hashes[name] = hex;
+  try {
+    execFileSync("gh", ["release", "download", tag, "--repo", repoSlug, "-p", "*.sha256", "-D", shaDir], {
+      stdio: "inherit",
+    });
+    for (const file of readdirSync(shaDir)) {
+      const [hex, name] = readFileSync(join(shaDir, file), "utf-8").trim().split(/\s+/);
+      hashes[name] = hex;
+    }
+  } finally {
+    rmSync(shaDir, { recursive: true, force: true });
   }
   function hashFor(asset) {
     const h = hashes[asset];
@@ -209,31 +295,22 @@ function main() {
     assets: { macArm64: asset(ASSETS.macArm64), macX64: asset(ASSETS.macX64), linuxX64: asset(ASSETS.linuxX64) },
   });
 
-  // 4. Write both manifests into the sibling repos.
+  // 4. Write both manifests into the sibling repos; with --push, commit and
+  //    push each one too (see updateManifestRepo for the ordering).
   const scoopRel = `bucket/${pkgShort}.json`;
   const formulaRel = `Formula/${cmd}.rb`;
-  const scoopPath = join(scoopDir, scoopRel);
-  const formulaPath = join(homebrewDir, formulaRel);
-  mkdirSync(dirname(scoopPath), { recursive: true });
-  mkdirSync(dirname(formulaPath), { recursive: true });
-  writeFileSync(scoopPath, `${JSON.stringify(scoopManifest, null, 2)}\n`);
-  writeFileSync(formulaPath, formula);
-  console.log(`wrote ${scoopPath}`);
-  console.log(`wrote ${formulaPath}`);
-
-  // 5. Commit + push (SSH gh_woods, like release.sh) only with --push.
-  const SSH = "ssh -i ~/.ssh/gh_woods -o IdentitiesOnly=yes";
-  function commitPush(dir, file, msg) {
-    const git = (...a) =>
-      execFileSync("git", ["-C", dir, ...a], { stdio: "inherit", env: { ...process.env, GIT_SSH_COMMAND: SSH } });
-    git("pull", "--rebase", "origin", "main");
-    git("add", file);
-    git("commit", "-m", msg);
-    git("push", "origin", "main");
+  const msg = `${cmd} ${version}`;
+  for (const [dir, rel, content] of [
+    [scoopDir, scoopRel, `${JSON.stringify(scoopManifest, null, 2)}\n`],
+    [homebrewDir, formulaRel, formula],
+  ]) {
+    const result = updateManifestRepo(dir, rel, content, { push, msg });
+    console.log(
+      `wrote ${join(dir, rel)}${result === "unchanged" ? " (already committed, nothing new to commit)" : ""}`,
+    );
   }
+
   if (push) {
-    commitPush(scoopDir, scoopRel, `${cmd} ${version}`);
-    commitPush(homebrewDir, formulaRel, `${cmd} ${version}`);
     console.log("pushed scoop-yaw + homebrew-yaw");
   } else {
     console.log("\n--push not set. Review, then:");

@@ -1,9 +1,10 @@
 import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { beforeAll, beforeEach, describe, expect, it } from "vitest";
+import { afterAll, beforeAll, beforeEach, describe, expect, it } from "vitest";
 import type { ApiResponse } from "../api.js";
 import * as api from "../api.js";
+import { clearSnapshots } from "../snapshots.js";
 import { registerAdaptTools } from "../tools/adapt.js";
 import { registerConfigTools } from "../tools/config.js";
 import { registerOperationalTools } from "../tools/operational.js";
@@ -21,15 +22,61 @@ function assertOk<T>(res: ApiResponse<T>, label: string): asserts res is ApiResp
 /**
  * Live-Caddy integration tests. Skipped unless CADDY_MCP_INTEGRATION=1 is set.
  * Requires a running Caddy admin API at CADDY_ADMIN_URL (default: http://localhost:2019).
- * Run locally before a release: start Caddy (`caddy start`), then
- * `CADDY_MCP_INTEGRATION=1 npm test`.
+ *
+ * THIS SUITE REPLACES THE TARGET INSTANCE'S CONFIG WHILE IT RUNS: every test
+ * starts by loading {}, and several unload the whole config. The config found
+ * at the start is captured and loaded back in afterAll, but anything serving
+ * on that instance stops serving for the duration (and stays down if the run
+ * is killed before afterAll). Point it at a scratch instance, not one that
+ * serves traffic. CADDY_ADMIN (not an `admin` block) sets its admin address,
+ * because the {} each test loads has no `admin` block and Caddy re-binds to
+ * its default address:
+ *
+ *   CADDY_ADMIN=127.0.0.1:20190 caddy run
+ *   CADDY_MCP_INTEGRATION=1 CADDY_ADMIN_URL=http://127.0.0.1:20190 npx vitest run src/tests/integration.test.ts
  */
 describe.skipIf(!RUN)("integration: live Caddy admin API", () => {
+  // The handler tests below assert on the module-level snapshot ring's length
+  // and contents. An exported CADDY_MCP_SNAPSHOT_DIR would rehydrate the
+  // operator's persisted snapshots into it (a full ring of 10 makes every
+  // `ringBefore + 1` fail) and fill that directory with test configs. Unset it
+  // for this file and start from an empty ring; CADDY_ADMIN_URL is left alone,
+  // because the ambient value is how this suite finds its Caddy.
+  const ambientSnapshotDir = process.env.CADDY_MCP_SNAPSHOT_DIR;
+  // The target's config as found, restored in afterAll. `null` is a real state
+  // (a bare `caddy run` has no config at all) and is restored as an unload.
+  let originalConfig: unknown;
+  let captured = false;
+
   beforeAll(async () => {
+    delete process.env.CADDY_MCP_SNAPSHOT_DIR;
+    clearSnapshots();
     const res = await api.configGet();
     if (!res.ok) {
       throw new Error(`Cannot reach Caddy at ${process.env.CADDY_ADMIN_URL || "http://localhost:2019"}: ${res.error}`);
     }
+    originalConfig = res.data;
+    captured = true;
+  });
+
+  afterAll(async () => {
+    if (ambientSnapshotDir !== undefined) process.env.CADDY_MCP_SNAPSHOT_DIR = ambientSnapshotDir;
+    else delete process.env.CADDY_MCP_SNAPSHOT_DIR;
+    // Never "restore" a config that was not read: loading undefined would be
+    // a second, unrequested replace.
+    if (!captured) return;
+    if (originalConfig === null || originalConfig === undefined) {
+      // Unloading an already config-less instance answers 404 even though it
+      // is already the state being restored, so unload only a non-null config.
+      const current = await api.configGet();
+      if (current.ok && current.data !== null) {
+        const del = await api.configDelete("");
+        if (!del.ok) throw new Error(`Restoring the original (empty) config failed: ${del.error}`);
+      }
+      return;
+    }
+    const res = await loadAndSettle(originalConfig, "application/json");
+    if (!res.ok) throw new Error(`Restoring the original config failed: ${res.error}`);
   });
 
   /**
@@ -509,11 +556,21 @@ describe.skipIf(!RUN)("integration: live Caddy admin API", () => {
   });
 
   // The opposite side of that switch: /adapt takes a raw document, so a string
-  // body must NOT be JSON-encoded on the way out.
+  // body must NOT be JSON-encoded on the way out. "adapts a Caddyfile to JSON"
+  // above only checks that a result came back; this checks it is THIS
+  // document's result. A JSON-encoded body would reach the Caddyfile adapter
+  // as one quoted token, not as a site block listening on :18896 that responds
+  // "ok".
   it("still sends a Caddyfile to /adapt as a raw document", async () => {
-    const res = await api.adapt<{ result?: unknown }>(':18896 {\n  respond "ok"\n}\n');
+    type Adapted = {
+      result?: { apps?: { http?: { servers?: Record<string, { listen?: string[]; routes?: unknown[] }> } } };
+    };
+    const res = await api.adapt<Adapted>(':18896 {\n  respond "ok"\n}\n');
     assertOk(res, "adapt Caddyfile");
-    expect(res.data?.result).toBeDefined();
+    const servers = Object.values(res.data?.result?.apps?.http?.servers ?? {});
+    expect(servers).toHaveLength(1);
+    expect(servers[0].listen).toEqual([":18896"]);
+    expect(JSON.stringify(servers[0].routes)).toContain('"body":"ok"');
   });
 
   it("configByIdGet + Delete works end-to-end", async () => {
@@ -548,10 +605,6 @@ describe.skipIf(!RUN)("integration: live Caddy admin API", () => {
     expect(getAfter.ok).toBe(false);
   });
 
-  // Tool handlers, not the api module. Each case below turns on a response
-  // shape only a real Caddy produces -- a failed path traversal, a server
-  // object with no keys, an adapter syntax error -- so the mocked suite in
-  // tools.test.ts (which feeds hand-built 200s) can never reach them.
   // The contract api.isRootConfigPath rests on: Caddy strips a lone trailing
   // "..." segment BEFORE it switches on the method (admin.go:1196-1199 at
   // v2.11.4), so `PATCH /config/...` is `PATCH /config/` -- a whole-config
@@ -573,6 +626,10 @@ describe.skipIf(!RUN)("integration: live Caddy admin API", () => {
     expect(after.data).toEqual(replacement);
   });
 
+  // Tool handlers, not the api module. Each case below turns on a response
+  // shape only a real Caddy produces -- a failed path traversal, a server
+  // object with no keys, an adapter syntax error -- so the mocked suite in
+  // tools.test.ts (which feeds hand-built 200s) can never reach them.
   describe("tool handlers against live Caddy", () => {
     type ToolResult = { isError?: boolean; content: Array<{ type: string; text: string }> };
 

@@ -101,7 +101,9 @@ function persist(snap: Snapshot): void {
     mkdirSync(dir, { recursive: true, mode: 0o700 });
     // The trigger is embedded in the filename, so keep it filename-safe. It is
     // always one of our own literals today ("caddy_load", "manual",
-    // "caddy_revert"); the sanitize keeps that true if a caller passes another.
+    // "caddy_revert", "caddy_config_set", "caddy_config_delete",
+    // "caddy_config_by_id"); the sanitize keeps it filename-safe if a caller
+    // passes another.
     const safeTrigger = snap.trigger.replace(/[^\w-]/g, "_");
     writeFileSync(join(dir, `snapshot-${snap.timestamp}-${safeTrigger}.json`), JSON.stringify(snap.config, null, 2), {
       encoding: "utf-8",
@@ -147,11 +149,19 @@ export function getSnapshot(index: number): Snapshot | undefined {
   return store[index];
 }
 
+/**
+ * TEST HOOK: no tool calls this. The ring is module-level, so tests use it to
+ * start each case from an empty ring instead of inheriting the last test's
+ * snapshots (index 0 would otherwise be whatever ran before).
+ *
+ * It empties the in-memory ring only; persisted files are left alone, and a
+ * fresh process (or a re-imported module) loads them again. It sets
+ * `hydrated = true` so the next read does NOT pull the persisted set back in:
+ * a test that clears and then counts snapshots must see zero even when
+ * CADDY_MCP_SNAPSHOT_DIR points at a directory holding some, and a "clear"
+ * that refilled itself from disk on the next call would defeat the hook.
+ */
 export function clearSnapshots(): void {
   store.length = 0;
-  // Mark hydrated so a follow-up read does NOT pull the persisted set back in.
-  // "Clear" that refills itself from disk on the next call would be the wrong
-  // reading of the name. This empties the in-memory ring only; persisted files
-  // are left alone, and a fresh process will load them again.
   hydrated = true;
 }

@@ -33,6 +33,7 @@ import { chmodSync, existsSync, mkdirSync, readFileSync, rmSync, statSync } from
 import { dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import esbuild from "esbuild";
+import { readFloor } from "./check-oam-floor.mjs";
 import { describeRuntime, findOam } from "./runtime.mjs";
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
@@ -74,8 +75,11 @@ function fmtSize(p) {
 
 // The carrier is a release artifact, so it must not depend on what happens to
 // be installed on the build host: a missing oam is a hard ERROR, never a quiet
-// downgrade to a different artifact.
-const oam = findOam({ require: true });
+// downgrade to a different artifact. Nor may it come from an oam older than
+// the launcher's floor (OAM_MIN in bin/caddy-mcp.mjs, read rather than copied
+// so the two cannot drift): discovery order alone would let a stale
+// ~/.oam/bin copy outrank a current oam on PATH.
+const oam = findOam({ require: true, min: readFloor(repoRoot) });
 console.log(describeRuntime(oam));
 
 mkdirSync(tmpDir, { recursive: true });

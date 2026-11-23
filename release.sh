@@ -260,11 +260,25 @@ command -v npm >/dev/null  || fail "npm not installed"
 # may not be on the runner image; the GitHub-release step in CI is gh-only too,
 # so still require it there).
 command -v gh >/dev/null   || fail "gh CLI not installed"
+# jq rewrites server.json in step 2, AFTER `npm version` has dirtied
+# package.json. Missing it there would strand the bump, and the re-run the
+# header promises would then stop on "Working directory not clean".
+command -v jq >/dev/null   || fail "jq not installed"
 
 CURRENT_VERSION=$(node -p "require('./package.json').version")
 
 if [ "$IS_CI" != "true" ]; then
   [ -z "$(git status --porcelain)" ] || fail "Working directory not clean -- commit or stash changes before releasing"
+  # Step 4 pushes `main` and step 5 publishes the working tree: from any other
+  # branch the npm package and the pushed tag would carry commits main never
+  # got. (CI checks out the tag detached, so this is local-only.)
+  CURRENT_BRANCH=$(git rev-parse --abbrev-ref HEAD)
+  [ "$CURRENT_BRANCH" = "main" ] || fail "On branch '$CURRENT_BRANCH' -- releases are cut from main. Check out main and re-run."
+  # The CI-mode branches (this one, the resume check and the hand-off in step
+  # 5, DEFER_PUBLISH_TO_CI) are inert in this repo until a
+  # .github/workflows/release.yml exists. Kept so release.sh stays in step with
+  # the sibling @yawlabs repos it is shared with.
+  #
   # If a CI release workflow exists, a missing local npm session is fine --
   # pushing the v* tag in step 4 will trigger CI to publish via NPM_TOKEN,
   # and step 5 here will then see "Already published -- skipping". Only
@@ -355,29 +369,48 @@ elif ! command -v caddy >/dev/null 2>&1; then
 else
   INTEGRATION_ADMIN_PORT="${INTEGRATION_ADMIN_PORT:-2999}"
   INTEGRATION_ADMIN_URL="http://localhost:${INTEGRATION_ADMIN_PORT}"
+  # Two guards keep the suite off a Caddy this script did not start -- an
+  # orphan from an aborted release, or the developer's own -- whose config the
+  # suite's `loadConfig({})` would wipe. A plain readiness probe cannot tell:
+  # it succeeds on the first HTTP answer from whoever holds the port, and a
+  # scratch caddy that lost the bind may not have exited yet when it does.
+  #
+  # 1. Refuse an occupied port before starting anything. Without -f, curl
+  #    exits 0 on ANY HTTP response, error statuses included; only "nothing
+  #    listening" fails it.
+  if curl -sS -m 2 -o /dev/null "${INTEGRATION_ADMIN_URL}/config/" 2>/dev/null; then
+    fail "something already answers on ${INTEGRATION_ADMIN_URL} -- refusing to run the integration suite against a Caddy this script did not start (it would wipe that instance's config). Stop it, or set INTEGRATION_ADMIN_PORT to a free port."
+  fi
+  # 2. Start ours with a config carrying a one-off @id, and count it up only
+  #    when /id/<that id> answers: no other Caddy knows the id, so a process
+  #    that grabbed the port in between can never pass for ours.
+  CADDY_SCRATCH_ID="caddy-release-$$-${RANDOM}-$(date +%s)"
   CADDY_SCRATCH_LOG="$(mktemp -t caddy-release-XXXXXX.log)"
-  CADDY_ADMIN="localhost:${INTEGRATION_ADMIN_PORT}" caddy run >"$CADDY_SCRATCH_LOG" 2>&1 &
+  CADDY_SCRATCH_CONFIG="$(mktemp -t caddy-release-config-XXXXXX)"
+  printf '{"admin":{"listen":"localhost:%s","@id":"%s"}}\n' "$INTEGRATION_ADMIN_PORT" "$CADDY_SCRATCH_ID" >"$CADDY_SCRATCH_CONFIG"
+  #    CADDY_ADMIN as well as admin.listen: the suite loads {} before each test,
+  #    and a config with no admin block re-binds to the DEFAULT admin address,
+  #    which CADDY_ADMIN sets. Without it the instance moves to localhost:2019
+  #    after the first test -- possibly onto the developer's own Caddy.
+  CADDY_ADMIN="localhost:${INTEGRATION_ADMIN_PORT}" caddy run --config "$CADDY_SCRATCH_CONFIG" >"$CADDY_SCRATCH_LOG" 2>&1 &
   CADDY_SCRATCH_PID=$!
   # Reap the scratch instance on EVERY exit path, including `fail`'s exit 1.
-  trap 'kill "$CADDY_SCRATCH_PID" 2>/dev/null || true' EXIT
+  trap 'kill "$CADDY_SCRATCH_PID" 2>/dev/null || true; rm -f "$CADDY_SCRATCH_CONFIG"' EXIT
 
+  CADDY_SCRATCH_UP=0
   for _ in $(seq 1 40); do
-    curl -fsS -m 2 -o /dev/null "${INTEGRATION_ADMIN_URL}/config/" 2>/dev/null && break
+    if curl -fsS -m 2 -o /dev/null "${INTEGRATION_ADMIN_URL}/id/${CADDY_SCRATCH_ID}" 2>/dev/null; then
+      CADDY_SCRATCH_UP=1
+      break
+    fi
     sleep 0.25
   done
-  # A successful curl only proves SOMETHING is listening on that port. If our
-  # caddy failed to bind -- most likely the port is already taken by an orphaned
-  # scratch instance from an aborted release -- it has since exited, and the
-  # tests would run against a foreign Caddy whose config the suite's
-  # `loadConfig({})` then wipes. That is exactly what the scratch instance
-  # exists to prevent, so confirm the process WE started is the live one.
-  if ! kill -0 "$CADDY_SCRATCH_PID" 2>/dev/null; then
+  if [ "$CADDY_SCRATCH_UP" != "1" ]; then
     warn "scratch Caddy log: $CADDY_SCRATCH_LOG"
-    fail "scratch Caddy exited -- port ${INTEGRATION_ADMIN_PORT} may already be in use. Refusing to run the integration suite against a Caddy this script did not start (it would wipe that instance's config). Free the port, or set INTEGRATION_ADMIN_PORT to another one."
-  fi
-  if ! curl -fsS -m 2 -o /dev/null "${INTEGRATION_ADMIN_URL}/config/" 2>/dev/null; then
-    warn "scratch Caddy log: $CADDY_SCRATCH_LOG"
-    fail "scratch Caddy never came up on ${INTEGRATION_ADMIN_URL}"
+    if ! kill -0 "$CADDY_SCRATCH_PID" 2>/dev/null; then
+      fail "scratch Caddy exited -- port ${INTEGRATION_ADMIN_PORT} may already be in use. Refusing to run the integration suite against a Caddy this script did not start (it would wipe that instance's config). Free the port, or set INTEGRATION_ADMIN_PORT to another one."
+    fi
+    fail "scratch Caddy never answered as itself (/id/${CADDY_SCRATCH_ID}) on ${INTEGRATION_ADMIN_URL}"
   fi
   info "scratch Caddy up on ${INTEGRATION_ADMIN_URL} (pid $CADDY_SCRATCH_PID)"
 
@@ -387,13 +420,17 @@ else
 
   kill "$CADDY_SCRATCH_PID" 2>/dev/null || true
   trap - EXIT
-  rm -f "$CADDY_SCRATCH_LOG"
+  rm -f "$CADDY_SCRATCH_LOG" "$CADDY_SCRATCH_CONFIG"
   info "admin-API semantics verified against $(caddy version 2>/dev/null | head -1)"
 fi
 
 info "All checks passed"
 
 step 2 "Bump version to $VERSION"
+# Re-read rather than reuse the pre-flight value: step 1 ran the build, the
+# tests and the integration suite, and the decision below must rest on what
+# package.json says now, not on what it said before all of that.
+CURRENT_VERSION=$(node -p "require('./package.json').version")
 if [ "$CURRENT_VERSION" = "$VERSION" ]; then
   info "Already at v${VERSION} -- skipping"
 else

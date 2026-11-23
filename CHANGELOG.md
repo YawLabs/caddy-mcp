@@ -7,7 +7,82 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+- **The settle wait after a config change works again on Node 26.** Node 26.13.1
+  bundles undici 8.12.4, which moved the real connection pool to
+  `Symbol.for("undici.globalDispatcher.2")`. The `.1` slot now holds a wrapper
+  that never emits connect/disconnect, so the hook counted no sockets and the
+  wait silently did nothing. The client now hooks `.2` first and falls back to
+  `.1` on older Node.
+- `caddy_tls` set actions no longer send a second full-reload write after a
+  PATCH that timed out with its outcome unknown. That result is now reported as is.
+- A write through `/id/<a>` now drops every cached `/id/` ETag. Before, a cached
+  `/id/srv` ETag survived a write to a route inside srv, and the next `/id/srv`
+  write sent a stale `If-Match` and got a spurious 412. A PATCH/PUT response
+  ETag is now cached only when Caddy could parse it back, like a GET's.
+- `CADDY_ADMIN_URL` is trimmed, and its `unix` scheme matches case-insensitively.
+  A value with no http(s) scheme (`localhost:2019`, Caddy's own `CADDY_ADMIN`
+  form, or `127.0.0.1:2019`, `:2019`, `[::1]:2019`) is refused up front, without
+  retrying, instead of surfacing as "Cannot connect ... at null" or a retried
+  parse error.
+- `CADDY_TIMEOUT` / `CADDY_LOAD_TIMEOUT` accept only a plain decimal integer and
+  are clamped to 2147483647. Above that, Node fired the timer after about 1 ms,
+  and 1e12 threw.
+- Timeout classification:
+  - A unix-socket response dropped mid-body is no longer reported as a timeout.
+  - undici's own headers timeout (`UND_ERR_HEADERS_TIMEOUT`, 300 s) now counts
+    as one. Before, a long `CADDY_LOAD_TIMEOUT` saw it as "Cannot connect" and
+    replayed `/load`.
+- `caddy_reverse_proxy` and `caddy_add_route`:
+  - An upstream scheme matches case-insensitively, so `HTTPS://` gets the TLS
+    transport.
+  - An `http(s)://` upstream with a path, query or fragment is refused instead
+    of being written as a malformed dial.
+- `caddy_remove_route` by index on a missing server says the server does not
+  exist instead of returning Caddy's raw traversal error.
+- `caddy_list_routes` shows numeric `@id`s, which Caddy resolves like string ones.
+- `caddy_config_set` refuses an omitted `value` instead of sending a bodiless
+  write.
+- `caddy_load` (JSON) and `caddy_revert` apply say where the admin endpoint went,
+  as a root `caddy_config_set` does.
+- `caddy_metrics` says when a filter matched nothing or the body was empty,
+  instead of a bare `OK`. A non-text body is rendered as JSON in the tool and in
+  `caddy://metrics`, instead of `[object Object]`.
+- `caddy://servers` returns `{}` on a Caddy with no http app instead of an error,
+  and its description says it is the raw servers config.
+- `caddy_tls` is annotated `destructiveHint: true`: its set actions overwrite
+  existing values. Its description now says the PATCH-first path does not check
+  the issuer module.
+- Launcher:
+  - `CADDY_MCP_RUNTIME=node` on a current oam with no Node prints a well-formed
+    message with the right remedy.
+  - A missing `dist/index.js` on the in-process path is reported instead of
+    dumping a raw stack.
+  - A host-less `CADDY_ADMIN_URL` under the sandbox warns that the network grant
+    is open.
+
 ### Changed
+- Release tooling:
+  - `release.sh` refuses to run off `main`, pre-flights `jq`, and re-reads
+    `package.json` before the version bump.
+  - The integration gate refuses an occupied scratch port and confirms the
+    instance that answers is its own.
+  - `npm run build:binary:oam` requires an oam at or above `OAM_MIN`.
+  - `scripts/stage-release-asset.mjs` refuses a binary whose `--version` does not
+    match `package.json`.
+  - `scripts/update-manifests.mjs --push` pulls before writing, skips an
+    unchanged commit so a re-run reaches both repos, and refuses a missing repo
+    root.
+  - `scripts/check-oam-floor.mjs` catches all three floor claims in CLAUDE.md.
+- Tests:
+  - The unit suites pin `CADDY_ADMIN_URL` and `CADDY_MCP_SNAPSHOT_DIR`, so an
+    exported value no longer sends them to a live Caddy or a real snapshot
+    directory.
+  - The integration suite loads the target's original config back when it
+    finishes.
+  - The built-CLI tests skip when `dist/` is older than `src/`.
+  - Mock implementations no longer leak between handler tests.
+
 - The release pre-flight checks the Yaw MCP floor: `scripts/check-yaw-mcp-floor.mjs`
   (`npm run check:yaw-mcp-floor`) fails on drift between `YAW_MCP_MIN` 1.1.13 and the
   README's "Yaw MCP 1.1.13 or newer" (and, if one is ever added, a
@@ -104,6 +179,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   binary build), bound each `oam --version` probe at 5 s so a wedged binary
   cannot hang them, and read `CADDY_MCP_RUNTIME` case-insensitively like the
   launcher (`=NODE` forces tsc).
+
+### Removed
+- *Late note: this entry originally omitted it.* **The Node SEA binary carrier
+  is gone** (commit 41492a4). `scripts/build-binary.mjs`, `sea-config.json` and
+  the `postject` devDependency were deleted; the single-file release binaries
+  are built only by `oam compile`, through `npm run build:binary:oam`
+  (`scripts/build-binary-oam.mjs`), and a missing oam is a hard error rather
+  than a fallback to another carrier. Entries before this one that describe
+  `scripts/build-binary.mjs` or a Node SEA binary (2.5.9's SDK note, for one)
+  describe the carrier as it was then.
 
 ## [2.6.0] — 2026-10-09
 
@@ -1774,21 +1859,50 @@ First stable release. API surface is now frozen under semver.
 - stdio transport, MCP tool annotations (`readOnlyHint`, `destructiveHint`,
   `idempotentHint`).
 
+[Unreleased]: https://github.com/YawLabs/caddy-mcp/compare/v2.6.3...HEAD
+[2.6.3]: https://github.com/YawLabs/caddy-mcp/releases/tag/v2.6.3
+[2.6.2]: https://github.com/YawLabs/caddy-mcp/releases/tag/v2.6.2
+[2.6.1]: https://github.com/YawLabs/caddy-mcp/releases/tag/v2.6.1
+[2.6.0]: https://github.com/YawLabs/caddy-mcp/releases/tag/v2.6.0
+[2.5.10]: https://github.com/YawLabs/caddy-mcp/releases/tag/v2.5.10
+[2.5.9]: https://github.com/YawLabs/caddy-mcp/releases/tag/v2.5.9
+[2.5.8]: https://github.com/YawLabs/caddy-mcp/releases/tag/v2.5.8
+[2.5.7]: https://github.com/YawLabs/caddy-mcp/releases/tag/v2.5.7
+[2.5.6]: https://github.com/YawLabs/caddy-mcp/releases/tag/v2.5.6
+[2.5.5]: https://github.com/YawLabs/caddy-mcp/releases/tag/v2.5.5
+[2.5.4]: https://github.com/YawLabs/caddy-mcp/releases/tag/v2.5.4
+[2.5.3]: https://github.com/YawLabs/caddy-mcp/releases/tag/v2.5.3
+[2.5.2]: https://github.com/YawLabs/caddy-mcp/releases/tag/v2.5.2
+[2.5.1]: https://github.com/YawLabs/caddy-mcp/releases/tag/v2.5.1
+[2.5.0]: https://github.com/YawLabs/caddy-mcp/releases/tag/v2.5.0
+[2.4.4]: https://github.com/YawLabs/caddy-mcp/releases/tag/v2.4.4
+[2.4.3]: https://github.com/YawLabs/caddy-mcp/releases/tag/v2.4.3
+[2.4.2]: https://github.com/YawLabs/caddy-mcp/releases/tag/v2.4.2
 [2.4.1]: https://github.com/YawLabs/caddy-mcp/releases/tag/v2.4.1
+[2.4.0]: https://github.com/YawLabs/caddy-mcp/releases/tag/v2.4.0
+[2.3.2]: https://github.com/YawLabs/caddy-mcp/releases/tag/v2.3.2
+[2.3.1]: https://github.com/YawLabs/caddy-mcp/releases/tag/v2.3.1
+[2.3.0]: https://github.com/YawLabs/caddy-mcp/releases/tag/v2.3.0
 [2.2.0]: https://github.com/YawLabs/caddy-mcp/releases/tag/v2.2.0
+[2.1.0]: https://github.com/YawLabs/caddy-mcp/releases/tag/v2.1.0
+[2.0.0]: https://github.com/YawLabs/caddy-mcp/releases/tag/v2.0.0
 [1.3.1]: https://github.com/YawLabs/caddy-mcp/releases/tag/v1.3.1
 [1.3.0]: https://github.com/YawLabs/caddy-mcp/releases/tag/v1.3.0
 [1.2.9]: https://github.com/YawLabs/caddy-mcp/releases/tag/v1.2.9
 [1.2.8]: https://github.com/YawLabs/caddy-mcp/releases/tag/v1.2.8
+[1.2.7]: https://github.com/YawLabs/caddy-mcp/releases/tag/v1.2.7
+[1.2.6]: https://github.com/YawLabs/caddy-mcp/releases/tag/v1.2.6
+[1.2.5]: https://github.com/YawLabs/caddy-mcp/releases/tag/v1.2.5
 [1.2.4]: https://github.com/YawLabs/caddy-mcp/releases/tag/v1.2.4
 [1.2.3]: https://github.com/YawLabs/caddy-mcp/releases/tag/v1.2.3
 [1.2.2]: https://github.com/YawLabs/caddy-mcp/releases/tag/v1.2.2
 [1.2.1]: https://github.com/YawLabs/caddy-mcp/releases/tag/v1.2.1
 [1.2.0]: https://github.com/YawLabs/caddy-mcp/releases/tag/v1.2.0
 [1.1.0]: https://github.com/YawLabs/caddy-mcp/releases/tag/v1.1.0
+[1.0.1]: https://github.com/YawLabs/caddy-mcp/releases/tag/v1.0.1
 [1.0.0]: https://github.com/YawLabs/caddy-mcp/releases/tag/v1.0.0
 [0.3.1]: https://github.com/YawLabs/caddy-mcp/releases/tag/v0.3.1
 [0.3.0]: https://github.com/YawLabs/caddy-mcp/releases/tag/v0.3.0
 [0.2.0]: https://github.com/YawLabs/caddy-mcp/releases/tag/v0.2.0
 [0.1.1]: https://github.com/YawLabs/caddy-mcp/releases/tag/v0.1.1
-[0.1.0]: https://github.com/YawLabs/caddy-mcp/releases/tag/v0.1.0
+[0.1.0]: https://github.com/YawLabs/caddy-mcp/commit/236a273e5b660415816d483f217fe9ef8b379975

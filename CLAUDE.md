@@ -14,9 +14,9 @@ MCP server for managing Caddy web servers via the admin API. 18 tools across con
 - `src/tools/adapt.ts` — Config format conversion (Caddyfile → JSON).
 - `src/tools/tls.ts` — TLS/HTTPS settings management.
 - `src/tools/operational.ts` — Status, list_servers, upstreams, PKI, metrics, stop. Also owns the `TLS:` label in the server summaries, which replays Caddy's automatic-HTTPS rule (`autohttps.go` + `app.go:535`) over the stored config instead of guessing from the listen port — including a port-range parser that mirrors `caddy.ParseNetworkAddress`.
-- `src/resources.ts` — MCP resources: caddy://config, caddy://upstreams, caddy://metrics, caddy://servers.
+- `src/resources.ts` — MCP resources: caddy://config, caddy://upstreams, caddy://metrics, caddy://servers. `caddy://servers` is the raw `apps/http/servers` config object, not the per-server summary `caddy_list_servers` builds.
 
-## Runtime: oam for the dev loop, Node for artifacts
+## Runtime: oam for the release binary, Node for tests and start, auto-detect for typecheck
 
 [oam](https://oamjs.org) is **not** an npm dependency and is never assumed present.
 Discovery lives in `scripts/runtime.mjs`: `$OAM_BIN`, then the installed locations
@@ -30,7 +30,7 @@ The split is deliberate — **auto-detect for tools, explicit for artifacts**:
 | Task | Default | Alternate |
 |---|---|---|
 | `npm run typecheck` | `oam check .` if available, else `tsc --noEmit` | `CADDY_MCP_RUNTIME=node` forces tsc; `typecheck:tsc` pins it |
-| `npm run build:binary:oam` | **oam compile** | — (single carrier; no oam is a hard error) |
+| `npm run build:binary:oam` | **oam compile**, on an oam at or above the launcher floor (`OAM_MIN`) | — (single carrier; no qualifying oam is a hard error) |
 | `npm test` | vitest (Node) | — |
 | `npm start` | Node | — |
 | `bin` entry (`bin/caddy-mcp.mjs`) | newest oam at or above 0.20.2, else Node | `CADDY_MCP_RUNTIME=node` / `=oam`, `OAM_BIN`; see the launcher header |
@@ -39,7 +39,8 @@ The split is deliberate — **auto-detect for tools, explicit for artifacts**:
 artifact. If a carrier were chosen by what happens to be installed, the same git
 tag could produce a different binary on one machine and another, silently. So the
 single carrier is `oam compile`, and a missing oam is a hard **error** rather than
-a quiet downgrade. (The repo used to carry a second carrier -- Node SEA + postject
+a quiet downgrade. So is an oam below `OAM_MIN`: `scripts/build-binary-oam.mjs` passes the
+launcher floor to `findOam`, so a stale `~/.oam/bin` copy cannot outrank a current oam on PATH. (The repo used to carry a second carrier -- Node SEA + postject
 -- which is gone.) Type-checking auto-detects because it emits nothing — a type
 error is a type error under either checker.
 
@@ -63,22 +64,22 @@ Two deliberate non-changes:
 - **`oam run` is used only by the published `bin` launcher**, on the built
   `dist/index.js`. An earlier note here called it *slower* than Node (853 ms vs
   701 ms); that timed an oam inside `target/release` mid-rebuild. Against an
-  installed oam it is faster (184 ms vs 213 ms, see `scripts/build-binary-oam.mjs`).
+  installed oam it is faster (184 ms vs 213 ms, see the header of `scripts/runtime.mjs`).
   The launcher never serves on an oam older than 0.20.2.
 - **Tests stay on vitest.** oam ships its own runner (`import 'oam:test'`), but the
   suite leans on `vi.mock` for module-level api mocking; porting it would trade a
-  working 310-test suite for a rewrite and would break the Node-only path.
+  working suite of nearly a thousand tests for a rewrite and would break the Node-only path.
 
 ## Environment variables
 
-Read by `src/api.ts`. All optional.
+Read by `src/api.ts`, except `CADDY_MCP_SNAPSHOT_DIR`, which `src/snapshots.ts` reads. All optional.
 
 | Var | Default | Purpose |
 |---|---|---|
-| `CADDY_ADMIN_URL` | `http://localhost:2019` | Admin API base URL. Trailing slashes stripped. A `unix:///path` or `unix//path` value switches the transport from global `fetch` to `node:http` with `socketPath` — `fetch` cannot dial a unix socket. The unix path deliberately sends **no** `Origin` header: Caddy builds no default origin allowlist for a unix/fd admin listener and only runs its origin check when `Origin` or `Sec-Fetch-Mode` is present, so sending one opts into a check against an empty list and always 403s. |
+| `CADDY_ADMIN_URL` | `http://localhost:2019` | Admin API base URL. Trailing slashes stripped. A `unix:///path` or `unix//path` value switches the transport from global `fetch` to `node:http` with `socketPath` — `fetch` cannot dial a unix socket. The unix path deliberately sends **no** `Origin` header: Caddy builds no default origin allowlist for a unix/fd admin listener and only runs its origin check when `Origin` or `Sec-Fetch-Mode` is present, so sending one opts into a check against an empty list and always 403s. The value is trimmed, and the `unix` scheme matches case-insensitively. A value with no http/https scheme (a schemeless `localhost:2019` -- Caddy's own `CADDY_ADMIN` form -- or the unparseable `127.0.0.1:2019`, `:2019`, `[::1]:2019`) is refused up front, without retrying, with a message suggesting `http://localhost:2019`. |
 | `CADDY_API_TOKEN` | (unset) | Sent as `Authorization: Bearer <token>` when present. |
-| `CADDY_TIMEOUT` | `10000` | Per-request timeout in ms for requests that do not change the config (GETs, `/adapt`, `/stop`, PKI, upstreams, metrics). Values that floor below 1 fall back to the default. |
-| `CADDY_LOAD_TIMEOUT` | `55000` | Timeout for every config change — `POST /load` and every non-GET under `/config` and `/id` — because each is the same synchronous full reload inside Caddy. A timeout on one of these is never retried, and its error says the outcome is unknown (the response carries `outcomeUnknown`, on which `caddy_load` / `caddy_revert` keep their snapshot). A timeout is recognised by the error's name (`TimeoutError` / `AbortError`), not its text, which differs between runtimes. The default is one constant, `LOAD_TIMEOUT`, deliberately below the MCP SDK client's 60 s request timeout; at or above it the outcome-unknown error is never delivered. Values that floor below 1 fall back to the default. |
+| `CADDY_TIMEOUT` | `10000` | Per-request timeout in ms for requests that do not change the config (GETs, `/adapt`, `/stop`, PKI, upstreams, metrics). Anything but a plain positive decimal integer (after trimming) means the default -- `0x10`, `1e3`, `1.5` included; values above 2147483647 (the largest delay a timer honours) are clamped to it. |
+| `CADDY_LOAD_TIMEOUT` | `55000` | Timeout for every config change — `POST /load` and every non-GET under `/config` and `/id` — because each is the same synchronous full reload inside Caddy. A timeout on one of these is never retried, and its error says the outcome is unknown (the response carries `outcomeUnknown`, on which `caddy_load` / `caddy_revert` keep their snapshot). A timeout is recognised by the error's name (`TimeoutError` / `AbortError`), not its text, which differs between runtimes; fetch's own undici headers timeout (cause code `UND_ERR_HEADERS_TIMEOUT`, 300 s by default, so it fires first when `CADDY_LOAD_TIMEOUT` is above 300000) counts as a timeout too, not as "Cannot connect". The default is one constant, `LOAD_TIMEOUT`, deliberately below the MCP SDK client's 60 s request timeout; at or above it the outcome-unknown error is never delivered. Parsed and clamped like `CADDY_TIMEOUT`. |
 | `CADDY_MAX_RETRIES` | `2` | Retries on transient failures: a network error, or a 502/503/504 (only a proxy in front of Caddy sends those). Hard-capped at 5; exceeding the cap warns once on stderr. Anything but a plain non-negative integer (after trimming) means the default. Never retries 4xx (including 412), Caddy's own 500s, a config change whose timeout fired, or — unless the connection was refused — a POST under `/config` or `/id`, a PUT/DELETE at an array index, or a PUT to a bare `/id/<id>` (Caddy resolves it to an array index for a route). Those path shapes match with trailing slashes and with the trailing `/...` segment Caddy strips before it picks a method, so `.../routes/0/...` and `PUT /id/<id>/...` are covered; a trailing `/...` with no index in front of it is not, and still retries. |
 | `CADDY_MCP_SNAPSHOT_DIR` | (unset) | Persist `caddy_revert` snapshots here instead of memory-only. Opt-in because snapshots are full configs and can carry secrets; a directory it creates is `0700` and each file `0600` (POSIX). Write failures degrade to in-memory rather than failing the tool call. |
 
@@ -97,6 +98,6 @@ npm run dev        # Watch mode
 npm test           # Run vitest
 npm run lint       # Biome check
 npm run lint:fix   # Biome auto-fix
-npm run typecheck  # tsc --noEmit
+npm run typecheck  # oam check . if oam is found, else tsc --noEmit
 npm run test:ci    # Build + test
 ```
