@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [2.6.4] — 2026-11-23
+
 ### Fixed
 - **The settle wait after a config change works again on Node 26.** Node 26.13.1
   bundles undici 8.12.4, which moved the real connection pool to
@@ -1880,7 +1882,8 @@ First stable release. API surface is now frozen under semver.
 - stdio transport, MCP tool annotations (`readOnlyHint`, `destructiveHint`,
   `idempotentHint`).
 
-[Unreleased]: https://github.com/YawLabs/caddy-mcp/compare/v2.6.3...HEAD
+[Unreleased]: https://github.com/YawLabs/caddy-mcp/compare/v2.6.4...HEAD
+[2.6.4]: https://github.com/YawLabs/caddy-mcp/compare/v2.6.3...v2.6.4
 [2.6.3]: https://github.com/YawLabs/caddy-mcp/releases/tag/v2.6.3
 [2.6.2]: https://github.com/YawLabs/caddy-mcp/releases/tag/v2.6.2
 [2.6.1]: https://github.com/YawLabs/caddy-mcp/releases/tag/v2.6.1
